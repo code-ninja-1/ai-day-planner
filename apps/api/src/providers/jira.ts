@@ -9,6 +9,10 @@ export interface JiraIssue {
     summary: string;
     status?: { name?: string };
     priority?: { name?: string };
+    updated?: string;
+    issuetype?: { name?: string; subtask?: boolean };
+    timeoriginalestimate?: number;
+    timetracking?: { originalEstimateSeconds?: number };
   };
 }
 
@@ -52,6 +56,16 @@ export interface JiraCredentials {
   email: string;
   apiToken: string;
   authType?: "basic" | "bearer";
+}
+
+export interface JiraPlanningContext {
+  openSubtaskEstimateSeconds: number | null;
+  subtasks: Array<{
+    key: string;
+    title: string;
+    status: string | null;
+    estimateSeconds: number | null;
+  }>;
 }
 
 function mapJiraPriority(name?: string) {
@@ -189,15 +203,15 @@ export async function validateJiraCredentials(input: {
   throw await buildJiraHttpError("Jira validation failed", bearerResponse);
 }
 
-export async function fetchRecentAssignedIssuesForCredentials(
+export async function fetchOpenAssignedIssuesForCredentials(
   credentials: JiraCredentials,
   _sinceIso: string
 ) {
-  const jql = "assignee = currentUser() AND updated >= -2d ORDER BY updated DESC";
+  const jql = "assignee = currentUser() AND resolution = Unresolved ORDER BY updated DESC";
   const searchUrl = new URL(buildJiraUrl(credentials.baseUrl, "/rest/api/2/search"));
   searchUrl.searchParams.set("jql", jql);
-  searchUrl.searchParams.set("maxResults", "25");
-  searchUrl.searchParams.set("fields", "summary,status,priority");
+  searchUrl.searchParams.set("maxResults", "50");
+  searchUrl.searchParams.set("fields", "summary,status,priority,updated,issuetype,timeoriginalestimate,timetracking");
 
   const response = await jiraFetchAuthed(searchUrl.toString(), credentials);
 
@@ -206,17 +220,92 @@ export async function fetchRecentAssignedIssuesForCredentials(
   }
 
   const json = (await response.json()) as { issues: JiraIssue[] };
-  return json.issues;
+  return json.issues.filter((issue) => issue.fields.issuetype?.subtask !== true);
 }
 
-export async function fetchRecentAssignedIssues(sinceIso: string) {
+export async function fetchOpenAssignedIssues(sinceIso: string) {
   const connection = getIntegrationConnection("jira");
   if (!connection?.configJson) {
     throw new Error("Jira integration is not connected");
   }
 
   const config = JSON.parse(connection.configJson) as JiraCredentials;
-  return fetchRecentAssignedIssuesForCredentials(config, sinceIso);
+  return fetchOpenAssignedIssuesForCredentials(config, sinceIso);
+}
+
+function isDoneLikeStatus(status?: string | null) {
+  const value = (status ?? "").toLowerCase();
+  return /(done|closed|resolved|complete|completed|cancelled|canceled)/.test(value);
+}
+
+function choosePlanningSubtasks(
+  subtasks: Array<{
+    key: string;
+    title: string;
+    status: string | null;
+    estimateSeconds: number | null;
+    updated: string | null;
+  }>
+) {
+  return [...subtasks].sort((left, right) => {
+    const leftInProgress = /(progress|coding|review|testing|qa|blocked|in dev|development)/i.test(left.status ?? "");
+    const rightInProgress = /(progress|coding|review|testing|qa|blocked|in dev|development)/i.test(right.status ?? "");
+    if (leftInProgress !== rightInProgress) return leftInProgress ? -1 : 1;
+    const leftEstimate = left.estimateSeconds ?? 0;
+    const rightEstimate = right.estimateSeconds ?? 0;
+    if (rightEstimate !== leftEstimate) return rightEstimate - leftEstimate;
+    return new Date(right.updated ?? 0).getTime() - new Date(left.updated ?? 0).getTime();
+  });
+}
+
+export async function fetchJiraIssuePlanningContextForCredentials(
+  credentials: JiraCredentials,
+  issueKey: string
+): Promise<JiraPlanningContext> {
+  const searchUrl = new URL(buildJiraUrl(credentials.baseUrl, "/rest/api/2/search"));
+  searchUrl.searchParams.set("jql", `parent = ${issueKey} AND resolution = Unresolved ORDER BY updated DESC`);
+  searchUrl.searchParams.set("maxResults", "50");
+  searchUrl.searchParams.set("fields", "summary,status,updated,timeoriginalestimate,timetracking");
+
+  const response = await jiraFetchAuthed(searchUrl.toString(), credentials);
+  if (!response.ok) {
+    throw await buildJiraHttpError("Jira subtask lookup failed", response);
+  }
+
+  const json = (await response.json()) as { issues?: Array<JiraIssue & { fields: JiraIssue["fields"] & { updated?: string } }> };
+  const subtasks = choosePlanningSubtasks(
+    (json.issues ?? [])
+      .map((issue) => ({
+        key: issue.key,
+        title: issue.fields.summary ?? issue.key,
+        status: issue.fields.status?.name ?? null,
+        estimateSeconds: extractOriginalEstimateSeconds(issue.fields as unknown as Record<string, unknown>),
+        updated: issue.fields.updated ?? null
+      }))
+      .filter((subtask) => !isDoneLikeStatus(subtask.status))
+  );
+
+  const summed = subtasks.reduce((total, subtask) => total + Math.max(0, subtask.estimateSeconds ?? 0), 0);
+
+  return {
+    openSubtaskEstimateSeconds: summed > 0 ? summed : null,
+    subtasks: subtasks.map(({ key, title, status, estimateSeconds }) => ({
+      key,
+      title,
+      status,
+      estimateSeconds
+    }))
+  };
+}
+
+export async function fetchJiraIssuePlanningContext(issueKey: string) {
+  const connection = getIntegrationConnection("jira");
+  if (!connection?.configJson) {
+    throw new Error("Jira integration is not connected");
+  }
+
+  const config = JSON.parse(connection.configJson) as JiraCredentials;
+  return fetchJiraIssuePlanningContextForCredentials(config, issueKey);
 }
 
 function adfToText(node: unknown): string {
@@ -270,6 +359,20 @@ function extractStoryPoints(fields: Record<string, unknown>) {
       return value;
     }
   }
+  return null;
+}
+
+function extractOriginalEstimateSeconds(fields: Record<string, unknown>) {
+  const direct = fields.timeoriginalestimate;
+  if (typeof direct === "number") {
+    return direct;
+  }
+
+  const timetracking = fields.timetracking as { originalEstimateSeconds?: unknown } | undefined;
+  if (typeof timetracking?.originalEstimateSeconds === "number") {
+    return timetracking.originalEstimateSeconds;
+  }
+
   return null;
 }
 

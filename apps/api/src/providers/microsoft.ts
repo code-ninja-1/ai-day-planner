@@ -124,6 +124,15 @@ function buildGraphPath(pathname: string, params?: Record<string, string>) {
   return query ? `${pathname}?${query}` : pathname;
 }
 
+function buildOutlookCalendarItemLink(eventId: string) {
+  return `https://outlook.office365.com/owa/?itemid=${encodeURIComponent(eventId)}&exvsurl=1&path=/calendar/item`;
+}
+
+function normalizeOptionalString(value?: string | null) {
+  const normalized = value?.trim();
+  return normalized ? normalized : null;
+}
+
 export async function graphWithAccessToken<T>(
   path: string,
   accessToken: string,
@@ -173,7 +182,15 @@ export interface GraphEvent {
   start?: { dateTime?: string; timeZone?: string };
   end?: { dateTime?: string; timeZone?: string };
   onlineMeetingUrl?: string;
+  onlineMeeting?: { joinUrl?: string };
+  isOnlineMeeting?: boolean;
+  onlineMeetingProvider?: string;
   webLink?: string;
+  bodyPreview?: string;
+  body?: {
+    contentType?: string;
+    content?: string;
+  };
   isCancelled?: boolean;
 }
 
@@ -201,10 +218,118 @@ function sortMailsByReceivedDate<T extends { receivedDateTime?: string }>(mails:
   });
 }
 
+function decodeHtmlEntities(content: string) {
+  return content
+    .replace(/&amp;/gi, "&")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;/gi, "'")
+    .replace(/&nbsp;/gi, " ");
+}
+
+function cleanExtractedUrl(url: string) {
+  return decodeHtmlEntities(url).replace(/^[("'[\s]+/, "").replace(/[)"'\].,\s>]+$/, "");
+}
+
+function isLikelyMeetingJoinUrl(url: string) {
+  return /(teams\.microsoft\.com\/l\/meetup-join|teams\.live\.com\/meet|meet\.google\.com|(?:[\w-]+\.)?zoom\.us\/(?:j|wc\/join)\/|(?:[\w-]+\.)?webex\.com\/(?:meet|join|j\.php)|join\.skype\.com|skype\.com\/meet|gotomeeting\.com\/join|bluejeans\.com\/|chime\.aws\/|ringcentral\.com\/join)/i.test(
+    url
+  );
+}
+
+function extractMeetingJoinUrlFromContent(content?: string | null) {
+  if (!content) return null;
+  const decoded = decodeHtmlEntities(content);
+  const hrefMatches = Array.from(decoded.matchAll(/href=["']([^"']+)["']/gi)).map((match) => match[1]);
+  const textMatches = Array.from(decoded.matchAll(/https?:\/\/[^\s"'<>]+/gi)).map((match) => match[0]);
+  const candidates = [...hrefMatches, ...textMatches].map(cleanExtractedUrl);
+  return candidates.find((candidate) => isLikelyMeetingJoinUrl(candidate)) ?? null;
+}
+
+function extractMeetingJoinUrl(event: GraphEvent) {
+  return (
+    normalizeOptionalString(event.onlineMeeting?.joinUrl) ??
+    normalizeOptionalString(event.onlineMeetingUrl) ??
+    extractMeetingJoinUrlFromContent(event.body?.content) ??
+    extractMeetingJoinUrlFromContent(event.bodyPreview) ??
+    null
+  );
+}
+
+function eventLooksJoinable(event: GraphEvent) {
+  return Boolean(
+    event.isOnlineMeeting ||
+      event.onlineMeetingProvider ||
+      extractMeetingJoinUrlFromContent(event.body?.content) ||
+      extractMeetingJoinUrlFromContent(event.bodyPreview)
+  );
+}
+
+function eventNeedsLinkFallback(event: GraphEvent) {
+  return !normalizeOptionalString(event.webLink) || (eventLooksJoinable(event) && !extractMeetingJoinUrl(event));
+}
+
+async function fetchEventJoinInfo(eventId: string, accessToken?: string) {
+  const query = buildGraphPath(`/me/events/${encodeURIComponent(eventId)}`, {
+    $select: "id,isOnlineMeeting,onlineMeeting,onlineMeetingUrl,onlineMeetingProvider,webLink,bodyPreview,body"
+  });
+
+  const event = accessToken
+    ? await graphWithAccessToken<GraphEvent>(query, accessToken)
+    : await graph<GraphEvent>(query);
+
+  return event;
+}
+
+async function enrichEventsWithJoinInfo(events: GraphEvent[], accessToken?: string) {
+  const enriched = await Promise.all(
+    events.map(async (event) => {
+      if (!eventNeedsLinkFallback(event)) {
+        return {
+          ...event,
+          webLink: normalizeOptionalString(event.webLink) ?? buildOutlookCalendarItemLink(event.id)
+        };
+      }
+
+      try {
+        const detail = await fetchEventJoinInfo(event.id, accessToken);
+        const joinUrl = extractMeetingJoinUrl(detail) ?? extractMeetingJoinUrl(event);
+        return {
+          ...event,
+          bodyPreview: detail.bodyPreview ?? event.bodyPreview,
+          body: detail.body ?? event.body,
+          onlineMeeting: detail.onlineMeeting ?? event.onlineMeeting,
+          onlineMeetingUrl:
+            normalizeOptionalString(detail.onlineMeetingUrl) ??
+            normalizeOptionalString(event.onlineMeetingUrl) ??
+            joinUrl ??
+            undefined,
+          onlineMeetingProvider: detail.onlineMeetingProvider ?? event.onlineMeetingProvider,
+          webLink:
+            normalizeOptionalString(detail.webLink) ??
+            normalizeOptionalString(event.webLink) ??
+            buildOutlookCalendarItemLink(event.id),
+          isOnlineMeeting: detail.isOnlineMeeting ?? event.isOnlineMeeting ?? Boolean(joinUrl)
+        };
+      } catch {
+        const joinUrl = extractMeetingJoinUrl(event);
+        return {
+          ...event,
+          onlineMeetingUrl: normalizeOptionalString(event.onlineMeetingUrl) ?? joinUrl ?? undefined,
+          webLink: normalizeOptionalString(event.webLink) ?? buildOutlookCalendarItemLink(event.id)
+        };
+      }
+    })
+  );
+
+  return enriched;
+}
+
 export async function fetchRecentEmails(sinceIso: string) {
   const query = buildGraphPath("/me/messages", {
-    $top: "25",
-    $select: "id,conversationId,subject,webLink,bodyPreview,receivedDateTime,from",
+    $top: "200",
+    $select: "id,conversationId,subject,webLink,bodyPreview,body,receivedDateTime,from",
     $filter: `receivedDateTime ge ${sinceIso}`
   });
   const data = await graph<{ value: GraphMail[] }>(query);
@@ -213,8 +338,8 @@ export async function fetchRecentEmails(sinceIso: string) {
 
 export async function fetchRecentEmailsWithAccessToken(sinceIso: string, accessToken: string) {
   const query = buildGraphPath("/me/messages", {
-    $top: "25",
-    $select: "id,conversationId,subject,webLink,bodyPreview,receivedDateTime,from",
+    $top: "200",
+    $select: "id,conversationId,subject,webLink,bodyPreview,body,receivedDateTime,from",
     $filter: `receivedDateTime ge ${sinceIso}`
   });
   const data = await graphWithAccessToken<{ value: GraphMail[] }>(query, accessToken);
@@ -226,6 +351,7 @@ export async function fetchTodaysMeetings(startIso: string, endIso: string, pref
   const query = buildGraphPath("/me/calendarView", {
     startDateTime: startIso,
     endDateTime: endIso,
+    $select: "id,subject,start,end,onlineMeetingUrl,onlineMeeting,isOnlineMeeting,onlineMeetingProvider,webLink,bodyPreview,body,isCancelled",
     $orderby: "start/dateTime",
     $top: "25"
   });
@@ -233,7 +359,7 @@ export async function fetchTodaysMeetings(startIso: string, endIso: string, pref
     query,
     timeZone ? { Prefer: `outlook.timezone="${timeZone}"` } : undefined
   );
-  return { events: data.value, timeZone };
+  return { events: await enrichEventsWithJoinInfo(data.value), timeZone };
 }
 
 export async function fetchTodaysMeetingsWithAccessToken(
@@ -246,6 +372,7 @@ export async function fetchTodaysMeetingsWithAccessToken(
   const query = buildGraphPath("/me/calendarView", {
     startDateTime: startIso,
     endDateTime: endIso,
+    $select: "id,subject,start,end,onlineMeetingUrl,onlineMeeting,isOnlineMeeting,onlineMeetingProvider,webLink,bodyPreview,body,isCancelled",
     $orderby: "start/dateTime",
     $top: "25"
   });
@@ -254,7 +381,7 @@ export async function fetchTodaysMeetingsWithAccessToken(
     accessToken,
     timeZone ? { Prefer: `outlook.timezone="${timeZone}"` } : undefined
   );
-  return { events: data.value, timeZone };
+  return { events: await enrichEventsWithJoinInfo(data.value, accessToken), timeZone };
 }
 
 export async function fetchMicrosoftProfileWithAccessToken(accessToken: string) {

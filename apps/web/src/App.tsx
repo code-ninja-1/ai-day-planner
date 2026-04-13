@@ -12,15 +12,18 @@ import type {
   EmailTaskDetail,
   IntegrationStatus,
   JiraTaskDetail,
+  PersonalizationInsight,
+  RejectedTask,
   Reminder,
   Task,
   TaskDetail,
   TaskPriority,
   TaskStatus,
-  TodayResponse
+  TodayResponse,
+  UserPriorityProfile
 } from "./types";
 
-type View = "today" | "tasks" | "deferred" | "reminders" | "settings";
+type View = "today" | "tasks" | "deferred" | "rejected" | "reminders" | "settings";
 type TaskFilter = TaskStatus | "All";
 
 const priorityOrder: TaskPriority[] = ["High", "Medium", "Low"];
@@ -39,6 +42,23 @@ function formatDate(value: string | null) {
   return new Intl.DateTimeFormat(undefined, {
     dateStyle: "medium"
   }).format(new Date(value));
+}
+
+function formatMinutesAsHours(minutes: number) {
+  const hours = minutes / 60;
+  return `${hours % 1 === 0 ? hours.toFixed(0) : hours.toFixed(1)}h`;
+}
+
+function formatPercent(value: number) {
+  return `${Math.round(value * 100)}%`;
+}
+
+function formatPreferenceLines(values: string[]) {
+  return values.join("\n");
+}
+
+function parsePreferenceLines(value: string) {
+  return [...new Set(value.split(/\n|,/).map((item) => item.trim()).filter(Boolean))];
 }
 
 function getBrowserTimeZone() {
@@ -69,6 +89,18 @@ function getUpcomingMeetingId(meetings: TodayResponse["meetings"]) {
   const now = Date.now();
   const next = meetings.find((meeting) => !meeting.isCancelled && meetingInstant(meeting, "end").getTime() >= now);
   return next?.id ?? meetings.find((meeting) => !meeting.isCancelled)?.id ?? meetings[0]?.id ?? null;
+}
+
+function getUpcomingJoinableMeetingId(meetings: TodayResponse["meetings"]) {
+  const now = Date.now();
+  const nextJoinable = meetings.find(
+    (meeting) =>
+      !meeting.isCancelled &&
+      meeting.meetingLinkType === "join" &&
+      Boolean(meeting.meetingLink) &&
+      meetingInstant(meeting, "end").getTime() >= now
+  );
+  return nextJoinable?.id ?? null;
 }
 
 function getMeetingDayKey(meeting: TodayResponse["meetings"][number]) {
@@ -137,6 +169,29 @@ function groupMeetingsByDay(meetings: TodayResponse["meetings"]) {
   return groups;
 }
 
+function dayPlanBlockStatusLabel(block: TodayResponse["dayPlan"]["blocks"][number]) {
+  switch (block.status) {
+    case "in_progress":
+      return block.kind === "meeting" ? "Live" : "In progress";
+    case "up_next":
+      return "Up next";
+    case "completed":
+      return "Completed";
+    case "ended":
+      return "Ended";
+    default:
+      return block.kind === "meeting" ? "Planned" : "Planned";
+  }
+}
+
+function dayPlanBlockActionLabel(block: TodayResponse["dayPlan"]["blocks"][number]) {
+  if (!block.link) return null;
+  if (block.kind === "meeting") {
+    return block.note?.toLowerCase().includes("join") ? "Join now" : "Open in Calendar";
+  }
+  return "Open source";
+}
+
 function sourceLabel(task: Task) {
   if (task.source === "Jira" && task.jiraStatus) {
     return task.jiraStatus;
@@ -144,8 +199,93 @@ function sourceLabel(task: Task) {
   return task.status;
 }
 
+function nextJiraSubtask(task: Task) {
+  return (
+    task.jiraPlanningSubtasks.find((subtask) =>
+      /(progress|coding|review|testing|qa|blocked|in dev|development)/i.test(subtask.status ?? "")
+    ) ??
+    task.jiraPlanningSubtasks[0] ??
+    null
+  );
+}
+
+function jiraStorySummary(task: Task) {
+  if (task.source !== "Jira") return null;
+  const nextSubtask = nextJiraSubtask(task);
+  const openCount = task.jiraPlanningSubtasks.length;
+  const openHours =
+    task.jiraSubtaskEstimateSeconds && task.jiraSubtaskEstimateSeconds > 0
+      ? `${(task.jiraSubtaskEstimateSeconds / 3600).toFixed(task.jiraSubtaskEstimateSeconds % 3600 === 0 ? 0 : 1)}h`
+      : null;
+  const parts = [`Story ${task.sourceRef ?? "Jira item"}`];
+  if (openCount > 0) {
+    parts.push(`${openCount} open subtask${openCount === 1 ? "" : "s"}`);
+  }
+  if (nextSubtask) {
+    parts.push(`Next ${nextSubtask.key}`);
+  }
+  if (openHours) {
+    parts.push(`${openHours} remaining`);
+  }
+  return parts.join(" • ");
+}
+
 function compareTasks(left: Task, right: Task) {
   return new Date(right.updatedAt ?? 0).getTime() - new Date(left.updatedAt ?? 0).getTime();
+}
+
+function simplifyEmailTaskTitle(title: string) {
+  return title
+    .replace(/\s*\[[^\]]*account:\s*\d+[^\]]*\]/gi, "")
+    .replace(/\b\d{10,}\b/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function emailGroupKey(task: Task) {
+  if (task.source !== "Email") return null;
+  const simplified = simplifyEmailTaskTitle(task.title);
+  return simplified ? `email:${simplified.toLowerCase()}` : null;
+}
+
+type TaskPresentationItem =
+  | { kind: "single"; key: string; task: Task }
+  | { kind: "cluster"; key: string; title: string; tasks: Task[] };
+
+function buildTaskPresentationItems(tasks: Task[]) {
+  const ordered = [...tasks].sort(compareTasks);
+  const emailGroups = new Map<string, Task[]>();
+
+  for (const task of ordered) {
+    const key = emailGroupKey(task);
+    if (!key) continue;
+    const current = emailGroups.get(key) ?? [];
+    current.push(task);
+    emailGroups.set(key, current);
+  }
+
+  const seen = new Set<string>();
+  const items: TaskPresentationItem[] = [];
+
+  for (const task of ordered) {
+    const key = emailGroupKey(task);
+    const grouped = key ? emailGroups.get(key) ?? [] : [];
+    if (key && grouped.length > 1) {
+      if (seen.has(key)) continue;
+      seen.add(key);
+      items.push({
+        kind: "cluster",
+        key,
+        title: simplifyEmailTaskTitle(grouped[0]?.title ?? task.title),
+        tasks: grouped
+      });
+      continue;
+    }
+
+    items.push({ kind: "single", key: `task:${task.id}`, task });
+  }
+
+  return items;
 }
 
 function groupTasksByPriority(tasks: Task[]) {
@@ -204,8 +344,9 @@ function AppHeader(props: { active: View; onChange: (view: View) => void }) {
           ["today", "Today"],
           ["tasks", "Tasks"],
           ["deferred", "Deferred"],
+          ["rejected", "Rejected"],
           ["reminders", "Reminders"],
-          ["settings", "Integrations"]
+          ["settings", "Settings"]
         ].map(([id, label]) => (
           <button
             key={id}
@@ -233,6 +374,14 @@ function TodaySkeleton() {
   return (
     <section className="panel-stack">
       <div className="hero-card skeleton-block hero-skeleton" />
+      <div className="panel skeleton-panel">
+        <div className="skeleton-line wide" />
+        <div className="skeleton-line medium" />
+        <div className="skeleton-stack">
+          <div className="skeleton-card" />
+          <div className="skeleton-card" />
+        </div>
+      </div>
       <div className="dashboard-grid">
         <div className="panel tall-panel skeleton-panel">
           <div className="skeleton-line wide" />
@@ -254,6 +403,124 @@ function TodaySkeleton() {
         </div>
       </div>
     </section>
+  );
+}
+
+function DayPlanPanel(props: {
+  data: TodayResponse;
+  onOpenDetails: (task: Task) => Promise<void>;
+}) {
+  const taskLookup = new Map(flattenTaskGroups(props.data.tasks).map((task) => [task.id, task]));
+  const summary = props.data.dayPlan.summary;
+
+  return (
+    <div className="panel day-plan-panel">
+      <div className="panel-header">
+        <div>
+          <h3>Daily Plan</h3>
+          <p className="timeline-header-note">{summary.guidance}</p>
+        </div>
+        <div className="panel-header-actions">
+          <span>{summary.dayKey}</span>
+          <span className="day-plan-factor">Pattern fit {formatPercent(summary.focusFactor)}</span>
+        </div>
+      </div>
+
+      <div className="day-plan-summary-grid">
+        <div className="overview-card day-plan-summary-card">
+          <span>Capacity</span>
+          <strong>{formatMinutesAsHours(summary.adaptedTaskCapacityMinutes)}</strong>
+          <p>{formatMinutesAsHours(summary.remainingTaskCapacityMinutes)} still available for task work</p>
+        </div>
+        <div className="overview-card day-plan-summary-card">
+          <span>Completed today</span>
+          <strong>{formatMinutesAsHours(summary.completedTaskMinutes)}</strong>
+          <p>{formatPercent(summary.completionRate)} of today’s planned task load already closed</p>
+        </div>
+        <div className="overview-card day-plan-summary-card">
+          <span>Planned next</span>
+          <strong>{formatMinutesAsHours(summary.plannedTaskMinutes)}</strong>
+          <p>{props.data.dayPlan.blocks.filter((block) => block.kind === "task").length} work blocks arranged around meetings</p>
+        </div>
+        <div className="overview-card day-plan-summary-card">
+          <span>Spillover</span>
+          <strong>{summary.spilloverTaskCount}</strong>
+          <p>{formatMinutesAsHours(summary.freeMinutes)} flexible time remains after the scheduled blocks</p>
+        </div>
+      </div>
+
+      <div className="day-plan-list">
+        {props.data.dayPlan.blocks.length ? (
+          props.data.dayPlan.blocks.map((block) => {
+            const task = block.taskId !== null ? taskLookup.get(block.taskId) ?? null : null;
+            const actionLabel = dayPlanBlockActionLabel(block);
+            return (
+              <div
+                key={block.id}
+                className={`day-plan-item day-plan-item-${block.kind} day-plan-item-${block.status}`}
+              >
+                <div className="day-plan-time">
+                  <strong>{formatMeetingTime(block.startTime, block.timeZone)}</strong>
+                  <span>{block.durationMinutes} min</span>
+                </div>
+                <div className="day-plan-body">
+                  <div className="day-plan-title-row">
+                    <strong>{block.title}</strong>
+                    <span className={`timeline-state ${block.status === "planned" ? "queued" : block.status}`}>
+                      {dayPlanBlockStatusLabel(block)}
+                    </span>
+                    {block.priority ? (
+                      <span className={`priority-pill priority-pill-${block.priority.toLowerCase()}`}>{block.priority}</span>
+                    ) : null}
+                  </div>
+                  <p>
+                    {formatMeetingTime(block.startTime, block.timeZone)} to{" "}
+                    {formatMeetingTime(block.endTime, block.timeZone)}
+                  </p>
+                  {block.note ? <p className="day-plan-note">{block.note}</p> : null}
+                  <div className="day-plan-actions">
+                    {task ? (
+                      <button className="ghost-button subtle-action" onClick={() => void props.onOpenDetails(task)}>
+                        View task
+                      </button>
+                    ) : null}
+                    {block.link && actionLabel ? (
+                      <a className="source-link" href={block.link} target="_blank" rel="noreferrer">
+                        {actionLabel}
+                      </a>
+                    ) : null}
+                  </div>
+                </div>
+              </div>
+            );
+          })
+        ) : (
+          <p className="empty-state">No remaining work blocks are needed today.</p>
+        )}
+      </div>
+
+      {props.data.dayPlan.spilloverTasks.length ? (
+        <div className="day-plan-spillover">
+          <div className="task-group-header">
+            <h4>Spillover candidates</h4>
+            <span>{props.data.dayPlan.spilloverTasks.length}</span>
+          </div>
+          <div className="day-plan-spillover-list">
+            {props.data.dayPlan.spilloverTasks.slice(0, 4).map((task) => (
+              <button key={task.id} className="day-plan-spillover-item" onClick={() => void props.onOpenDetails(task)}>
+                <strong>{task.title}</strong>
+                {task.source === "Jira" && jiraStorySummary(task) ? (
+                  <span>{jiraStorySummary(task)}</span>
+                ) : null}
+                <span>
+                  {task.priority} • {task.estimatedEffortBucket ?? "15 min"}
+                </span>
+              </button>
+            ))}
+          </div>
+        </div>
+      ) : null}
+    </div>
   );
 }
 
@@ -607,6 +874,9 @@ function TaskCard(props: {
           ) : null}
         </div>
         <strong>{props.task.title}</strong>
+        {props.task.source === "Jira" && jiraStorySummary(props.task) ? (
+          <p className="task-story-context">{jiraStorySummary(props.task)}</p>
+        ) : null}
         {props.task.priorityExplanation ? (
           <p className="task-why">Why now: {props.task.priorityExplanation}</p>
         ) : null}
@@ -648,7 +918,7 @@ function TaskCard(props: {
         />
         {props.onDelete ? (
           <button className="ghost-button subtle-action" onClick={() => void props.onDelete?.(props.task)}>
-            Remove
+            {props.task.source === "Manual" ? "Remove" : "Reject"}
           </button>
         ) : null}
         {props.onDeferUntilTomorrow && !props.task.deferredUntil ? (
@@ -663,6 +933,49 @@ function TaskCard(props: {
         ) : null}
       </div>
     </article>
+  );
+}
+
+function TaskClusterCard(props: {
+  title: string;
+  tasks: Task[];
+  onStatusChange: (task: Task, status: TaskStatus) => Promise<void>;
+  onPriorityChange: (task: Task, priority: TaskPriority) => Promise<void>;
+  onDelete?: (task: Task) => Promise<void>;
+  onOpenDetails?: (task: Task) => Promise<void>;
+  onDeferUntilTomorrow?: (task: Task) => Promise<void>;
+  onBringBackNow?: (task: Task) => Promise<void>;
+  disableControls?: boolean;
+}) {
+  return (
+    <section className="task-cluster">
+      <div className="task-cluster-header">
+        <div>
+          <div className="task-meta">
+            <span className="pill pill-email">Email</span>
+            <span className="subtle-pill">{props.tasks.length} related messages</span>
+          </div>
+          <strong>{props.title}</strong>
+          <p className="muted">Grouped together as one stream of work while each email keeps its own controls.</p>
+        </div>
+      </div>
+      <div className="task-cluster-list">
+        {props.tasks.map((task) => (
+          <TaskCard
+            key={task.id}
+            task={task}
+            dense
+            onStatusChange={(currentTask, status) => props.onStatusChange(currentTask, status)}
+            onPriorityChange={(currentTask, priority) => props.onPriorityChange(currentTask, priority)}
+            onDelete={props.onDelete ? (currentTask) => props.onDelete!(currentTask) : undefined}
+            onOpenDetails={props.onOpenDetails}
+            onDeferUntilTomorrow={props.onDeferUntilTomorrow}
+            onBringBackNow={props.onBringBackNow}
+            disableControls={props.disableControls}
+          />
+        ))}
+      </div>
+    </section>
   );
 }
 
@@ -685,6 +998,7 @@ function TodayView(props: {
   const meetingTimeZone = props.data?.meetings.find((meeting) => meeting.timeZone)?.timeZone ?? null;
   const orderedMeetings = props.data?.meetings ?? [];
   const focusedMeetingId = getUpcomingMeetingId(orderedMeetings);
+  const joinableMeetingId = getUpcomingJoinableMeetingId(orderedMeetings);
   const focusedMeeting = focusedMeetingId
     ? orderedMeetings.find((meeting) => meeting.id === focusedMeetingId) ?? null
     : null;
@@ -731,7 +1045,7 @@ function TodayView(props: {
             <span>Workload</span>
             <strong>{props.data.workload.state}</strong>
             <p>
-              {props.data.workload.totalTaskMinutes} min tasks • {props.data.workload.totalMeetingMinutes} min meetings
+              {formatMinutesAsHours(props.data.workload.totalTaskMinutes)} tasks • {formatMinutesAsHours(props.data.workload.totalMeetingMinutes)} meetings
             </p>
           </div>
           <div className="overview-card">
@@ -744,8 +1058,15 @@ function TodayView(props: {
             <strong>{props.data.deferredTaskCount} hidden</strong>
             <p>Deferred tasks stay out of the active plan until they are due.</p>
           </div>
+          <div className="overview-card">
+            <span>Rejected queue</span>
+            <strong>{props.data.rejectedTaskCount} hidden</strong>
+            <p>Rejected tasks remain recoverable with explanations and feedback controls.</p>
+          </div>
         </div>
       ) : null}
+
+      {props.data ? <DayPlanPanel data={props.data} onOpenDetails={props.onOpenDetails} /> : null}
 
       <div className="dashboard-grid">
         <div className="panel tall-panel">
@@ -823,7 +1144,9 @@ function TodayView(props: {
                             </p>
                             {meeting.meetingLink && !meeting.isCancelled && meetingActionLabel(meeting) ? (
                               <a className="source-link" href={meeting.meetingLink} target="_blank" rel="noreferrer">
-                                {meetingActionLabel(meeting)}
+                                {meeting.id === joinableMeetingId && meeting.meetingLinkType === "join"
+                                  ? "Join now"
+                                  : meetingActionLabel(meeting)}
                               </a>
                             ) : null}
                           </div>
@@ -921,6 +1244,7 @@ function TasksView(props: {
   onDeferUntilTomorrow: (task: Task) => Promise<void>;
 }) {
   const [title, setTitle] = useState("");
+  const items = useMemo(() => buildTaskPresentationItems(props.tasks), [props.tasks]);
 
   return (
     <section className="panel-stack">
@@ -966,18 +1290,31 @@ function TasksView(props: {
 
         <div className="task-table">
           {props.loading ? <p className="muted">Loading tasks…</p> : null}
-          {props.tasks.map((task) => (
-            <TaskCard
-              key={task.id}
-              task={task}
-              dense
-              onStatusChange={(currentTask, status) => props.onUpdateStatus(currentTask, status)}
-              onPriorityChange={(currentTask, priority) => props.onUpdatePriority(currentTask, priority)}
-              onDelete={(currentTask) => props.onDelete(currentTask)}
-              onOpenDetails={props.onOpenDetails}
-              onDeferUntilTomorrow={props.onDeferUntilTomorrow}
-            />
-          ))}
+          {items.map((item) =>
+            item.kind === "cluster" ? (
+              <TaskClusterCard
+                key={item.key}
+                title={item.title}
+                tasks={item.tasks}
+                onStatusChange={(currentTask, status) => props.onUpdateStatus(currentTask, status)}
+                onPriorityChange={(currentTask, priority) => props.onUpdatePriority(currentTask, priority)}
+                onDelete={(currentTask) => props.onDelete(currentTask)}
+                onOpenDetails={props.onOpenDetails}
+                onDeferUntilTomorrow={props.onDeferUntilTomorrow}
+              />
+            ) : (
+              <TaskCard
+                key={item.key}
+                task={item.task}
+                dense
+                onStatusChange={(currentTask, status) => props.onUpdateStatus(currentTask, status)}
+                onPriorityChange={(currentTask, priority) => props.onUpdatePriority(currentTask, priority)}
+                onDelete={(currentTask) => props.onDelete(currentTask)}
+                onOpenDetails={props.onOpenDetails}
+                onDeferUntilTomorrow={props.onDeferUntilTomorrow}
+              />
+            )
+          )}
           {!props.tasks.length ? <p className="empty-state">No tasks match this filter yet.</p> : null}
         </div>
       </div>
@@ -991,6 +1328,8 @@ function DeferredView(props: {
   onBringBackNow: (task: Task) => Promise<void>;
   onOpenDetails: (task: Task) => Promise<void>;
 }) {
+  const items = useMemo(() => buildTaskPresentationItems(props.tasks), [props.tasks]);
+
   return (
     <section className="panel-stack">
       <div className="panel">
@@ -1002,18 +1341,31 @@ function DeferredView(props: {
         </div>
         <div className="task-table">
           {props.loading ? <p className="muted">Loading deferred tasks…</p> : null}
-          {props.tasks.map((task) => (
-            <TaskCard
-              key={task.id}
-              task={task}
-              dense
-              onStatusChange={async () => undefined}
-              onPriorityChange={async () => undefined}
-              onOpenDetails={task.source === "Manual" ? undefined : props.onOpenDetails}
-              onBringBackNow={props.onBringBackNow}
-              disableControls
-            />
-          ))}
+          {items.map((item) =>
+            item.kind === "cluster" ? (
+              <TaskClusterCard
+                key={item.key}
+                title={item.title}
+                tasks={item.tasks}
+                onStatusChange={async () => undefined}
+                onPriorityChange={async () => undefined}
+                onOpenDetails={props.onOpenDetails}
+                onBringBackNow={props.onBringBackNow}
+                disableControls
+              />
+            ) : (
+              <TaskCard
+                key={item.key}
+                task={item.task}
+                dense
+                onStatusChange={async () => undefined}
+                onPriorityChange={async () => undefined}
+                onOpenDetails={item.task.source === "Manual" ? undefined : props.onOpenDetails}
+                onBringBackNow={props.onBringBackNow}
+                disableControls
+              />
+            )
+          )}
           {!props.tasks.length ? <p className="empty-state">No deferred tasks right now.</p> : null}
         </div>
       </div>
@@ -1076,6 +1428,98 @@ function ReminderCenterView(props: {
   );
 }
 
+function RejectedView(props: {
+  tasks: RejectedTask[];
+  loading: boolean;
+  onRestore: (task: RejectedTask) => Promise<void>;
+  onAlwaysIgnore: (task: RejectedTask) => Promise<void>;
+  onShouldInclude: (task: RejectedTask) => Promise<void>;
+}) {
+  const [sourceFilter, setSourceFilter] = useState<"All" | "Email" | "Jira">("All");
+  const filtered = props.tasks.filter((task) => (sourceFilter === "All" ? true : task.source === sourceFilter));
+
+  function hasIncludeLearning(task: RejectedTask) {
+    return task.decisionState === "uncertain" || (task.decisionReason ?? "").includes("should have been included");
+  }
+
+  function hasIgnoreLearning(task: RejectedTask) {
+    return (task.decisionReason ?? "").includes("ignore similar");
+  }
+
+  return (
+    <section className="panel-stack">
+      <div className="panel">
+        <div className="tasks-header">
+          <div>
+            <h3>Rejected Queue</h3>
+            <p className="muted">Items the planner hid from the active plan, with reasons and recovery actions.</p>
+          </div>
+          <div className="filter-shell">
+            <label className="status-select compact">
+              <span>Source</span>
+              <select value={sourceFilter} onChange={(event) => setSourceFilter(event.target.value as "All" | "Email" | "Jira")}>
+                <option value="All">All sources</option>
+                <option value="Email">Email</option>
+                <option value="Jira">Jira</option>
+              </select>
+            </label>
+          </div>
+        </div>
+        <div className="reminder-list">
+          {props.loading ? <p className="muted">Loading rejected tasks…</p> : null}
+          {filtered.map((task) => (
+            <article className="reminder-card rejected-card" key={task.id}>
+              <div className="task-meta">
+                <span className={`pill pill-${task.source.toLowerCase()}`}>{task.source}</span>
+                <span className="subtle-pill">
+                  Hidden • {Math.round((task.decisionConfidence ?? 0) * 100)}% confidence
+                </span>
+              </div>
+              <strong>{task.title}</strong>
+              <p className="muted">{task.decisionReason ?? "This item looked less relevant to your current preferences."}</p>
+              <div className="task-link-row">
+                {task.decisionReasonTags.map((tag) => (
+                  <span className="subtle-pill" key={tag}>
+                    {tag.replace(/_/g, " ")}
+                  </span>
+                ))}
+                {hasIncludeLearning(task) ? <span className="subtle-pill learning-pill">Learning applied</span> : null}
+                {hasIgnoreLearning(task) ? <span className="subtle-pill learning-pill">Ignore similar saved</span> : null}
+              </div>
+              <div className="reminder-footer">
+                <span className="small-text">Rejected {formatDateTime(task.rejectedAt)}</span>
+                <div className="integration-actions">
+                  {task.sourceLink ? (
+                    <a className="ghost-button subtle-action" href={task.sourceLink} target="_blank" rel="noreferrer">
+                      Open source
+                    </a>
+                  ) : null}
+                  <button
+                    className={hasIgnoreLearning(task) ? "ghost-button subtle-action selected-action" : "ghost-button subtle-action"}
+                    onClick={() => void props.onAlwaysIgnore(task)}
+                  >
+                    Always ignore similar
+                  </button>
+                  <button
+                    className={hasIncludeLearning(task) ? "ghost-button subtle-action selected-action" : "ghost-button subtle-action"}
+                    onClick={() => void props.onShouldInclude(task)}
+                  >
+                    This should have been included
+                  </button>
+                  <button className="primary-button" onClick={() => void props.onRestore(task)}>
+                    Restore to plan
+                  </button>
+                </div>
+              </div>
+            </article>
+          ))}
+          {!filtered.length ? <p className="empty-state">Nothing is hidden right now.</p> : null}
+        </div>
+      </div>
+    </section>
+  );
+}
+
 function SettingsView(props: {
   integrations: {
     microsoft: IntegrationStatus;
@@ -1083,6 +1527,8 @@ function SettingsView(props: {
   } | null;
   loading: boolean;
   automation: AutomationSettings | null;
+  profile: UserPriorityProfile | null;
+  insights: PersonalizationInsight[];
   microsoftAccount: MicrosoftAccount | null;
   microsoftStatusText: string | null;
   jiraStatusText: string | null;
@@ -1090,6 +1536,19 @@ function SettingsView(props: {
   savingJira: boolean;
   onUpdateSchedule: (input: Partial<Pick<AutomationSettings, "scheduleEnabled" | "scheduleTimeLocal" | "scheduleTimezone">>) => Promise<void>;
   onUpdateReminderSettings: (input: Partial<Pick<AutomationSettings, "remindersEnabled" | "reminderCadenceHours" | "desktopNotificationsEnabled">>) => Promise<void>;
+  onUpdateProfile: (input: Partial<UserPriorityProfile>) => Promise<void>;
+  onRunCalibration: (input: {
+    roleFocus: string;
+    prioritizationPrompt: string;
+    importantWork: string[];
+    noiseWork: string[];
+    mustNotMiss: string[];
+    importantPeople: string[];
+    importantProjects: string[];
+    filteringStyle: UserPriorityProfile["filteringStyle"];
+    priorityBias: UserPriorityProfile["priorityBias"];
+    exampleRankings: Array<{ title: string; source: "Email" | "Jira" | "Manual"; decision: "show_today" | "keep_low" | "reject_noise" }>;
+  }) => Promise<void>;
   onConnectMicrosoft: () => Promise<void>;
   onDisconnectMicrosoft: () => Promise<void>;
   onSaveJira: (input: { baseUrl: string; email: string; apiToken: string }) => Promise<void>;
@@ -1104,6 +1563,27 @@ function SettingsView(props: {
     reminderCadenceHours: 6,
     desktopNotificationsEnabled: false
   });
+  const [calibrationForm, setCalibrationForm] = useState({
+    roleFocus: "",
+    prioritizationPrompt: "",
+    importantWork: "",
+    noiseWork: "",
+    mustNotMiss: "",
+    importantPeople: "",
+    importantProjects: "",
+    filteringStyle: "conservative" as UserPriorityProfile["filteringStyle"],
+    priorityBias: "balanced" as UserPriorityProfile["priorityBias"]
+  });
+  const [exampleRankings, setExampleRankings] = useState<
+    Array<{ title: string; source: "Email" | "Jira" | "Manual"; decision: "show_today" | "keep_low" | "reject_noise" }>
+  >([
+    { title: "Manager asks for design review by EOD", source: "Email", decision: "show_today" },
+    { title: "Jira issue assigned to you and blocked in QA", source: "Jira", decision: "show_today" },
+    { title: "Automated comment notification on Jira thread", source: "Email", decision: "reject_noise" },
+    { title: "Weekly org newsletter", source: "Email", decision: "reject_noise" },
+    { title: "Manual note for future cleanup", source: "Manual", decision: "keep_low" },
+    { title: "Jira story updated with review request", source: "Jira", decision: "show_today" }
+  ]);
 
   useEffect(() => {
     const jiraConfig = props.integrations?.jira.config;
@@ -1135,8 +1615,32 @@ function SettingsView(props: {
     });
   }, [props.automation]);
 
+  useEffect(() => {
+    if (!props.profile) return;
+    setCalibrationForm({
+      roleFocus: props.profile.roleFocus ?? "",
+      prioritizationPrompt: props.profile.prioritizationPrompt ?? "",
+      importantWork: formatPreferenceLines(props.profile.importantWork),
+      noiseWork: formatPreferenceLines(props.profile.noiseWork),
+      mustNotMiss: formatPreferenceLines(props.profile.mustNotMiss),
+      importantPeople: formatPreferenceLines(props.profile.importantPeople),
+      importantProjects: formatPreferenceLines(props.profile.importantProjects),
+      filteringStyle: props.profile.filteringStyle,
+      priorityBias: props.profile.priorityBias
+    });
+  }, [props.profile]);
+
   return (
     <section className="panel-stack">
+      <div className="hero-card settings-hero">
+        <div className="hero-copy">
+          <p className="eyebrow">Settings</p>
+          <h2>Connections, automation, and prioritization controls.</h2>
+          <p className="muted">
+            Tune integrations, scheduling, reminders, and the personalization instructions that shape your plan.
+          </p>
+        </div>
+      </div>
       <div className="settings-grid">
         <div className="panel integration-card">
           <div className="panel-header">
@@ -1347,6 +1851,223 @@ function SettingsView(props: {
         </div>
         {props.automation?.schedulerLastError ? <p className="error-text">{props.automation.schedulerLastError}</p> : null}
       </div>
+      <div className="panel automation-panel">
+        <div className="panel-header">
+          <h3>Planner Preferences</h3>
+          <span className={`status-badge ${props.profile?.personalizationEnabled ? "connected" : "disconnected"}`}>
+            {props.profile?.personalizationEnabled ? "enabled" : "disabled"}
+          </span>
+        </div>
+        <p className="muted">
+          Keep this simple: tell the planner what to surface early, what is safe to mute, and what should never disappear.
+          The planner still analyzes the full mail or Jira content before deciding.
+        </p>
+        <div className="automation-grid">
+          <label className="toggle-card">
+            <span>Personalized filtering</span>
+            <input
+              type="checkbox"
+              checked={props.profile?.personalizationEnabled ?? true}
+              onChange={async (event) => {
+                await props.onUpdateProfile({ personalizationEnabled: event.target.checked });
+              }}
+            />
+          </label>
+          <label className="field-card">
+            <span>How selective should the planner be?</span>
+            <select
+              value={calibrationForm.filteringStyle}
+              onChange={(event) =>
+                setCalibrationForm((current) => ({
+                  ...current,
+                  filteringStyle: event.target.value as UserPriorityProfile["filteringStyle"]
+                }))
+              }
+            >
+              <option value="conservative">Tight focus</option>
+              <option value="balanced">Balanced</option>
+              <option value="aggressive">Show me more</option>
+            </select>
+          </label>
+          <label className="field-card">
+            <span>When in doubt, optimize for</span>
+            <select
+              value={calibrationForm.priorityBias}
+              onChange={(event) =>
+                setCalibrationForm((current) => ({
+                  ...current,
+                  priorityBias: event.target.value as UserPriorityProfile["priorityBias"]
+                }))
+              }
+            >
+              <option value="focus">Finishing what matters</option>
+              <option value="balanced">Balanced</option>
+              <option value="coverage">Keeping options visible</option>
+            </select>
+          </label>
+        </div>
+        <form
+          className="settings-form refined"
+          onSubmit={async (event) => {
+            event.preventDefault();
+            await props.onRunCalibration({
+              roleFocus: calibrationForm.roleFocus,
+              prioritizationPrompt: calibrationForm.prioritizationPrompt,
+              importantWork: parsePreferenceLines(calibrationForm.importantWork),
+              noiseWork: parsePreferenceLines(calibrationForm.noiseWork),
+              mustNotMiss: parsePreferenceLines(calibrationForm.mustNotMiss),
+              importantPeople: parsePreferenceLines(calibrationForm.importantPeople),
+              importantProjects: parsePreferenceLines(calibrationForm.importantProjects),
+              filteringStyle: calibrationForm.filteringStyle,
+              priorityBias: calibrationForm.priorityBias,
+              exampleRankings
+            });
+          }}
+        >
+          <div className="preference-grid">
+            <label className="field-card preference-card">
+              <span>Your role or current charter</span>
+              <input
+                value={calibrationForm.roleFocus}
+                onChange={(event) => setCalibrationForm((current) => ({ ...current, roleFocus: event.target.value }))}
+                placeholder="For example: Staff engineer focused on platform reliability"
+              />
+            </label>
+            <label className="field-card preference-card">
+              <span>Always prioritize</span>
+              <textarea
+                className="preference-editor"
+                value={calibrationForm.mustNotMiss}
+                onChange={(event) => setCalibrationForm((current) => ({ ...current, mustNotMiss: event.target.value }))}
+                placeholder={"One item per line\nProduction issues\nManager requests\nCustomer escalations"}
+              />
+            </label>
+            <label className="field-card preference-card">
+              <span>Focus areas</span>
+              <textarea
+                className="preference-editor"
+                value={calibrationForm.importantWork}
+                onChange={(event) => setCalibrationForm((current) => ({ ...current, importantWork: event.target.value }))}
+                placeholder={"One item per line\nCode reviews\nRelease work\nPlatform migrations"}
+              />
+            </label>
+            <label className="field-card preference-card">
+              <span>Priority people or senders</span>
+              <textarea
+                className="preference-editor"
+                value={calibrationForm.importantPeople}
+                onChange={(event) => setCalibrationForm((current) => ({ ...current, importantPeople: event.target.value }))}
+                placeholder={"One item per line\nmanager@company.com\nDirector of Engineering\nProduct lead"}
+              />
+            </label>
+            <label className="field-card preference-card">
+              <span>Priority projects</span>
+              <textarea
+                className="preference-editor"
+                value={calibrationForm.importantProjects}
+                onChange={(event) => setCalibrationForm((current) => ({ ...current, importantProjects: event.target.value }))}
+                placeholder={"One item per line\nSECCCAT\nPLATFORM\nAUTH"}
+              />
+            </label>
+            <label className="field-card preference-card">
+              <span>Usually safe to ignore</span>
+              <textarea
+                className="preference-editor"
+                value={calibrationForm.noiseWork}
+                onChange={(event) => setCalibrationForm((current) => ({ ...current, noiseWork: event.target.value }))}
+                placeholder={"One item per line\nGeneric digests\nFYI only notices\nLow-signal comment notifications"}
+              />
+            </label>
+          </div>
+          <label className="field-card">
+            <span>Notes to the planner</span>
+            <textarea
+              className="prompt-editor"
+              value={calibrationForm.prioritizationPrompt}
+              onChange={(event) =>
+                setCalibrationForm((current) => ({ ...current, prioritizationPrompt: event.target.value }))
+              }
+              placeholder="Anything subtle the planner should know, like how you balance coding, reviews, meetings, or follow-ups."
+            />
+          </label>
+          <div className="field-card">
+            <span>Teach with examples</span>
+            <p className="muted small-text">
+              These examples help the planner tune filtering and ranking without hiding work permanently.
+            </p>
+          </div>
+          <div className="calibration-list">
+            {exampleRankings.map((item, index) => (
+              <div className="field-card" key={`${item.title}-${index}`}>
+                <span>
+                  {item.source}: {item.title}
+                </span>
+                <select
+                  value={item.decision}
+                  onChange={(event) =>
+                    setExampleRankings((current) =>
+                      current.map((entry, currentIndex) =>
+                        currentIndex === index
+                          ? {
+                              ...entry,
+                              decision: event.target.value as "show_today" | "keep_low" | "reject_noise"
+                            }
+                          : entry
+                      )
+                    )
+                  }
+                >
+                  <option value="show_today">Bring forward</option>
+                  <option value="keep_low">Keep visible, lower</option>
+                  <option value="reject_noise">Hide as low value</option>
+                </select>
+              </div>
+            ))}
+          </div>
+          <div className="integration-actions">
+            <button className="primary-button" type="submit">
+              Refresh preferences
+            </button>
+            <button
+              className="ghost-button subtle-action"
+              type="button"
+              onClick={() =>
+                void props.onUpdateProfile({
+                  filteringStyle: calibrationForm.filteringStyle,
+                  priorityBias: calibrationForm.priorityBias,
+                  roleFocus: calibrationForm.roleFocus,
+                  prioritizationPrompt: calibrationForm.prioritizationPrompt,
+                  importantWork: parsePreferenceLines(calibrationForm.importantWork),
+                  noiseWork: parsePreferenceLines(calibrationForm.noiseWork),
+                  mustNotMiss: parsePreferenceLines(calibrationForm.mustNotMiss),
+                  importantPeople: parsePreferenceLines(calibrationForm.importantPeople),
+                  importantProjects: parsePreferenceLines(calibrationForm.importantProjects)
+                })
+              }
+            >
+              Save preferences
+            </button>
+          </div>
+        </form>
+        <div className="field-card">
+          <span>What the planner is learning</span>
+          <p className="muted small-text">
+            Rejections, restores, reprioritization, and completions continue to refine future filtering and ranking.
+          </p>
+        </div>
+        <div className="detail-list">
+          {props.insights.length ? (
+            props.insights.map((insight, index) => (
+              <article className="detail-row" key={`${insight.statement}-${index}`}>
+                <strong>{insight.statement}</strong>
+                <span className="subtle-pill">{Math.round(insight.confidence * 100)}%</span>
+              </article>
+            ))
+          ) : (
+            <p className="empty-state">Insights will appear after a few task decisions and calibrations.</p>
+          )}
+        </div>
+      </div>
     </section>
   );
 }
@@ -1366,17 +2087,28 @@ function replaceTaskInList(tasks: Task[], taskId: number, updater: (task: Task) 
   return tasks.map((task) => (task.id === taskId ? updater(task) : task));
 }
 
+function mergeTaskLists(existing: Task[], incoming: Task[]) {
+  const byId = new Map<number, Task>();
+  for (const task of existing) {
+    byId.set(task.id, task);
+  }
+  for (const task of incoming) {
+    byId.set(task.id, task);
+  }
+  return [...byId.values()].sort(compareTasks);
+}
+
 function applyTodayResponseState(
   payload: TodayResponse,
   setters: {
     setToday: (value: TodayResponse) => void;
-    setAllTasks: (value: Task[]) => void;
+    setAllTasks: React.Dispatch<React.SetStateAction<Task[]>>;
     setReminders: (value: Reminder[]) => void;
     setAutomation: (value: AutomationSettings) => void;
   }
 ) {
   setters.setToday(payload);
-  setters.setAllTasks(flattenTaskGroups(payload.tasks));
+  setters.setAllTasks((current) => mergeTaskLists(current, flattenTaskGroups(payload.tasks)));
   setters.setReminders(payload.reminders);
   setters.setAutomation(payload.automation);
 }
@@ -1386,8 +2118,11 @@ export function App() {
   const [today, setToday] = useState<TodayResponse | null>(null);
   const [allTasks, setAllTasks] = useState<Task[]>([]);
   const [deferredTasks, setDeferredTasks] = useState<Task[]>([]);
+  const [rejectedTasks, setRejectedTasks] = useState<RejectedTask[]>([]);
   const [reminders, setReminders] = useState<Reminder[]>([]);
   const [automation, setAutomation] = useState<AutomationSettings | null>(null);
+  const [profile, setProfile] = useState<UserPriorityProfile | null>(null);
+  const [insights, setInsights] = useState<PersonalizationInsight[]>([]);
   const [taskFilter, setTaskFilter] = useState<TaskFilter>("All");
   const [integrations, setIntegrations] = useState<{ microsoft: IntegrationStatus; jira: IntegrationStatus } | null>(
     null
@@ -1396,6 +2131,7 @@ export function App() {
     today: true,
     tasks: false,
     deferred: false,
+    rejected: false,
     reminders: false,
     settings: false
   });
@@ -1403,6 +2139,7 @@ export function App() {
     today: false,
     tasks: false,
     deferred: false,
+    rejected: false,
     reminders: false,
     settings: false
   });
@@ -1437,17 +2174,23 @@ export function App() {
     setPageLoading((current) => ({ ...current, today: true }));
     try {
       const microsoftAccessToken = await getMicrosoftSessionToken();
-      const [todayData, integrationsData, automationData] = await Promise.all([
+      const [todayData, integrationsData, automationData, profileData, insightsData, rejectedData] = await Promise.all([
         api.getToday(),
         microsoftAccessToken
           ? api.getIntegrationsWithMicrosoftSession(microsoftAccessToken)
           : api.getIntegrations(),
-        api.getAutomationSettings()
+        api.getAutomationSettings(),
+        api.getPersonalizationProfile(),
+        api.getPersonalizationInsights(),
+        api.getRejectedTasks()
       ]);
       setToday(todayData);
       setIntegrations(integrationsData.integrations);
       setAutomation(automationData.automation);
       setReminders(automationData.reminders);
+      setProfile(profileData.profile);
+      setInsights(insightsData.insights);
+      setRejectedTasks(rejectedData.tasks);
       setLoadedViews((current) => ({ ...current, today: true }));
     } finally {
       setPageLoading((current) => ({ ...current, today: false }));
@@ -1476,6 +2219,17 @@ export function App() {
     }
   }
 
+  async function loadRejectedPage() {
+    setPageLoading((current) => ({ ...current, rejected: true }));
+    try {
+      const response = await api.getRejectedTasks();
+      setRejectedTasks(response.tasks);
+      setLoadedViews((current) => ({ ...current, rejected: true }));
+    } finally {
+      setPageLoading((current) => ({ ...current, rejected: false }));
+    }
+  }
+
   async function loadRemindersPage() {
     setPageLoading((current) => ({ ...current, reminders: true }));
     try {
@@ -1491,15 +2245,19 @@ export function App() {
     setPageLoading((current) => ({ ...current, settings: true }));
     try {
       const microsoftAccessToken = await getMicrosoftSessionToken();
-      const [integrationsData, automationData] = await Promise.all([
+      const [integrationsData, automationData, profileData, insightsData] = await Promise.all([
         microsoftAccessToken
           ? api.getIntegrationsWithMicrosoftSession(microsoftAccessToken)
           : api.getIntegrations(),
-        api.getAutomationSettings()
+        api.getAutomationSettings(),
+        api.getPersonalizationProfile(),
+        api.getPersonalizationInsights()
       ]);
       setIntegrations(integrationsData.integrations);
       setAutomation(automationData.automation);
       setReminders(automationData.reminders);
+      setProfile(profileData.profile);
+      setInsights(insightsData.insights);
       setLoadedViews((current) => ({ ...current, settings: true }));
     } finally {
       setPageLoading((current) => ({ ...current, settings: false }));
@@ -1526,6 +2284,9 @@ export function App() {
     if (view === "reminders" && !loadedViews.reminders && !pageLoading.reminders) {
       void loadRemindersPage();
     }
+    if (view === "rejected" && !loadedViews.rejected && !pageLoading.rejected) {
+      void loadRejectedPage();
+    }
   }, [view, loadedViews, pageLoading]);
 
   const visibleTasks = useMemo(
@@ -1535,20 +2296,26 @@ export function App() {
 
   async function refreshTodayAndIntegrations() {
     const microsoftAccessToken = await getMicrosoftSessionToken();
-    const [todayData, integrationsData, deferredData, reminderData, automationData] = await Promise.all([
+    const [todayData, integrationsData, deferredData, reminderData, automationData, profileData, insightsData, rejectedData] = await Promise.all([
       api.getToday(),
       microsoftAccessToken
         ? api.getIntegrationsWithMicrosoftSession(microsoftAccessToken)
         : api.getIntegrations(),
       api.getDeferredTasks(),
       api.getReminders(),
-      api.getAutomationSettings()
+      api.getAutomationSettings(),
+      api.getPersonalizationProfile(),
+      api.getPersonalizationInsights(),
+      api.getRejectedTasks()
     ]);
     setToday(todayData);
     setIntegrations(integrationsData.integrations);
     setDeferredTasks(deferredData.tasks);
     setReminders(reminderData.reminders);
     setAutomation(automationData.automation);
+    setProfile(profileData.profile);
+    setInsights(insightsData.insights);
+    setRejectedTasks(rejectedData.tasks);
   }
 
   async function refreshTasksPage() {
@@ -1760,6 +2527,7 @@ export function App() {
                   });
                   try {
                     await api.deleteTask(task.id);
+                    await refreshTodayAndIntegrations();
                   } catch (error) {
                     console.error(error);
                     setAllTasks(previousTasks);
@@ -1798,6 +2566,39 @@ export function App() {
             )
           ) : null}
 
+          {view === "rejected" ? (
+            !loadedViews.rejected ? (
+              <TasksSkeleton />
+            ) : (
+              <RejectedView
+                tasks={rejectedTasks}
+                loading={pageLoading.rejected}
+                onRestore={async (task) => {
+                  const response = await api.restoreRejectedTask(task.id);
+                  if (response.task) {
+                    setAllTasks((current) => [response.task as Task, ...current.filter((item) => item.id !== response.task?.id)]);
+                  }
+                  setRejectedTasks((current) => current.filter((item) => item.id !== task.id));
+                  await refreshTodayAndIntegrations();
+                }}
+                onAlwaysIgnore={async (task) => {
+                  const response = await api.updateRejectedTask(task.id, { action: "always_ignore_similar" });
+                  if (response.task) {
+                    setRejectedTasks((current) => current.map((item) => (item.id === task.id ? response.task! : item)));
+                  }
+                  await refreshTodayAndIntegrations();
+                }}
+                onShouldInclude={async (task) => {
+                  const response = await api.updateRejectedTask(task.id, { action: "should_have_been_included" });
+                  if (response.task) {
+                    setRejectedTasks((current) => current.map((item) => (item.id === task.id ? response.task! : item)));
+                  }
+                  await refreshTodayAndIntegrations();
+                }}
+              />
+            )
+          ) : null}
+
           {view === "reminders" ? (
             !loadedViews.reminders ? (
               <TasksSkeleton />
@@ -1825,6 +2626,8 @@ export function App() {
                 integrations={integrations}
                 loading={pageLoading.settings}
                 automation={automation}
+                profile={profile}
+                insights={insights}
                 microsoftAccount={microsoftAccount}
                 microsoftStatusText={microsoftStatusText}
                 jiraStatusText={jiraStatusText}
@@ -1837,6 +2640,16 @@ export function App() {
                 onUpdateReminderSettings={async (input) => {
                   const response = await api.updateReminderSettings(input);
                   setAutomation(response.automation);
+                }}
+                onUpdateProfile={async (input) => {
+                  const response = await api.updatePersonalizationProfile(input);
+                  setProfile(response.profile);
+                  await refreshTodayAndIntegrations();
+                }}
+                onRunCalibration={async (input) => {
+                  const response = await api.calibratePersonalization(input);
+                  setProfile(response.profile);
+                  await refreshTodayAndIntegrations();
                 }}
                 onConnectMicrosoft={async () => {
                   setSavingMicrosoft(true);

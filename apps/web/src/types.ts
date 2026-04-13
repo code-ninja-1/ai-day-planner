@@ -2,6 +2,44 @@ export type TaskPriority = "High" | "Medium" | "Low";
 export type TaskStatus = "Not Started" | "In Progress" | "Completed";
 export type TaskEffortBucket = "15 min" | "30 min" | "1 hour" | "2+ hours";
 export type ReminderStatus = "active" | "dismissed" | "resolved";
+export type TaskDecisionState = "accepted" | "rejected" | "uncertain" | "restored";
+export type FilteringStyle = "conservative" | "balanced" | "aggressive";
+export type PriorityBias = "focus" | "balanced" | "coverage";
+export type DayPlanBlockKind = "task" | "meeting" | "buffer";
+export type DayPlanBlockStatus = "planned" | "in_progress" | "up_next" | "completed" | "ended";
+export type FeedbackAction =
+  | "system_evaluated"
+  | "reject"
+  | "restore"
+  | "priority_changed"
+  | "status_changed"
+  | "deferred"
+  | "completed"
+  | "always_ignore_similar"
+  | "should_have_been_included";
+export type ReasonTag =
+  | "direct_request"
+  | "manager_visibility"
+  | "project_critical"
+  | "comment_noise"
+  | "newsletter_like"
+  | "duplicate_signal"
+  | "meeting_related"
+  | "historically_rejected"
+  | "historically_accepted"
+  | "assigned_work"
+  | "due_soon"
+  | "bot_generated"
+  | "review_request"
+  | "blocking_work"
+  | "fyi_only";
+
+export interface JiraPlanningSubtask {
+  key: string;
+  title: string;
+  status: string | null;
+  estimateSeconds: number | null;
+}
 
 export interface Task {
   id: number;
@@ -19,6 +57,9 @@ export interface Task {
   reminderState: ReminderStatus | null;
   lastRemindedAt: string | null;
   estimatedEffortBucket: TaskEffortBucket | null;
+  jiraEstimateSeconds: number | null;
+  jiraSubtaskEstimateSeconds: number | null;
+  jiraPlanningSubtasks: JiraPlanningSubtask[];
   priorityScore: number | null;
   priorityExplanation: string | null;
   taskAgeDays: number;
@@ -26,6 +67,14 @@ export interface Task {
   completedAt: string | null;
   lastActivityAt: string | null;
   manualOverrideFlags: string[];
+  decisionState: TaskDecisionState | null;
+  decisionConfidence: number | null;
+  decisionReason: string | null;
+  decisionReasonTags: ReasonTag[];
+  personalizationVersion: number | null;
+  wasUserOverridden: boolean;
+  restoredAt: string | null;
+  rejectedAt: string | null;
 }
 
 export interface Meeting {
@@ -40,12 +89,53 @@ export interface Meeting {
   isCancelled: boolean;
 }
 
+export interface DayPlanBlock {
+  id: string;
+  kind: DayPlanBlockKind;
+  title: string;
+  startTime: string;
+  endTime: string;
+  timeZone: string | null;
+  durationMinutes: number;
+  status: DayPlanBlockStatus;
+  taskId: number | null;
+  meetingId: number | null;
+  source: "Email" | "Jira" | "Manual" | "Calendar" | null;
+  priority: TaskPriority | null;
+  link: string | null;
+  note: string | null;
+}
+
+export interface DayPlanSummary {
+  dayKey: string;
+  baseWorkdayMinutes: number;
+  adaptedTaskCapacityMinutes: number;
+  remainingTaskCapacityMinutes: number;
+  meetingMinutes: number;
+  completedTaskMinutes: number;
+  plannedTaskMinutes: number;
+  remainingTaskMinutes: number;
+  spilloverTaskCount: number;
+  freeMinutes: number;
+  focusFactor: number;
+  completionRate: number;
+  guidance: string;
+}
+
+export interface DayPlan {
+  summary: DayPlanSummary;
+  blocks: DayPlanBlock[];
+  spilloverTasks: Task[];
+}
+
 export interface TodayResponse {
   meetings: Meeting[];
   tasks: Record<TaskPriority, Task[]>;
   reminders: Reminder[];
   workload: WorkloadSummary;
+  dayPlan: DayPlan;
   deferredTaskCount: number;
+  rejectedTaskCount: number;
   automation: AutomationSettings;
   sync: {
     microsoft: string | null;
@@ -83,6 +173,52 @@ export interface AutomationSettings {
   schedulerLastRunAt: string | null;
   schedulerLastStatus: "idle" | "ok" | "error";
   schedulerLastError: string | null;
+}
+
+export interface UserPriorityProfile {
+  personalizationEnabled: boolean;
+  roleFocus: string | null;
+  prioritizationPrompt: string | null;
+  importantWork: string[];
+  noiseWork: string[];
+  mustNotMiss: string[];
+  importantSources: string[];
+  importantPeople: string[];
+  importantProjects: string[];
+  positiveReasonTags: ReasonTag[];
+  negativeReasonTags: ReasonTag[];
+  filteringStyle: FilteringStyle;
+  priorityBias: PriorityBias;
+  questionnaireJson: string | null;
+  exampleRankingsJson: string | null;
+  lastProfileRefreshAt: string | null;
+  updatedAt: string | null;
+}
+
+export interface RejectedTask {
+  id: number;
+  title: string;
+  source: "Email" | "Jira" | "Manual";
+  sourceLink: string | null;
+  sourceRef: string | null;
+  sourceThreadRef: string | null;
+  jiraStatus: string | null;
+  proposedPriority: TaskPriority;
+  decisionState: TaskDecisionState;
+  decisionConfidence: number | null;
+  decisionReason: string | null;
+  decisionReasonTags: ReasonTag[];
+  personalizationVersion: number | null;
+  candidatePayloadJson: string | null;
+  rejectedAt: string;
+  restoredAt: string | null;
+  updatedAt: string;
+}
+
+export interface PersonalizationInsight {
+  statement: string;
+  confidence: number;
+  source: "profile" | "history";
 }
 
 export interface WorkloadSummary {

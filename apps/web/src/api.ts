@@ -1,12 +1,15 @@
 import type {
   AutomationSettings,
   IntegrationStatus,
+  PersonalizationInsight,
+  RejectedTask,
   Reminder,
   Task,
   TaskDetail,
   TaskPriority,
   TaskStatus,
-  TodayResponse
+  TodayResponse,
+  UserPriorityProfile
 } from "./types";
 
 const API_ROOT = import.meta.env.VITE_API_ROOT ?? "http://localhost:4000/api";
@@ -80,10 +83,44 @@ export const api = {
       body: JSON.stringify({ timeZone })
     }),
   getDeferredTasks: () => request<{ tasks: Task[] }>("/tasks/deferred"),
+  getRejectedTasks: () => request<{ tasks: RejectedTask[] }>("/tasks/rejected"),
+  restoreRejectedTask: (id: number) =>
+    request<{ task: Task | null; rejectedTask: RejectedTask | null }>(`/tasks/rejected/${id}/restore`, {
+      method: "POST"
+    }),
+  updateRejectedTask: (
+    id: number,
+    input: { action: "always_ignore_similar" | "should_have_been_included" | "keep_rejected" }
+  ) =>
+    request<{ task: RejectedTask | null }>(`/tasks/rejected/${id}`, {
+      method: "PATCH",
+      body: JSON.stringify(input)
+    }),
   deferTask: (id: number, deferredUntil: string | null) =>
     request<{ task: Task }>(`/tasks/${id}/defer`, {
       method: "PATCH",
       body: JSON.stringify({ deferredUntil })
+    }),
+  sendTaskFeedback: (
+    id: number,
+    input: {
+      action:
+        | "reject"
+        | "restore"
+        | "priority_changed"
+        | "status_changed"
+        | "deferred"
+        | "completed"
+        | "always_ignore_similar"
+        | "should_have_been_included";
+      beforePriority?: TaskPriority | null;
+      afterPriority?: TaskPriority | null;
+      context?: string | null;
+    }
+  ) =>
+    request<{ ok: boolean }>(`/tasks/${id}/feedback`, {
+      method: "POST",
+      body: JSON.stringify(input)
     }),
   getReminders: () => request<{ reminders: Reminder[] }>("/reminders"),
   updateReminder: (
@@ -154,5 +191,31 @@ export const api = {
       method: "PATCH",
       body: JSON.stringify(input)
     }),
+  getPersonalizationProfile: () => request<{ profile: UserPriorityProfile }>("/personalization/profile"),
+  updatePersonalizationProfile: (input: Partial<UserPriorityProfile>) =>
+    request<{ profile: UserPriorityProfile }>("/personalization/profile", {
+      method: "PATCH",
+      body: JSON.stringify(input)
+    }),
+  calibratePersonalization: (input: {
+    roleFocus: string;
+    prioritizationPrompt: string;
+    importantWork: string[];
+    noiseWork: string[];
+    mustNotMiss: string[];
+    importantPeople: string[];
+    importantProjects: string[];
+    filteringStyle: UserPriorityProfile["filteringStyle"];
+    priorityBias: UserPriorityProfile["priorityBias"];
+    exampleRankings: Array<{ title: string; source: "Email" | "Jira" | "Manual"; decision: "show_today" | "keep_low" | "reject_noise" }>;
+  }) =>
+    request<{ profile: UserPriorityProfile }>("/personalization/calibrate", {
+      method: "POST",
+      body: JSON.stringify(input)
+    }),
+  getPersonalizationInsights: () =>
+    request<{ insights: PersonalizationInsight[]; sourceEventCount: number; createdAt: string | null }>(
+      "/personalization/insights"
+    ),
   getMicrosoftAuthUrl: () => request<{ url: string }>("/auth/microsoft/start")
 };

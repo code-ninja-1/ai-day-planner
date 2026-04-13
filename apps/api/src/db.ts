@@ -4,16 +4,24 @@ import Database from "better-sqlite3";
 import { env } from "./env.js";
 import type {
   AutomationSettings,
+  BehaviorFeedbackEvent,
+  FeedbackAction,
+  FeedbackPolarity,
   IntegrationConnection,
   Meeting,
+  PersonalizationInsight,
   Reminder,
   ReminderKind,
   ReminderStatus,
+  RejectedTask,
+  ReasonTag,
   Task,
+  TaskDecisionState,
   TaskEffortBucket,
   TaskPriority,
   TaskSource,
-  TaskStatus
+  TaskStatus,
+  UserPriorityProfile
 } from "./types.js";
 
 const databaseDir = path.dirname(env.databasePath);
@@ -122,6 +130,102 @@ db.exec(`
     generated_at TEXT NOT NULL,
     warnings_json TEXT
   );
+
+  CREATE TABLE IF NOT EXISTS daily_plan_snapshots (
+    day_key TEXT PRIMARY KEY,
+    weekday INTEGER NOT NULL,
+    base_workday_minutes INTEGER NOT NULL,
+    adapted_task_capacity_minutes INTEGER NOT NULL,
+    remaining_task_capacity_minutes INTEGER NOT NULL,
+    meeting_minutes INTEGER NOT NULL,
+    planned_task_minutes INTEGER NOT NULL,
+    completed_task_minutes INTEGER NOT NULL,
+    remaining_task_minutes INTEGER NOT NULL,
+    spillover_task_count INTEGER NOT NULL,
+    free_minutes INTEGER NOT NULL,
+    focus_factor REAL NOT NULL DEFAULT 1,
+    completion_rate REAL NOT NULL DEFAULT 0,
+    planned_task_ids_json TEXT NOT NULL DEFAULT '[]',
+    summary_json TEXT NOT NULL DEFAULT '{}',
+    blocks_json TEXT NOT NULL DEFAULT '[]',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS user_priority_profile (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    personalization_enabled INTEGER NOT NULL DEFAULT 1,
+    role_focus TEXT,
+    prioritization_prompt TEXT,
+    important_work_json TEXT NOT NULL DEFAULT '[]',
+    noise_work_json TEXT NOT NULL DEFAULT '[]',
+    must_not_miss_json TEXT NOT NULL DEFAULT '[]',
+    important_sources_json TEXT NOT NULL DEFAULT '[]',
+    important_people_json TEXT NOT NULL DEFAULT '[]',
+    important_projects_json TEXT NOT NULL DEFAULT '[]',
+    positive_reason_tags_json TEXT NOT NULL DEFAULT '[]',
+    negative_reason_tags_json TEXT NOT NULL DEFAULT '[]',
+    filtering_style TEXT NOT NULL DEFAULT 'conservative',
+    priority_bias TEXT NOT NULL DEFAULT 'balanced',
+    questionnaire_json TEXT,
+    example_rankings_json TEXT,
+    last_profile_refresh_at TEXT,
+    updated_at TEXT
+  );
+
+  CREATE TABLE IF NOT EXISTS rejected_tasks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    title TEXT NOT NULL,
+    source TEXT NOT NULL,
+    source_link TEXT,
+    source_ref TEXT,
+    source_thread_ref TEXT,
+    jira_status TEXT,
+    proposed_priority TEXT NOT NULL,
+    decision_state TEXT NOT NULL DEFAULT 'rejected',
+    decision_confidence REAL,
+    decision_reason TEXT,
+    decision_reason_tags TEXT NOT NULL DEFAULT '[]',
+    personalization_version INTEGER,
+    candidate_payload_json TEXT,
+    rejected_at TEXT NOT NULL,
+    restored_at TEXT,
+    updated_at TEXT NOT NULL
+  );
+
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_rejected_tasks_source_ref
+  ON rejected_tasks(source, source_ref)
+  WHERE source_ref IS NOT NULL;
+
+  CREATE TABLE IF NOT EXISTS task_decision_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id INTEGER,
+    source TEXT NOT NULL,
+    source_ref TEXT,
+    source_thread_ref TEXT,
+    action TEXT NOT NULL,
+    before_priority TEXT,
+    after_priority TEXT,
+    system_decision_state TEXT,
+    decision_confidence REAL,
+    decision_reason TEXT,
+    decision_reason_tags TEXT NOT NULL DEFAULT '[]',
+    features_json TEXT,
+    feedback_payload_json TEXT,
+    inferred_reason TEXT,
+    inferred_reason_tag TEXT,
+    preference_polarity TEXT NOT NULL DEFAULT 'neutral',
+    created_at TEXT NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS preference_memory_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    snapshot_json TEXT NOT NULL,
+    insights_json TEXT NOT NULL DEFAULT '[]',
+    source_event_count INTEGER NOT NULL DEFAULT 0,
+    active INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL
+  );
 `);
 
 function ensureColumn(table: string, column: string, definition: string) {
@@ -146,6 +250,18 @@ ensureColumn("tasks", "carry_forward_count", "INTEGER NOT NULL DEFAULT 0");
 ensureColumn("tasks", "completed_at", "TEXT");
 ensureColumn("tasks", "last_activity_at", "TEXT");
 ensureColumn("tasks", "manual_override_flags", "TEXT NOT NULL DEFAULT '[]'");
+ensureColumn("tasks", "decision_state", "TEXT");
+ensureColumn("tasks", "decision_confidence", "REAL");
+ensureColumn("tasks", "decision_reason", "TEXT");
+ensureColumn("tasks", "decision_reason_tags", "TEXT NOT NULL DEFAULT '[]'");
+ensureColumn("tasks", "personalization_version", "INTEGER");
+ensureColumn("tasks", "was_user_overridden", "INTEGER NOT NULL DEFAULT 0");
+ensureColumn("tasks", "restored_at", "TEXT");
+ensureColumn("tasks", "rejected_at", "TEXT");
+ensureColumn("tasks", "jira_estimate_seconds", "INTEGER");
+ensureColumn("tasks", "jira_subtask_estimate_seconds", "INTEGER");
+ensureColumn("tasks", "jira_planning_subtasks_json", "TEXT NOT NULL DEFAULT '[]'");
+ensureColumn("user_priority_profile", "prioritization_prompt", "TEXT");
 
 db.prepare(
   `
@@ -155,6 +271,14 @@ db.prepare(
   `
 ).run();
 
+db.prepare(
+  `
+  INSERT INTO user_priority_profile (id, updated_at)
+  VALUES (1, ?)
+  ON CONFLICT(id) DO NOTHING
+  `
+).run(new Date().toISOString());
+
 function parseJsonArray(value: unknown) {
   if (typeof value !== "string" || !value.trim()) return [];
   try {
@@ -163,6 +287,16 @@ function parseJsonArray(value: unknown) {
   } catch {
     return [];
   }
+}
+
+function normalizeOptionalString(value: unknown) {
+  if (typeof value !== "string") return null;
+  const normalized = value.trim();
+  return normalized ? normalized : null;
+}
+
+function buildOutlookCalendarItemLink(eventId: string) {
+  return `https://outlook.office365.com/owa/?itemid=${encodeURIComponent(eventId)}&exvsurl=1&path=/calendar/item`;
 }
 
 const taskRowToTask = (row: Record<string, unknown>): Task => ({
@@ -180,6 +314,37 @@ const taskRowToTask = (row: Record<string, unknown>): Task => ({
   reminderState: (row.reminder_state as ReminderStatus | null) ?? null,
   lastRemindedAt: (row.last_reminded_at as string | null) ?? null,
   estimatedEffortBucket: (row.estimated_effort_bucket as TaskEffortBucket | null) ?? null,
+  jiraEstimateSeconds:
+    row.jira_estimate_seconds === null || row.jira_estimate_seconds === undefined
+      ? null
+      : Number(row.jira_estimate_seconds),
+  jiraSubtaskEstimateSeconds:
+    row.jira_subtask_estimate_seconds === null || row.jira_subtask_estimate_seconds === undefined
+      ? null
+      : Number(row.jira_subtask_estimate_seconds),
+  jiraPlanningSubtasks: (() => {
+    try {
+      const parsed = JSON.parse(String(row.jira_planning_subtasks_json ?? "[]")) as unknown;
+      return Array.isArray(parsed)
+        ? parsed
+            .filter((entry): entry is Record<string, unknown> => Boolean(entry) && typeof entry === "object")
+            .map((entry) => ({
+              key: String(entry.key ?? ""),
+              title: String(entry.title ?? entry.key ?? ""),
+              status: typeof entry.status === "string" ? entry.status : null,
+              estimateSeconds:
+                typeof entry.estimateSeconds === "number"
+                  ? entry.estimateSeconds
+                  : typeof entry.estimate_seconds === "number"
+                    ? entry.estimate_seconds
+                    : null
+            }))
+            .filter((entry) => entry.key)
+        : [];
+    } catch {
+      return [];
+    }
+  })(),
   priorityScore: row.priority_score === null || row.priority_score === undefined ? null : Number(row.priority_score),
   priorityExplanation: (row.priority_explanation as string | null) ?? null,
   taskAgeDays: Number(row.task_age_days ?? 0),
@@ -187,23 +352,47 @@ const taskRowToTask = (row: Record<string, unknown>): Task => ({
   completedAt: (row.completed_at as string | null) ?? null,
   lastActivityAt: (row.last_activity_at as string | null) ?? null,
   manualOverrideFlags: parseJsonArray(row.manual_override_flags),
+  decisionState: (row.decision_state as TaskDecisionState | null) ?? null,
+  decisionConfidence:
+    row.decision_confidence === null || row.decision_confidence === undefined
+      ? null
+      : Number(row.decision_confidence),
+  decisionReason: (row.decision_reason as string | null) ?? null,
+  decisionReasonTags: parseJsonArray(row.decision_reason_tags) as ReasonTag[],
+  personalizationVersion:
+    row.personalization_version === null || row.personalization_version === undefined
+      ? null
+      : Number(row.personalization_version),
+  wasUserOverridden: Number(row.was_user_overridden ?? 0) === 1,
+  restoredAt: (row.restored_at as string | null) ?? null,
+  rejectedAt: (row.rejected_at as string | null) ?? null,
   createdAt: String(row.created_at),
   updatedAt: String(row.updated_at)
 });
 
-const meetingRowToMeeting = (row: Record<string, unknown>): Meeting => ({
-  id: Number(row.id),
-  externalId: (row.external_id as string | null) ?? null,
-  title: String(row.title),
-  startTime: String(row.start_time),
-  endTime: String(row.end_time),
-  timeZone: (row.time_zone as string | null) ?? null,
-  durationMinutes: Number(row.duration_minutes),
-  meetingLink: (row.meeting_link as string | null) ?? null,
-  meetingLinkType: (row.meeting_link_type as "join" | "calendar" | null) ?? null,
-  isCancelled: Number(row.is_cancelled) === 1,
-  createdAt: String(row.created_at)
-});
+const meetingRowToMeeting = (row: Record<string, unknown>): Meeting => {
+  const externalId = normalizeOptionalString(row.external_id);
+  const isCancelled = Number(row.is_cancelled) === 1;
+  const storedLink = normalizeOptionalString(row.meeting_link);
+  const storedLinkType = (row.meeting_link_type as "join" | "calendar" | null) ?? null;
+  const fallbackCalendarLink = !isCancelled && externalId ? buildOutlookCalendarItemLink(externalId) : null;
+  const meetingLink = storedLink ?? fallbackCalendarLink;
+  const meetingLinkType = meetingLink ? (storedLinkType === "join" && storedLink ? "join" : "calendar") : null;
+
+  return {
+    id: Number(row.id),
+    externalId,
+    title: String(row.title),
+    startTime: String(row.start_time),
+    endTime: String(row.end_time),
+    timeZone: (row.time_zone as string | null) ?? null,
+    durationMinutes: Number(row.duration_minutes),
+    meetingLink,
+    meetingLinkType,
+    isCancelled,
+    createdAt: String(row.created_at)
+  };
+};
 
 const reminderRowToReminder = (row: Record<string, unknown>): Reminder => ({
   id: Number(row.id),
@@ -233,6 +422,52 @@ const automationRowToSettings = (row: Record<string, unknown>): AutomationSettin
   schedulerLastRunAt: (row.scheduler_last_run_at as string | null) ?? null,
   schedulerLastStatus: row.scheduler_last_status as AutomationSettings["schedulerLastStatus"],
   schedulerLastError: (row.scheduler_last_error as string | null) ?? null
+});
+
+const rejectedTaskRowToRejectedTask = (row: Record<string, unknown>): RejectedTask => ({
+  id: Number(row.id),
+  title: String(row.title),
+  source: row.source as TaskSource,
+  sourceLink: (row.source_link as string | null) ?? null,
+  sourceRef: (row.source_ref as string | null) ?? null,
+  sourceThreadRef: (row.source_thread_ref as string | null) ?? null,
+  jiraStatus: (row.jira_status as string | null) ?? null,
+  proposedPriority: row.proposed_priority as TaskPriority,
+  decisionState: row.decision_state as TaskDecisionState,
+  decisionConfidence:
+    row.decision_confidence === null || row.decision_confidence === undefined
+      ? null
+      : Number(row.decision_confidence),
+  decisionReason: (row.decision_reason as string | null) ?? null,
+  decisionReasonTags: parseJsonArray(row.decision_reason_tags) as ReasonTag[],
+  personalizationVersion:
+    row.personalization_version === null || row.personalization_version === undefined
+      ? null
+      : Number(row.personalization_version),
+  candidatePayloadJson: (row.candidate_payload_json as string | null) ?? null,
+  rejectedAt: String(row.rejected_at),
+  restoredAt: (row.restored_at as string | null) ?? null,
+  updatedAt: String(row.updated_at)
+});
+
+const priorityProfileRowToProfile = (row: Record<string, unknown>): UserPriorityProfile => ({
+  personalizationEnabled: Number(row.personalization_enabled) === 1,
+  roleFocus: (row.role_focus as string | null) ?? null,
+  prioritizationPrompt: (row.prioritization_prompt as string | null) ?? null,
+  importantWork: parseJsonArray(row.important_work_json),
+  noiseWork: parseJsonArray(row.noise_work_json),
+  mustNotMiss: parseJsonArray(row.must_not_miss_json),
+  importantSources: parseJsonArray(row.important_sources_json),
+  importantPeople: parseJsonArray(row.important_people_json),
+  importantProjects: parseJsonArray(row.important_projects_json),
+  positiveReasonTags: parseJsonArray(row.positive_reason_tags_json) as ReasonTag[],
+  negativeReasonTags: parseJsonArray(row.negative_reason_tags_json) as ReasonTag[],
+  filteringStyle: row.filtering_style as UserPriorityProfile["filteringStyle"],
+  priorityBias: row.priority_bias as UserPriorityProfile["priorityBias"],
+  questionnaireJson: (row.questionnaire_json as string | null) ?? null,
+  exampleRankingsJson: (row.example_rankings_json as string | null) ?? null,
+  lastProfileRefreshAt: (row.last_profile_refresh_at as string | null) ?? null,
+  updatedAt: (row.updated_at as string | null) ?? null
 });
 
 function orderByPrioritySql() {
@@ -382,8 +617,426 @@ export function resolveStaleReminders(activeKeys: string[]) {
   }
 }
 
+export function getUserPriorityProfile() {
+  const row = db.prepare("SELECT * FROM user_priority_profile WHERE id = 1").get() as Record<string, unknown>;
+  return priorityProfileRowToProfile(row);
+}
+
+export function saveUserPriorityProfile(
+  patch: Partial<
+    Pick<
+      UserPriorityProfile,
+      | "personalizationEnabled"
+      | "roleFocus"
+      | "prioritizationPrompt"
+      | "importantWork"
+      | "noiseWork"
+      | "mustNotMiss"
+      | "importantSources"
+      | "importantPeople"
+      | "importantProjects"
+      | "positiveReasonTags"
+      | "negativeReasonTags"
+      | "filteringStyle"
+      | "priorityBias"
+      | "questionnaireJson"
+      | "exampleRankingsJson"
+      | "lastProfileRefreshAt"
+    >
+  >
+) {
+  const existing = getUserPriorityProfile();
+  const updatedAt = new Date().toISOString();
+  db.prepare(
+    `
+    UPDATE user_priority_profile
+    SET personalization_enabled = @personalizationEnabled,
+        role_focus = @roleFocus,
+        prioritization_prompt = @prioritizationPrompt,
+        important_work_json = @importantWork,
+        noise_work_json = @noiseWork,
+        must_not_miss_json = @mustNotMiss,
+        important_sources_json = @importantSources,
+        important_people_json = @importantPeople,
+        important_projects_json = @importantProjects,
+        positive_reason_tags_json = @positiveReasonTags,
+        negative_reason_tags_json = @negativeReasonTags,
+        filtering_style = @filteringStyle,
+        priority_bias = @priorityBias,
+        questionnaire_json = @questionnaireJson,
+        example_rankings_json = @exampleRankingsJson,
+        last_profile_refresh_at = @lastProfileRefreshAt,
+        updated_at = @updatedAt
+    WHERE id = 1
+    `
+  ).run({
+    personalizationEnabled: Number(patch.personalizationEnabled ?? existing.personalizationEnabled),
+    roleFocus: patch.roleFocus ?? existing.roleFocus,
+    prioritizationPrompt: patch.prioritizationPrompt ?? existing.prioritizationPrompt,
+    importantWork: JSON.stringify(patch.importantWork ?? existing.importantWork),
+    noiseWork: JSON.stringify(patch.noiseWork ?? existing.noiseWork),
+    mustNotMiss: JSON.stringify(patch.mustNotMiss ?? existing.mustNotMiss),
+    importantSources: JSON.stringify(patch.importantSources ?? existing.importantSources),
+    importantPeople: JSON.stringify(patch.importantPeople ?? existing.importantPeople),
+    importantProjects: JSON.stringify(patch.importantProjects ?? existing.importantProjects),
+    positiveReasonTags: JSON.stringify(patch.positiveReasonTags ?? existing.positiveReasonTags),
+    negativeReasonTags: JSON.stringify(patch.negativeReasonTags ?? existing.negativeReasonTags),
+    filteringStyle: patch.filteringStyle ?? existing.filteringStyle,
+    priorityBias: patch.priorityBias ?? existing.priorityBias,
+    questionnaireJson: patch.questionnaireJson ?? existing.questionnaireJson,
+    exampleRankingsJson: patch.exampleRankingsJson ?? existing.exampleRankingsJson,
+    lastProfileRefreshAt: patch.lastProfileRefreshAt ?? existing.lastProfileRefreshAt,
+    updatedAt
+  });
+  return getUserPriorityProfile();
+}
+
+export function listRejectedTasks() {
+  return db
+    .prepare("SELECT * FROM rejected_tasks ORDER BY rejected_at DESC")
+    .all()
+    .map((row: unknown) => rejectedTaskRowToRejectedTask(row as Record<string, unknown>));
+}
+
+export function getRejectedTaskById(id: number) {
+  const row = db.prepare("SELECT * FROM rejected_tasks WHERE id = ?").get(id) as Record<string, unknown> | undefined;
+  return row ? rejectedTaskRowToRejectedTask(row) : null;
+}
+
+export function getRejectedTaskBySource(source: TaskSource, sourceRef: string | null) {
+  if (!sourceRef) return null;
+  const row = db
+    .prepare("SELECT * FROM rejected_tasks WHERE source = ? AND source_ref = ?")
+    .get(source, sourceRef) as Record<string, unknown> | undefined;
+  return row ? rejectedTaskRowToRejectedTask(row) : null;
+}
+
+export function upsertRejectedTask(input: {
+  title: string;
+  source: TaskSource;
+  sourceLink?: string | null;
+  sourceRef?: string | null;
+  sourceThreadRef?: string | null;
+  jiraStatus?: string | null;
+  proposedPriority: TaskPriority;
+  decisionState?: TaskDecisionState;
+  decisionConfidence?: number | null;
+  decisionReason?: string | null;
+  decisionReasonTags?: ReasonTag[];
+  personalizationVersion?: number | null;
+  candidatePayloadJson?: string | null;
+  rejectedAt?: string;
+  restoredAt?: string | null;
+}) {
+  const now = new Date().toISOString();
+  const rejectedAt = input.rejectedAt ?? now;
+  if (input.sourceRef) {
+    const existing = db
+      .prepare("SELECT id FROM rejected_tasks WHERE source = ? AND source_ref = ?")
+      .get(input.source, input.sourceRef) as { id: number } | undefined;
+
+    if (existing) {
+      db.prepare(
+        `
+        UPDATE rejected_tasks
+        SET title = @title,
+            source_link = @sourceLink,
+            source_thread_ref = @sourceThreadRef,
+            jira_status = @jiraStatus,
+            proposed_priority = @proposedPriority,
+            decision_state = @decisionState,
+            decision_confidence = @decisionConfidence,
+            decision_reason = @decisionReason,
+            decision_reason_tags = @decisionReasonTags,
+            personalization_version = @personalizationVersion,
+            candidate_payload_json = @candidatePayloadJson,
+            rejected_at = @rejectedAt,
+            restored_at = @restoredAt,
+            updated_at = @updatedAt
+        WHERE id = @id
+        `
+      ).run({
+        id: existing.id,
+        title: input.title,
+        sourceLink: input.sourceLink ?? null,
+        sourceThreadRef: input.sourceThreadRef ?? null,
+        jiraStatus: input.jiraStatus ?? null,
+        proposedPriority: input.proposedPriority,
+        decisionState: input.decisionState ?? "rejected",
+        decisionConfidence: input.decisionConfidence ?? null,
+        decisionReason: input.decisionReason ?? null,
+        decisionReasonTags: JSON.stringify(input.decisionReasonTags ?? []),
+        personalizationVersion: input.personalizationVersion ?? null,
+        candidatePayloadJson: input.candidatePayloadJson ?? null,
+        rejectedAt,
+        restoredAt: input.restoredAt ?? null,
+        updatedAt: now
+      });
+    } else {
+      db.prepare(
+        `
+        INSERT INTO rejected_tasks (
+          title, source, source_link, source_ref, source_thread_ref, jira_status, proposed_priority,
+          decision_state, decision_confidence, decision_reason, decision_reason_tags, personalization_version,
+          candidate_payload_json, rejected_at, restored_at, updated_at
+        ) VALUES (
+          @title, @source, @sourceLink, @sourceRef, @sourceThreadRef, @jiraStatus, @proposedPriority,
+          @decisionState, @decisionConfidence, @decisionReason, @decisionReasonTags, @personalizationVersion,
+          @candidatePayloadJson, @rejectedAt, @restoredAt, @updatedAt
+        )
+        `
+      ).run({
+        title: input.title,
+        source: input.source,
+        sourceLink: input.sourceLink ?? null,
+        sourceRef: input.sourceRef,
+        sourceThreadRef: input.sourceThreadRef ?? null,
+        jiraStatus: input.jiraStatus ?? null,
+        proposedPriority: input.proposedPriority,
+        decisionState: input.decisionState ?? "rejected",
+        decisionConfidence: input.decisionConfidence ?? null,
+        decisionReason: input.decisionReason ?? null,
+        decisionReasonTags: JSON.stringify(input.decisionReasonTags ?? []),
+        personalizationVersion: input.personalizationVersion ?? null,
+        candidatePayloadJson: input.candidatePayloadJson ?? null,
+        rejectedAt,
+        restoredAt: input.restoredAt ?? null,
+        updatedAt: now
+      });
+    }
+  } else {
+    db.prepare(
+      `
+      INSERT INTO rejected_tasks (
+        title, source, source_link, source_ref, source_thread_ref, jira_status, proposed_priority,
+        decision_state, decision_confidence, decision_reason, decision_reason_tags, personalization_version,
+        candidate_payload_json, rejected_at, restored_at, updated_at
+      ) VALUES (
+        @title, @source, @sourceLink, NULL, @sourceThreadRef, @jiraStatus, @proposedPriority,
+        @decisionState, @decisionConfidence, @decisionReason, @decisionReasonTags, @personalizationVersion,
+        @candidatePayloadJson, @rejectedAt, @restoredAt, @updatedAt
+      )
+      `
+    ).run({
+      title: input.title,
+      source: input.source,
+      sourceLink: input.sourceLink ?? null,
+      sourceThreadRef: input.sourceThreadRef ?? null,
+      jiraStatus: input.jiraStatus ?? null,
+      proposedPriority: input.proposedPriority,
+      decisionState: input.decisionState ?? "rejected",
+      decisionConfidence: input.decisionConfidence ?? null,
+      decisionReason: input.decisionReason ?? null,
+      decisionReasonTags: JSON.stringify(input.decisionReasonTags ?? []),
+      personalizationVersion: input.personalizationVersion ?? null,
+      candidatePayloadJson: input.candidatePayloadJson ?? null,
+      rejectedAt,
+      restoredAt: input.restoredAt ?? null,
+      updatedAt: now
+    });
+  }
+
+  return input.sourceRef ? getRejectedTaskBySource(input.source, input.sourceRef) : null;
+}
+
+export function updateRejectedTask(
+  id: number,
+  patch: Partial<
+    Pick<
+      RejectedTask,
+      "title" | "sourceLink" | "jiraStatus" | "proposedPriority" | "decisionState" | "decisionConfidence" | "decisionReason" | "personalizationVersion" | "restoredAt"
+    > & { decisionReasonTags?: ReasonTag[]; candidatePayloadJson?: string | null }
+  >
+) {
+  const existing = db.prepare("SELECT * FROM rejected_tasks WHERE id = ?").get(id) as Record<string, unknown> | undefined;
+  if (!existing) return null;
+  db.prepare(
+    `
+    UPDATE rejected_tasks
+    SET title = @title,
+        source_link = @sourceLink,
+        jira_status = @jiraStatus,
+        proposed_priority = @proposedPriority,
+        decision_state = @decisionState,
+        decision_confidence = @decisionConfidence,
+        decision_reason = @decisionReason,
+        decision_reason_tags = @decisionReasonTags,
+        personalization_version = @personalizationVersion,
+        candidate_payload_json = @candidatePayloadJson,
+        restored_at = @restoredAt,
+        updated_at = @updatedAt
+    WHERE id = @id
+    `
+  ).run({
+    id,
+    title: patch.title ?? existing.title,
+    sourceLink: patch.sourceLink ?? existing.source_link,
+    jiraStatus: patch.jiraStatus ?? existing.jira_status,
+    proposedPriority: patch.proposedPriority ?? existing.proposed_priority,
+    decisionState: patch.decisionState ?? existing.decision_state,
+    decisionConfidence: patch.decisionConfidence ?? existing.decision_confidence,
+    decisionReason: patch.decisionReason ?? existing.decision_reason,
+    decisionReasonTags: JSON.stringify(patch.decisionReasonTags ?? parseJsonArray(existing.decision_reason_tags)),
+    personalizationVersion: patch.personalizationVersion ?? existing.personalization_version,
+    candidatePayloadJson: patch.candidatePayloadJson ?? existing.candidate_payload_json ?? null,
+    restoredAt: patch.restoredAt ?? existing.restored_at ?? null,
+    updatedAt: new Date().toISOString()
+  });
+  return getRejectedTaskById(id);
+}
+
+export function clearRejectedTasksBySourceThread(source: TaskSource, sourceThreadRef: string | null) {
+  if (!sourceThreadRef) return 0;
+  const now = new Date().toISOString();
+  const result = db
+    .prepare(
+      `
+      UPDATE rejected_tasks
+      SET decision_state = 'restored',
+          restored_at = COALESCE(restored_at, @restoredAt),
+          updated_at = @updatedAt
+      WHERE source = @source
+        AND source_thread_ref = @sourceThreadRef
+        AND decision_state != 'restored'
+      `
+    )
+    .run({
+      source,
+      sourceThreadRef,
+      restoredAt: now,
+      updatedAt: now
+    });
+  return Number(result.changes ?? 0);
+}
+
+export function logTaskDecisionEvent(input: {
+  taskId?: number | null;
+  source: TaskSource | "Calibration";
+  sourceRef?: string | null;
+  sourceThreadRef?: string | null;
+  action: FeedbackAction;
+  beforePriority?: TaskPriority | null;
+  afterPriority?: TaskPriority | null;
+  systemDecisionState?: TaskDecisionState | null;
+  decisionConfidence?: number | null;
+  decisionReason?: string | null;
+  decisionReasonTags?: ReasonTag[];
+  featuresJson?: string | null;
+  feedbackPayloadJson?: string | null;
+  inferredReason?: string | null;
+  inferredReasonTag?: ReasonTag | null;
+  preferencePolarity?: FeedbackPolarity;
+}) {
+  db.prepare(
+    `
+    INSERT INTO task_decision_log (
+      task_id, source, source_ref, source_thread_ref, action, before_priority, after_priority, system_decision_state,
+      decision_confidence, decision_reason, decision_reason_tags, features_json, feedback_payload_json,
+      inferred_reason, inferred_reason_tag, preference_polarity, created_at
+    ) VALUES (
+      @taskId, @source, @sourceRef, @sourceThreadRef, @action, @beforePriority, @afterPriority, @systemDecisionState,
+      @decisionConfidence, @decisionReason, @decisionReasonTags, @featuresJson, @feedbackPayloadJson,
+      @inferredReason, @inferredReasonTag, @preferencePolarity, @createdAt
+    )
+    `
+  ).run({
+    taskId: input.taskId ?? null,
+    source: input.source,
+    sourceRef: input.sourceRef ?? null,
+    sourceThreadRef: input.sourceThreadRef ?? null,
+    action: input.action,
+    beforePriority: input.beforePriority ?? null,
+    afterPriority: input.afterPriority ?? null,
+    systemDecisionState: input.systemDecisionState ?? null,
+    decisionConfidence: input.decisionConfidence ?? null,
+    decisionReason: input.decisionReason ?? null,
+    decisionReasonTags: JSON.stringify(input.decisionReasonTags ?? []),
+    featuresJson: input.featuresJson ?? null,
+    feedbackPayloadJson: input.feedbackPayloadJson ?? null,
+    inferredReason: input.inferredReason ?? null,
+    inferredReasonTag: input.inferredReasonTag ?? null,
+    preferencePolarity: input.preferencePolarity ?? "neutral",
+    createdAt: new Date().toISOString()
+  });
+}
+
+export function listRecentDecisionLogs(limit = 60) {
+  return db
+    .prepare("SELECT * FROM task_decision_log ORDER BY created_at DESC LIMIT ?")
+    .all(limit) as Array<Record<string, unknown>>;
+}
+
+export function getDecisionEventCount() {
+  const row = db.prepare("SELECT COUNT(*) as count FROM task_decision_log").get() as { count: number };
+  return Number(row.count ?? 0);
+}
+
+export function savePreferenceMemorySnapshot(input: {
+  snapshotJson: string;
+  insights: PersonalizationInsight[];
+  sourceEventCount: number;
+}) {
+  db.prepare("UPDATE preference_memory_snapshots SET active = 0 WHERE active = 1").run();
+  db.prepare(
+    `
+    INSERT INTO preference_memory_snapshots (snapshot_json, insights_json, source_event_count, active, created_at)
+    VALUES (?, ?, ?, 1, ?)
+    `
+  ).run(input.snapshotJson, JSON.stringify(input.insights), input.sourceEventCount, new Date().toISOString());
+}
+
+export function getLatestPreferenceMemorySnapshot() {
+  const row = db
+    .prepare("SELECT * FROM preference_memory_snapshots WHERE active = 1 ORDER BY created_at DESC LIMIT 1")
+    .get() as Record<string, unknown> | undefined;
+  if (!row) {
+    return {
+      snapshotJson: "{}",
+      insights: [] as PersonalizationInsight[],
+      sourceEventCount: 0,
+      createdAt: null as string | null
+    };
+  }
+  return {
+    snapshotJson: String(row.snapshot_json),
+    insights: (() => {
+      try {
+        return JSON.parse(String(row.insights_json)) as PersonalizationInsight[];
+      } catch {
+        return [] as PersonalizationInsight[];
+      }
+    })(),
+    sourceEventCount: Number(row.source_event_count ?? 0),
+    createdAt: String(row.created_at)
+  };
+}
+
 export function getTaskById(id: number) {
   const row = db.prepare("SELECT * FROM tasks WHERE id = ?").get(id) as Record<string, unknown> | undefined;
+  return row ? taskRowToTask(row) : null;
+}
+
+export function getTaskBySource(source: TaskSource, sourceRef: string | null, options?: { includeIgnored?: boolean }) {
+  if (!sourceRef) return null;
+  const row = db
+    .prepare(
+      `SELECT * FROM tasks WHERE source = ? AND source_ref = ?${options?.includeIgnored ? "" : " AND ignored = 0"} LIMIT 1`
+    )
+    .get(source, sourceRef) as Record<string, unknown> | undefined;
+  return row ? taskRowToTask(row) : null;
+}
+
+export function getTaskBySourceThread(
+  source: TaskSource,
+  sourceThreadRef: string | null,
+  options?: { includeIgnored?: boolean }
+) {
+  if (!sourceThreadRef) return null;
+  const row = db
+    .prepare(
+      `SELECT * FROM tasks WHERE source = ? AND source_thread_ref = ?${options?.includeIgnored ? "" : " AND ignored = 0"} ORDER BY updated_at DESC LIMIT 1`
+    )
+    .get(source, sourceThreadRef) as Record<string, unknown> | undefined;
   return row ? taskRowToTask(row) : null;
 }
 
@@ -407,6 +1060,23 @@ export function upsertTask(input: {
   sourceRef?: string | null;
   sourceThreadRef?: string | null;
   jiraStatus?: string | null;
+  decisionState?: TaskDecisionState | null;
+  decisionConfidence?: number | null;
+  decisionReason?: string | null;
+  decisionReasonTags?: ReasonTag[];
+  personalizationVersion?: number | null;
+  restoredAt?: string | null;
+  rejectedAt?: string | null;
+  lastActivityAt?: string | null;
+  jiraEstimateSeconds?: number | null;
+  jiraSubtaskEstimateSeconds?: number | null;
+  jiraPlanningSubtasks?: Array<{
+    key: string;
+    title: string;
+    status: string | null;
+    estimateSeconds: number | null;
+  }>;
+  reviveIgnored?: boolean;
 }) {
   const now = new Date().toISOString();
   const existing = input.sourceRef
@@ -426,6 +1096,18 @@ export function upsertTask(input: {
           source_link = @sourceLink,
           source_thread_ref = @sourceThreadRef,
           jira_status = @jiraStatus,
+          jira_estimate_seconds = @jiraEstimateSeconds,
+          jira_subtask_estimate_seconds = @jiraSubtaskEstimateSeconds,
+          jira_planning_subtasks_json = @jiraPlanningSubtasksJson,
+          ignored = @ignored,
+          decision_state = @decisionState,
+          decision_confidence = @decisionConfidence,
+          decision_reason = @decisionReason,
+          decision_reason_tags = @decisionReasonTags,
+          personalization_version = @personalizationVersion,
+          restored_at = @restoredAt,
+          rejected_at = @rejectedAt,
+          last_activity_at = @lastActivityAt,
           updated_at = @updatedAt
       WHERE source = @source AND source_ref = @sourceRef
       `
@@ -436,6 +1118,24 @@ export function upsertTask(input: {
       sourceLink: input.sourceLink ?? null,
       sourceThreadRef: input.sourceThreadRef ?? null,
       jiraStatus: input.jiraStatus ?? null,
+      jiraEstimateSeconds: input.jiraEstimateSeconds ?? existing.jira_estimate_seconds ?? null,
+      jiraSubtaskEstimateSeconds: input.jiraSubtaskEstimateSeconds ?? existing.jira_subtask_estimate_seconds ?? null,
+      jiraPlanningSubtasksJson: JSON.stringify(input.jiraPlanningSubtasks ?? (() => {
+        try {
+          return JSON.parse(String(existing.jira_planning_subtasks_json ?? "[]"));
+        } catch {
+          return [];
+        }
+      })()),
+      ignored: input.reviveIgnored ? 0 : existing.ignored,
+      decisionState: input.decisionState ?? existing.decision_state ?? "accepted",
+      decisionConfidence: input.decisionConfidence ?? existing.decision_confidence ?? null,
+      decisionReason: input.decisionReason ?? existing.decision_reason ?? null,
+      decisionReasonTags: JSON.stringify(input.decisionReasonTags ?? parseJsonArray(existing.decision_reason_tags)),
+      personalizationVersion: input.personalizationVersion ?? existing.personalization_version ?? null,
+      restoredAt: input.restoredAt ?? existing.restored_at ?? null,
+      rejectedAt: input.rejectedAt ?? existing.rejected_at ?? null,
+      lastActivityAt: input.lastActivityAt ?? existing.last_activity_at ?? now,
       updatedAt: now,
       source: input.source,
       sourceRef: input.sourceRef
@@ -445,12 +1145,19 @@ export function upsertTask(input: {
       `
       INSERT INTO tasks (
         title, source, priority, status, source_link, source_ref, source_thread_ref, jira_status,
+        jira_estimate_seconds,
+        jira_subtask_estimate_seconds, jira_planning_subtasks_json,
         ignored, deferred_until, reminder_state, last_reminded_at, estimated_effort_bucket,
         priority_score, priority_explanation, task_age_days, carry_forward_count, completed_at,
-        last_activity_at, manual_override_flags, created_at, updated_at
+        last_activity_at, manual_override_flags, decision_state, decision_confidence, decision_reason,
+        decision_reason_tags, personalization_version, was_user_overridden, restored_at, rejected_at,
+        created_at, updated_at
       ) VALUES (
         @title, @source, @priority, @status, @sourceLink, @sourceRef, @sourceThreadRef, @jiraStatus,
-        0, NULL, NULL, NULL, NULL, NULL, NULL, 0, 0, NULL, @createdAt, '[]', @createdAt, @updatedAt
+        @jiraEstimateSeconds,
+        @jiraSubtaskEstimateSeconds, @jiraPlanningSubtasksJson,
+        0, NULL, NULL, NULL, NULL, NULL, NULL, 0, 0, NULL, @lastActivityAt, '[]', @decisionState, @decisionConfidence,
+        @decisionReason, @decisionReasonTags, @personalizationVersion, 0, @restoredAt, @rejectedAt, @createdAt, @updatedAt
       )
       `
     ).run({
@@ -462,6 +1169,17 @@ export function upsertTask(input: {
       sourceRef: input.sourceRef ?? null,
       sourceThreadRef: input.sourceThreadRef ?? null,
       jiraStatus: input.jiraStatus ?? null,
+      jiraEstimateSeconds: input.jiraEstimateSeconds ?? null,
+      jiraSubtaskEstimateSeconds: input.jiraSubtaskEstimateSeconds ?? null,
+      jiraPlanningSubtasksJson: JSON.stringify(input.jiraPlanningSubtasks ?? []),
+      decisionState: input.decisionState ?? "accepted",
+      decisionConfidence: input.decisionConfidence ?? null,
+      decisionReason: input.decisionReason ?? null,
+      decisionReasonTags: JSON.stringify(input.decisionReasonTags ?? []),
+      personalizationVersion: input.personalizationVersion ?? null,
+      restoredAt: input.restoredAt ?? null,
+      rejectedAt: input.rejectedAt ?? null,
+      lastActivityAt: input.lastActivityAt ?? now,
       createdAt: now,
       updatedAt: now
     });
@@ -510,11 +1228,27 @@ export function updateTask(
     priorityScore?: number | null;
     priorityExplanation?: string | null;
     estimatedEffortBucket?: TaskEffortBucket | null;
+    jiraEstimateSeconds?: number | null;
+    jiraSubtaskEstimateSeconds?: number | null;
+    jiraPlanningSubtasks?: Array<{
+      key: string;
+      title: string;
+      status: string | null;
+      estimateSeconds: number | null;
+    }>;
     taskAgeDays?: number;
     carryForwardCount?: number;
     reminderState?: ReminderStatus | null;
     lastRemindedAt?: string | null;
     lastActivityAt?: string | null;
+    decisionState?: TaskDecisionState | null;
+    decisionConfidence?: number | null;
+    decisionReason?: string | null;
+    decisionReasonTags?: ReasonTag[];
+    personalizationVersion?: number | null;
+    wasUserOverridden?: boolean;
+    restoredAt?: string | null;
+    rejectedAt?: string | null;
   }
 ) {
   const existing = db.prepare("SELECT * FROM tasks WHERE id = ?").get(id) as Record<string, unknown> | undefined;
@@ -534,6 +1268,9 @@ export function updateTask(
         status = @status,
         deferred_until = @deferredUntil,
         estimated_effort_bucket = @estimatedEffortBucket,
+        jira_estimate_seconds = @jiraEstimateSeconds,
+        jira_subtask_estimate_seconds = @jiraSubtaskEstimateSeconds,
+        jira_planning_subtasks_json = @jiraPlanningSubtasksJson,
         priority_score = @priorityScore,
         priority_explanation = @priorityExplanation,
         task_age_days = @taskAgeDays,
@@ -543,6 +1280,14 @@ export function updateTask(
         completed_at = @completedAt,
         last_activity_at = @lastActivityAt,
         manual_override_flags = @manualOverrideFlags,
+        decision_state = @decisionState,
+        decision_confidence = @decisionConfidence,
+        decision_reason = @decisionReason,
+        decision_reason_tags = @decisionReasonTags,
+        personalization_version = @personalizationVersion,
+        was_user_overridden = @wasUserOverridden,
+        restored_at = @restoredAt,
+        rejected_at = @rejectedAt,
         updated_at = @updatedAt
     WHERE id = @id
     `
@@ -553,6 +1298,18 @@ export function updateTask(
     status: nextStatus,
     deferredUntil: patch.deferredUntil ?? existing.deferred_until,
     estimatedEffortBucket: patch.estimatedEffortBucket ?? existing.estimated_effort_bucket ?? null,
+    jiraEstimateSeconds: patch.jiraEstimateSeconds ?? existing.jira_estimate_seconds ?? null,
+    jiraSubtaskEstimateSeconds: patch.jiraSubtaskEstimateSeconds ?? existing.jira_subtask_estimate_seconds ?? null,
+    jiraPlanningSubtasksJson: JSON.stringify(
+      patch.jiraPlanningSubtasks ??
+        (() => {
+          try {
+            return JSON.parse(String(existing.jira_planning_subtasks_json ?? "[]"));
+          } catch {
+            return [];
+          }
+        })()
+    ),
     priorityScore: patch.priorityScore ?? existing.priority_score ?? null,
     priorityExplanation: patch.priorityExplanation ?? existing.priority_explanation ?? null,
     taskAgeDays: patch.taskAgeDays ?? existing.task_age_days ?? 0,
@@ -562,6 +1319,16 @@ export function updateTask(
     completedAt: nextStatus === "Completed" ? (existing.completed_at ?? updatedAt) : null,
     lastActivityAt: patch.lastActivityAt ?? updatedAt,
     manualOverrideFlags: JSON.stringify(overrideFlags),
+    decisionState: patch.decisionState ?? existing.decision_state ?? null,
+    decisionConfidence: patch.decisionConfidence ?? existing.decision_confidence ?? null,
+    decisionReason: patch.decisionReason ?? existing.decision_reason ?? null,
+    decisionReasonTags: JSON.stringify(patch.decisionReasonTags ?? parseJsonArray(existing.decision_reason_tags)),
+    personalizationVersion: patch.personalizationVersion ?? existing.personalization_version ?? null,
+    wasUserOverridden: Number(
+      patch.wasUserOverridden ?? (Number(existing.was_user_overridden ?? 0) === 1)
+    ),
+    restoredAt: patch.restoredAt ?? existing.restored_at ?? null,
+    rejectedAt: patch.rejectedAt ?? existing.rejected_at ?? null,
     updatedAt
   });
 
@@ -743,6 +1510,89 @@ export function recordGenerationRun(triggerType: "manual" | "scheduled", warning
     VALUES (?, ?, ?)
     `
   ).run(triggerType, new Date().toISOString(), JSON.stringify(warnings));
+}
+
+export function upsertDailyPlanSnapshot(input: {
+  dayKey: string;
+  weekday: number;
+  baseWorkdayMinutes: number;
+  adaptedTaskCapacityMinutes: number;
+  remainingTaskCapacityMinutes: number;
+  meetingMinutes: number;
+  plannedTaskMinutes: number;
+  completedTaskMinutes: number;
+  remainingTaskMinutes: number;
+  spilloverTaskCount: number;
+  freeMinutes: number;
+  focusFactor: number;
+  completionRate: number;
+  plannedTaskIds: number[];
+  summaryJson: string;
+  blocksJson: string;
+}) {
+  const now = new Date().toISOString();
+  db.prepare(
+    `
+    INSERT INTO daily_plan_snapshots (
+      day_key, weekday, base_workday_minutes, adapted_task_capacity_minutes, remaining_task_capacity_minutes,
+      meeting_minutes, planned_task_minutes, completed_task_minutes, remaining_task_minutes, spillover_task_count,
+      free_minutes, focus_factor, completion_rate, planned_task_ids_json, summary_json, blocks_json, created_at, updated_at
+    ) VALUES (
+      @dayKey, @weekday, @baseWorkdayMinutes, @adaptedTaskCapacityMinutes, @remainingTaskCapacityMinutes,
+      @meetingMinutes, @plannedTaskMinutes, @completedTaskMinutes, @remainingTaskMinutes, @spilloverTaskCount,
+      @freeMinutes, @focusFactor, @completionRate, @plannedTaskIdsJson, @summaryJson, @blocksJson, @createdAt, @updatedAt
+    )
+    ON CONFLICT(day_key) DO UPDATE SET
+      weekday = excluded.weekday,
+      base_workday_minutes = excluded.base_workday_minutes,
+      adapted_task_capacity_minutes = excluded.adapted_task_capacity_minutes,
+      remaining_task_capacity_minutes = excluded.remaining_task_capacity_minutes,
+      meeting_minutes = excluded.meeting_minutes,
+      planned_task_minutes = excluded.planned_task_minutes,
+      completed_task_minutes = excluded.completed_task_minutes,
+      remaining_task_minutes = excluded.remaining_task_minutes,
+      spillover_task_count = excluded.spillover_task_count,
+      free_minutes = excluded.free_minutes,
+      focus_factor = excluded.focus_factor,
+      completion_rate = excluded.completion_rate,
+      planned_task_ids_json = excluded.planned_task_ids_json,
+      summary_json = excluded.summary_json,
+      blocks_json = excluded.blocks_json,
+      updated_at = excluded.updated_at
+    `
+  ).run({
+    dayKey: input.dayKey,
+    weekday: input.weekday,
+    baseWorkdayMinutes: input.baseWorkdayMinutes,
+    adaptedTaskCapacityMinutes: input.adaptedTaskCapacityMinutes,
+    remainingTaskCapacityMinutes: input.remainingTaskCapacityMinutes,
+    meetingMinutes: input.meetingMinutes,
+    plannedTaskMinutes: input.plannedTaskMinutes,
+    completedTaskMinutes: input.completedTaskMinutes,
+    remainingTaskMinutes: input.remainingTaskMinutes,
+    spilloverTaskCount: input.spilloverTaskCount,
+    freeMinutes: input.freeMinutes,
+    focusFactor: input.focusFactor,
+    completionRate: input.completionRate,
+    plannedTaskIdsJson: JSON.stringify(input.plannedTaskIds),
+    summaryJson: input.summaryJson,
+    blocksJson: input.blocksJson,
+    createdAt: now,
+    updatedAt: now
+  });
+}
+
+export function listRecentDailyPlanSnapshots(limit = 28) {
+  return db
+    .prepare("SELECT * FROM daily_plan_snapshots ORDER BY day_key DESC LIMIT ?")
+    .all(limit) as Array<Record<string, unknown>>;
+}
+
+export function getRejectedTaskCount() {
+  const row = db
+    .prepare("SELECT COUNT(*) as count FROM rejected_tasks WHERE decision_state IN ('rejected', 'uncertain')")
+    .get() as { count: number };
+  return Number(row.count ?? 0);
 }
 
 export function groupTasksByPriority(tasks: Task[]) {

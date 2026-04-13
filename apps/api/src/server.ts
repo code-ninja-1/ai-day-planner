@@ -3,23 +3,36 @@ import express from "express";
 import { z } from "zod";
 import { acquireGraphTokenOnBehalfOf, getOptionalMicrosoftSession } from "./auth/microsoftAuth.js";
 import {
+  clearRejectedTasksBySourceThread,
   createManualTask,
   deleteIntegrationConnection,
   deleteTask,
   getAutomationSettings,
+  getLatestPreferenceMemorySnapshot,
   getReminderById,
+  getRejectedTaskById,
+  getRejectedTaskBySource,
   getTaskById,
+  getTaskBySource,
+  getTaskBySourceThread,
   getSyncState,
+  getUserPriorityProfile,
   listIntegrationConnections,
   listMeetings,
   listReminderItems,
+  listRejectedTasks,
   listTasks,
   listDeferredTasks,
+  logTaskDecisionEvent,
   normalizeTask,
   saveAutomationSettings,
   saveIntegrationConnection,
+  saveUserPriorityProfile,
   updateTask,
+  updateRejectedTask,
   updateReminder,
+  upsertRejectedTask,
+  upsertTask,
   groupTasksByPriority
 } from "./db.js";
 import { env } from "./env.js";
@@ -38,6 +51,7 @@ import {
   syncMeetingsOnly,
   syncTasksOnly
 } from "./services/planService.js";
+import { analyzeFeedbackReason, defaultPriorityProfile, synthesizePriorityProfile } from "./services/personalization.js";
 import { scheduleAutomation } from "./services/scheduler.js";
 
 const app = express();
@@ -69,6 +83,111 @@ const automationSettingsSchema = z.object({
   reminderCadenceHours: z.number().int().min(1).max(72).optional(),
   desktopNotificationsEnabled: z.boolean().optional()
 });
+
+const personalizationProfileSchema = z.object({
+  personalizationEnabled: z.boolean().optional(),
+  roleFocus: z.string().nullable().optional(),
+  prioritizationPrompt: z.string().nullable().optional(),
+  importantWork: z.array(z.string()).optional(),
+  noiseWork: z.array(z.string()).optional(),
+  mustNotMiss: z.array(z.string()).optional(),
+  importantSources: z.array(z.string()).optional(),
+  importantPeople: z.array(z.string()).optional(),
+  importantProjects: z.array(z.string()).optional(),
+  positiveReasonTags: z.array(z.string()).optional(),
+  negativeReasonTags: z.array(z.string()).optional(),
+  filteringStyle: z.enum(["conservative", "balanced", "aggressive"]).optional(),
+  priorityBias: z.enum(["focus", "balanced", "coverage"]).optional()
+});
+
+const calibrationSchema = z.object({
+  roleFocus: z.string().default(""),
+  prioritizationPrompt: z.string().default(""),
+  importantWork: z.array(z.string()).default([]),
+  noiseWork: z.array(z.string()).default([]),
+  mustNotMiss: z.array(z.string()).default([]),
+  importantPeople: z.array(z.string()).default([]),
+  importantProjects: z.array(z.string()).default([]),
+  filteringStyle: z.enum(["conservative", "balanced", "aggressive"]),
+  priorityBias: z.enum(["focus", "balanced", "coverage"]),
+  exampleRankings: z.array(
+    z.object({
+      title: z.string(),
+      source: z.enum(["Email", "Jira", "Manual"]),
+      decision: z.enum(["show_today", "keep_low", "reject_noise"])
+    })
+  )
+});
+
+const taskFeedbackSchema = z.object({
+  action: z.enum([
+    "reject",
+    "restore",
+    "priority_changed",
+    "status_changed",
+    "deferred",
+    "completed",
+    "always_ignore_similar",
+    "should_have_been_included"
+  ]),
+  beforePriority: z.enum(["High", "Medium", "Low"]).nullable().optional(),
+  afterPriority: z.enum(["High", "Medium", "Low"]).nullable().optional(),
+  context: z.string().nullable().optional()
+});
+
+const rejectedTaskPatchSchema = z.object({
+  action: z.enum(["always_ignore_similar", "should_have_been_included", "keep_rejected"])
+});
+
+async function captureTaskFeedback(input: {
+  taskId?: number | null;
+  source: "Email" | "Jira" | "Manual" | "Calibration";
+  sourceRef?: string | null;
+  sourceThreadRef?: string | null;
+  action:
+    | "system_evaluated"
+    | "reject"
+    | "restore"
+    | "priority_changed"
+    | "status_changed"
+    | "deferred"
+    | "completed"
+    | "always_ignore_similar"
+    | "should_have_been_included";
+  title: string;
+  beforePriority?: "High" | "Medium" | "Low" | null;
+  afterPriority?: "High" | "Medium" | "Low" | null;
+  decisionReason?: string | null;
+  decisionReasonTags?: string[];
+  context?: string | null;
+}) {
+  const analysis = await analyzeFeedbackReason({
+    action: input.action,
+    taskTitle: input.title,
+    source: input.source,
+    beforePriority: input.beforePriority,
+    afterPriority: input.afterPriority,
+    decisionReason: input.decisionReason,
+    decisionTags: (input.decisionReasonTags ?? []) as never,
+    context: input.context
+  });
+
+  logTaskDecisionEvent({
+    taskId: input.taskId ?? null,
+    source: input.source,
+    sourceRef: input.sourceRef ?? null,
+    sourceThreadRef: input.sourceThreadRef ?? null,
+    action: input.action,
+    beforePriority: input.beforePriority ?? null,
+    afterPriority: input.afterPriority ?? null,
+    decisionReason: input.decisionReason ?? null,
+    decisionReasonTags: (input.decisionReasonTags ?? []) as never,
+    feedbackPayloadJson: JSON.stringify({ title: input.title, context: input.context }),
+    inferredReason: analysis.likelyReason,
+    inferredReasonTag: analysis.reasonTag,
+    preferencePolarity: analysis.positiveOrNegativePreference
+  });
+}
 
 app.get("/api/health", (_req, res) => {
   res.json({ ok: true });
@@ -238,6 +357,10 @@ app.get("/api/tasks/deferred", (_req, res) => {
   res.json(getDeferredTasksPayload());
 });
 
+app.get("/api/tasks/rejected", (_req, res) => {
+  res.json({ tasks: listRejectedTasks().filter((task) => task.decisionState !== "restored") });
+});
+
 app.get("/api/tasks/:id/details", async (req, res) => {
   const task = getTaskById(Number(req.params.id));
   if (!task) {
@@ -290,11 +413,43 @@ app.patch("/api/tasks/:id", (req, res) => {
   if (!parsed.success) {
     return res.status(400).json({ message: "Invalid task payload" });
   }
+  const existingTask = getTaskById(Number(req.params.id));
   const row = updateTask(Number(req.params.id), parsed.data);
   if (!row) {
     return res.status(404).json({ message: "Task not found" });
   }
-  return res.json({ task: normalizeTask(row as Record<string, unknown>) });
+  const task = normalizeTask(row as Record<string, unknown>);
+  if (existingTask) {
+    if (parsed.data.priority && parsed.data.priority !== existingTask.priority) {
+      void captureTaskFeedback({
+        taskId: task.id,
+        source: task.source,
+        sourceRef: task.sourceRef ?? null,
+        sourceThreadRef: task.sourceThreadRef ?? null,
+        action: "priority_changed",
+        title: task.title,
+        beforePriority: existingTask.priority,
+        afterPriority: task.priority,
+        decisionReason: task.decisionReason,
+        decisionReasonTags: task.decisionReasonTags
+      });
+    }
+    if (parsed.data.status && parsed.data.status !== existingTask.status) {
+      void captureTaskFeedback({
+        taskId: task.id,
+        source: task.source,
+        sourceRef: task.sourceRef ?? null,
+        sourceThreadRef: task.sourceThreadRef ?? null,
+        action: parsed.data.status === "Completed" ? "completed" : "status_changed",
+        title: task.title,
+        beforePriority: task.priority,
+        afterPriority: task.priority,
+        decisionReason: task.decisionReason,
+        decisionReasonTags: task.decisionReasonTags
+      });
+    }
+  }
+  return res.json({ task });
 });
 
 app.patch("/api/tasks/:id/defer", (req, res) => {
@@ -312,15 +467,293 @@ app.patch("/api/tasks/:id/defer", (req, res) => {
   if (!row) {
     return res.status(404).json({ message: "Task not found" });
   }
-  return res.json({ task: normalizeTask(row as Record<string, unknown>) });
+  const task = normalizeTask(row as Record<string, unknown>);
+  void captureTaskFeedback({
+    taskId: task.id,
+    source: task.source,
+    sourceRef: task.sourceRef ?? null,
+    sourceThreadRef: task.sourceThreadRef ?? null,
+    action: "deferred",
+    title: task.title,
+    beforePriority: task.priority,
+    afterPriority: task.priority,
+    decisionReason: task.decisionReason,
+    decisionReasonTags: task.decisionReasonTags,
+    context: parsed.data.deferredUntil
+  });
+  return res.json({ task });
+});
+
+app.post("/api/tasks/:id/feedback", async (req, res) => {
+  const parsed = taskFeedbackSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ message: "Invalid feedback payload" });
+  }
+  const task = getTaskById(Number(req.params.id));
+  if (!task) {
+    return res.status(404).json({ message: "Task not found" });
+  }
+  await captureTaskFeedback({
+    taskId: task.id,
+    source: task.source,
+    sourceRef: task.sourceRef ?? null,
+    sourceThreadRef: task.sourceThreadRef ?? null,
+    action: parsed.data.action,
+    title: task.title,
+    beforePriority: parsed.data.beforePriority ?? task.priority,
+    afterPriority: parsed.data.afterPriority ?? task.priority,
+    decisionReason: task.decisionReason,
+    decisionReasonTags: task.decisionReasonTags,
+    context: parsed.data.context
+  });
+  return res.json({ ok: true });
 });
 
 app.delete("/api/tasks/:id", (req, res) => {
+  const task = getTaskById(Number(req.params.id));
+  if (task && task.source !== "Manual") {
+    upsertRejectedTask({
+      title: task.title,
+      source: task.source,
+      sourceLink: task.sourceLink,
+      sourceRef: task.sourceRef ?? null,
+      sourceThreadRef: task.sourceThreadRef ?? null,
+      jiraStatus: task.jiraStatus,
+      proposedPriority: task.priority,
+      decisionState: "rejected",
+      decisionConfidence: task.decisionConfidence,
+      decisionReason: task.decisionReason ?? "User rejected this task from the active plan.",
+      decisionReasonTags: task.decisionReasonTags,
+      personalizationVersion: task.personalizationVersion,
+      candidatePayloadJson: JSON.stringify({
+        title: task.title,
+        source: task.source,
+        sourceLink: task.sourceLink,
+        sourceRef: task.sourceRef,
+        sourceThreadRef: task.sourceThreadRef,
+        jiraStatus: task.jiraStatus
+      }),
+      rejectedAt: new Date().toISOString()
+    });
+    void captureTaskFeedback({
+      taskId: task.id,
+      source: task.source,
+      sourceRef: task.sourceRef ?? null,
+      sourceThreadRef: task.sourceThreadRef ?? null,
+      action: "reject",
+      title: task.title,
+      beforePriority: task.priority,
+      afterPriority: task.priority,
+      decisionReason: task.decisionReason,
+      decisionReasonTags: task.decisionReasonTags
+    });
+  }
   const deleted = deleteTask(Number(req.params.id));
   if (!deleted) {
     return res.status(404).json({ message: "Task not found" });
   }
   return res.status(204).send();
+});
+
+app.patch("/api/tasks/rejected/:id", async (req, res) => {
+  const parsed = rejectedTaskPatchSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ message: "Invalid rejected-task payload" });
+  }
+  const rejected = getRejectedTaskById(Number(req.params.id));
+  if (!rejected) {
+    return res.status(404).json({ message: "Rejected task not found" });
+  }
+
+  if (parsed.data.action === "always_ignore_similar") {
+    const profile = getUserPriorityProfile();
+    const nextTags = [...new Set([...profile.negativeReasonTags, ...rejected.decisionReasonTags])];
+    saveUserPriorityProfile({
+      negativeReasonTags: nextTags,
+      lastProfileRefreshAt: new Date().toISOString()
+    });
+    await captureTaskFeedback({
+      source: rejected.source,
+      sourceRef: rejected.sourceRef,
+      sourceThreadRef: rejected.sourceThreadRef,
+      action: "always_ignore_similar",
+      title: rejected.title,
+      beforePriority: rejected.proposedPriority,
+      afterPriority: rejected.proposedPriority,
+      decisionReason: rejected.decisionReason,
+      decisionReasonTags: rejected.decisionReasonTags
+    });
+  }
+
+  if (parsed.data.action === "should_have_been_included") {
+    const profile = getUserPriorityProfile();
+    const nextTags = [...new Set([...profile.positiveReasonTags, ...rejected.decisionReasonTags])];
+    saveUserPriorityProfile({
+      positiveReasonTags: nextTags,
+      lastProfileRefreshAt: new Date().toISOString()
+    });
+    await captureTaskFeedback({
+      source: rejected.source,
+      sourceRef: rejected.sourceRef,
+      sourceThreadRef: rejected.sourceThreadRef,
+      action: "should_have_been_included",
+      title: rejected.title,
+      beforePriority: rejected.proposedPriority,
+      afterPriority: rejected.proposedPriority,
+      decisionReason: rejected.decisionReason,
+      decisionReasonTags: rejected.decisionReasonTags
+    });
+  }
+
+  const updated = updateRejectedTask(rejected.id, {
+    decisionState: parsed.data.action === "should_have_been_included" ? "uncertain" : rejected.decisionState,
+    decisionConfidence:
+      parsed.data.action === "should_have_been_included"
+        ? Math.max(0.35, Math.min(0.95, (rejected.decisionConfidence ?? 0.5) - 0.2))
+        : rejected.decisionConfidence,
+    decisionReason:
+      parsed.data.action === "always_ignore_similar"
+        ? `${rejected.decisionReason ?? "Rejected"} Marked to ignore similar items in the future.`
+        : parsed.data.action === "should_have_been_included"
+          ? `${rejected.decisionReason ?? "Rejected"} You marked this as something that should have been included, so similar items will be ranked higher.`
+          : rejected.decisionReason
+  });
+  return res.json({ task: updated });
+});
+
+app.post("/api/tasks/rejected/:id/restore", async (req, res) => {
+  const rejected = getRejectedTaskById(Number(req.params.id));
+  if (!rejected) {
+    return res.status(404).json({ message: "Rejected task not found" });
+  }
+  const restoredAt = new Date().toISOString();
+  const exactTask =
+    rejected.sourceRef !== null ? getTaskBySource(rejected.source, rejected.sourceRef, { includeIgnored: true }) : null;
+  const threadTask =
+    rejected.source === "Email" && !exactTask
+      ? getTaskBySourceThread(rejected.source, rejected.sourceThreadRef, { includeIgnored: false })
+      : null;
+
+  if (threadTask && threadTask.sourceRef !== rejected.sourceRef) {
+    updateTask(threadTask.id, {
+      title: rejected.title,
+      priority: threadTask.manualOverrideFlags.includes("priority") ? undefined : rejected.proposedPriority,
+      lastActivityAt: restoredAt,
+      decisionState: "restored",
+      decisionConfidence: rejected.decisionConfidence,
+      decisionReason: rejected.decisionReason ?? "User restored this task from the rejected queue.",
+      decisionReasonTags: rejected.decisionReasonTags,
+      personalizationVersion: rejected.personalizationVersion,
+      restoredAt,
+      rejectedAt: null
+    });
+  } else {
+    upsertTask({
+      title: rejected.title,
+      source: rejected.source,
+      priority: rejected.proposedPriority,
+      sourceLink: rejected.sourceLink,
+      sourceRef: rejected.sourceRef,
+      sourceThreadRef: rejected.sourceThreadRef,
+      jiraStatus: rejected.jiraStatus,
+      decisionState: "restored",
+      decisionConfidence: rejected.decisionConfidence,
+      decisionReason: rejected.decisionReason ?? "User restored this task from the rejected queue.",
+      decisionReasonTags: rejected.decisionReasonTags,
+      personalizationVersion: rejected.personalizationVersion,
+      restoredAt,
+      reviveIgnored: true
+    });
+  }
+
+  if (rejected.source === "Email") {
+    clearRejectedTasksBySourceThread(rejected.source, rejected.sourceThreadRef);
+  }
+
+  const updated = updateRejectedTask(rejected.id, {
+    decisionState: "restored",
+    restoredAt
+  });
+  await captureTaskFeedback({
+    source: rejected.source,
+    sourceRef: rejected.sourceRef,
+    sourceThreadRef: rejected.sourceThreadRef,
+    action: "restore",
+    title: rejected.title,
+    beforePriority: rejected.proposedPriority,
+    afterPriority: rejected.proposedPriority,
+    decisionReason: rejected.decisionReason,
+    decisionReasonTags: rejected.decisionReasonTags
+  });
+  const restoredTask = listTasks(undefined, { includeDeferred: true }).find((task) => {
+    if (task.source !== rejected.source) return false;
+    if (rejected.sourceRef && task.sourceRef === rejected.sourceRef) return true;
+    return Boolean(rejected.sourceThreadRef && task.sourceThreadRef === rejected.sourceThreadRef);
+  });
+  return res.json({ task: restoredTask, rejectedTask: updated });
+});
+
+app.get("/api/personalization/profile", (_req, res) => {
+  res.json({ profile: getUserPriorityProfile() ?? defaultPriorityProfile });
+});
+
+app.patch("/api/personalization/profile", (req, res) => {
+  const parsed = personalizationProfileSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ message: "Invalid personalization profile" });
+  }
+  const profile = saveUserPriorityProfile({
+    ...parsed.data,
+    positiveReasonTags: (parsed.data.positiveReasonTags ?? []) as never,
+    negativeReasonTags: (parsed.data.negativeReasonTags ?? []) as never,
+    lastProfileRefreshAt: new Date().toISOString()
+  });
+  return res.json({ profile });
+});
+
+app.post("/api/personalization/calibrate", async (req, res) => {
+  const parsed = calibrationSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ message: "Invalid calibration payload" });
+  }
+  const synthesized = await synthesizePriorityProfile(parsed.data);
+  const profile = saveUserPriorityProfile({
+    ...synthesized,
+    positiveReasonTags: (synthesized.positiveReasonTags ?? []) as never,
+    negativeReasonTags: (synthesized.negativeReasonTags ?? []) as never,
+    prioritizationPrompt: parsed.data.prioritizationPrompt || synthesized.prioritizationPrompt || defaultPriorityProfile.prioritizationPrompt,
+    questionnaireJson: JSON.stringify({
+      roleFocus: parsed.data.roleFocus,
+      prioritizationPrompt: parsed.data.prioritizationPrompt,
+      importantWork: parsed.data.importantWork,
+      noiseWork: parsed.data.noiseWork,
+      mustNotMiss: parsed.data.mustNotMiss,
+      importantPeople: parsed.data.importantPeople,
+      importantProjects: parsed.data.importantProjects,
+      filteringStyle: parsed.data.filteringStyle,
+      priorityBias: parsed.data.priorityBias
+    }),
+    exampleRankingsJson: JSON.stringify(parsed.data.exampleRankings),
+    personalizationEnabled: true,
+    lastProfileRefreshAt: new Date().toISOString()
+  });
+  await captureTaskFeedback({
+    source: "Calibration",
+    action: "system_evaluated",
+    title: "Priority calibration",
+    decisionReason: "User completed priority calibration.",
+    context: JSON.stringify(parsed.data)
+  });
+  return res.status(201).json({ profile });
+});
+
+app.get("/api/personalization/insights", (_req, res) => {
+  const latest = getLatestPreferenceMemorySnapshot();
+  res.json({
+    insights: latest.insights,
+    sourceEventCount: latest.sourceEventCount,
+    createdAt: latest.createdAt
+  });
 });
 
 app.get("/api/settings/integrations", async (req, res) => {

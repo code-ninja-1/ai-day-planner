@@ -1,6 +1,6 @@
 import { env } from "../env.js";
 import {
-  fetchRecentAssignedIssuesForCredentials,
+  fetchOpenAssignedIssuesForCredentials,
   getMappedJiraPriority,
   normalizeJiraBaseUrl,
   validateJiraCredentials
@@ -43,7 +43,7 @@ async function main() {
   );
 
   const sinceIso = new Date(Date.now() - 48 * 60 * 60 * 1000).toISOString();
-  const issues = await fetchRecentAssignedIssuesForCredentials(
+  const issues = await fetchOpenAssignedIssuesForCredentials(
     {
       ...credentials,
       authType: validation.authType
@@ -51,7 +51,7 @@ async function main() {
     sinceIso
   );
 
-  console.log(`Assigned issues updated since ${sinceIso}: ${issues.length}`);
+  console.log(`Open assigned issues available since ${sinceIso}: ${issues.length}`);
   for (const issue of issues.slice(0, 5)) {
     console.log(
       `- ${issue.key}: ${issue.fields.summary} | status=${issue.fields.status?.name ?? "Unknown"} | mappedPriority=${getMappedJiraPriority(issue.fields.priority?.name)}`
@@ -59,7 +59,7 @@ async function main() {
   }
 
   if (!issues.length) {
-    console.log("No recently updated assigned issues found. Authentication still looks healthy.");
+    console.log("No open assigned issues found. Authentication still looks healthy.");
   }
 }
 

@@ -10,10 +10,14 @@ export interface EmailClassification {
 
 function heuristicClassification(email: GraphMail): EmailClassification {
   const text = `${email.subject ?? ""} ${email.bodyPreview ?? ""}`.toLowerCase();
+  const commentOrThreadSignal =
+    /(comment(ed)?|mentioned you|requested review|requested changes|assigned to you|reply needed|your input|needs your review|tagged you)/.test(
+      text
+    );
   const actionable =
     /(please|action|required|follow up|review|approve|can you|need you|todo|by eod|by tomorrow)/.test(
       text
-    );
+    ) || commentOrThreadSignal;
   const priority: TaskPriority =
     /(urgent|asap|today|blocking|immediately)/.test(text)
       ? "High"
@@ -49,7 +53,7 @@ export async function classifyEmail(email: GraphMail): Promise<EmailClassificati
               {
                 type: "input_text",
                 text:
-                  "Classify whether an email should become a work task. Return compact JSON with actionable(boolean), priority(High|Medium|Low), and title(string). Prefer false for newsletters or FYIs."
+                  "Classify whether an email should become a work task. Return compact JSON with actionable(boolean), priority(High|Medium|Low), and title(string). Do not blindly reject comment or notification emails if they mention the user, request review, contain an assignment, or imply follow-up. Prefer false for true newsletters, digests, or FYIs with no user-relevant action."
               }
             ]
           },
@@ -108,4 +112,3 @@ export async function classifyEmail(email: GraphMail): Promise<EmailClassificati
     return heuristicClassification(email);
   }
 }
-
