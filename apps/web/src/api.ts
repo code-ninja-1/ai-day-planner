@@ -1,11 +1,21 @@
 import type {
+  AuditEvent,
   AutomationSettings,
+  DayHistoryDetail,
+  DayHistorySummary,
+  DiagnosticsPayload,
+  EmailReplyDraft,
+  InsightsOverview,
+  InsightsTodayPayload,
   IntegrationStatus,
+  MeetingPrep,
   PersonalizationInsight,
+  PlannerRunDetail,
   RejectedTask,
   Reminder,
   Task,
   TaskDetail,
+  TaskInsightsPayload,
   TaskPriority,
   TaskStatus,
   TodayResponse,
@@ -83,14 +93,34 @@ export const api = {
       body: JSON.stringify({ timeZone })
     }),
   getDeferredTasks: () => request<{ tasks: Task[] }>("/tasks/deferred"),
-  getRejectedTasks: () => request<{ tasks: RejectedTask[] }>("/tasks/rejected"),
+  getRejectedTasks: () => request<{ tasks: RejectedTask[]; ignoredTasks: RejectedTask[] }>("/tasks/rejected"),
+  getInsightsOverview: () => request<InsightsOverview>("/insights/overview"),
+  getInsightsToday: () => request<InsightsTodayPayload>("/insights/today"),
+  getInsightsHistory: (limit = 30) => request<{ days: DayHistorySummary[] }>(`/insights/history?limit=${limit}`),
+  getInsightsHistoryDay: (dayKey: string) => request<DayHistoryDetail>(`/insights/history/${encodeURIComponent(dayKey)}`),
+  getTaskInsights: (taskId: number) => request<TaskInsightsPayload>(`/insights/tasks/${taskId}`),
+  getDebugRuns: () => request<{ runs: PlannerRunDetail[]; diagnostics: DiagnosticsPayload }>("/debug/runs"),
+  getDebugLogs: (limit = 200) => request<{ logs: AuditEvent[] }>(`/debug/logs?limit=${limit}`),
+  logClientEvent: (input: {
+    eventType: string;
+    level?: "debug" | "info" | "warn" | "error";
+    message: string;
+    entityType?: string | null;
+    entityId?: string | null;
+    status?: "started" | "success" | "failure" | "updated" | "skipped" | "info";
+    metadata?: unknown;
+  }) =>
+    request<{ ok: boolean }>("/debug/client-events", {
+      method: "POST",
+      body: JSON.stringify(input)
+    }),
   restoreRejectedTask: (id: number) =>
     request<{ task: Task | null; rejectedTask: RejectedTask | null }>(`/tasks/rejected/${id}/restore`, {
       method: "POST"
     }),
   updateRejectedTask: (
     id: number,
-    input: { action: "always_ignore_similar" | "should_have_been_included" | "keep_rejected" }
+    input: { action: "always_ignore_exact" | "always_ignore_similar" | "should_have_been_included" | "keep_rejected" }
   ) =>
     request<{ task: RejectedTask | null }>(`/tasks/rejected/${id}`, {
       method: "PATCH",
@@ -152,6 +182,48 @@ export const api = {
     request<{ detail: TaskDetail }>(`/tasks/${id}/details`),
   getTaskDetailsWithMicrosoftSession: (id: number, accessToken: string) =>
     authedRequest<{ detail: TaskDetail }>(`/tasks/${id}/details`, accessToken),
+  generateEmailReplyDraft: (id: number, input: { userIntent?: string | null }) =>
+    request<{ draft: EmailReplyDraft }>(`/tasks/${id}/email-reply/draft`, {
+      method: "POST",
+      body: JSON.stringify(input)
+    }),
+  generateEmailReplyDraftWithMicrosoftSession: (id: number, accessToken: string, input: { userIntent?: string | null }) =>
+    authedRequest<{ draft: EmailReplyDraft }>(`/tasks/${id}/email-reply/draft`, accessToken, {
+      method: "POST",
+      body: JSON.stringify(input)
+    }),
+  sendEmailReply: (id: number, input: { to: string[]; cc: string[]; subject: string; body: string }) =>
+    request<{ ok: boolean }>(`/tasks/${id}/email-reply/send`, {
+      method: "POST",
+      body: JSON.stringify(input)
+    }),
+  sendEmailReplyWithMicrosoftSession: (
+    id: number,
+    accessToken: string,
+    input: { to: string[]; cc: string[]; subject: string; body: string }
+  ) =>
+    authedRequest<{ ok: boolean }>(`/tasks/${id}/email-reply/send`, accessToken, {
+      method: "POST",
+      body: JSON.stringify(input)
+    }),
+  generateMeetingPrep: (id: number, input: { userNotes?: string | null }) =>
+    request<{ prep: MeetingPrep }>(`/meetings/${id}/prepare`, {
+      method: "POST",
+      body: JSON.stringify(input)
+    }),
+  generateMeetingPrepWithMicrosoftSession: (id: number, accessToken: string, input: { userNotes?: string | null }) =>
+    authedRequest<{ prep: MeetingPrep }>(`/meetings/${id}/prepare`, accessToken, {
+      method: "POST",
+      body: JSON.stringify(input)
+    }),
+  transitionJiraIssue: (issueKey: string, input: { transitionId: string; parentTaskId?: number }) =>
+    request<{ detail: Extract<TaskDetail, { type: "jira" }>; task: Task | null }>(
+      `/jira/issues/${encodeURIComponent(issueKey)}/transition`,
+      {
+        method: "POST",
+        body: JSON.stringify(input)
+      }
+    ),
   deleteTask: (id: number) =>
     request<void>(`/tasks/${id}`, {
       method: "DELETE"

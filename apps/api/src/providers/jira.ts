@@ -1,5 +1,6 @@
 import { env } from "../env.js";
 import { getIntegrationConnection } from "../db.js";
+import type { TaskStatus } from "../types.js";
 
 export interface JiraIssue {
   id: string;
@@ -51,6 +52,16 @@ interface JiraIssueDetailResponse {
   };
 }
 
+interface JiraTransitionResponse {
+  transitions?: Array<{
+    id?: string;
+    name?: string;
+    to?: {
+      name?: string;
+    };
+  }>;
+}
+
 export interface JiraCredentials {
   baseUrl: string;
   email: string;
@@ -68,6 +79,13 @@ export interface JiraPlanningContext {
   }>;
 }
 
+export interface JiraTransition {
+  id: string;
+  name: string;
+  toStatus: string | null;
+  toStatusCategory: TaskStatus;
+}
+
 function mapJiraPriority(name?: string) {
   const value = (name ?? "").toLowerCase();
   if (value.includes("highest") || value.includes("high") || value.includes("blocker")) {
@@ -81,6 +99,17 @@ function mapJiraPriority(name?: string) {
 
 export function getMappedJiraPriority(name?: string) {
   return mapJiraPriority(name);
+}
+
+export function mapJiraWorkflowStatus(status?: string | null): TaskStatus {
+  const value = (status ?? "").toLowerCase();
+  if (/(done|closed|resolved|complete|completed|cancelled|canceled)/.test(value)) {
+    return "Completed";
+  }
+  if (/(progress|coding|review|testing|qa|blocked|in dev|development)/.test(value)) {
+    return "In Progress";
+  }
+  return "Not Started";
 }
 
 export function buildJiraIssueBrowseUrl(baseUrl: string, issueKey: string) {
@@ -98,6 +127,14 @@ export function normalizeJiraBaseUrl(input: string) {
 
 function buildJiraUrl(baseUrl: string, path: string) {
   return new URL(path, `${normalizeJiraBaseUrl(baseUrl)}/`).toString();
+}
+
+function getJiraCredentials() {
+  const connection = getIntegrationConnection("jira");
+  if (!connection?.configJson) {
+    throw new Error("Jira integration is not connected");
+  }
+  return JSON.parse(connection.configJson) as JiraCredentials;
 }
 
 function formatNetworkError(error: unknown) {
@@ -127,7 +164,8 @@ async function buildJiraHttpError(prefix: string, response: Response) {
 async function jiraFetchWithAuthType(
   url: string,
   credentials: JiraCredentials,
-  authType: "basic" | "bearer"
+  authType: "basic" | "bearer",
+  init?: RequestInit
 ) {
   const previousTls = process.env.NODE_TLS_REJECT_UNAUTHORIZED;
   try {
@@ -141,9 +179,11 @@ async function jiraFetchWithAuthType(
         : `Basic ${Buffer.from(`${credentials.email}:${credentials.apiToken}`).toString("base64")}`;
 
     return await fetch(url, {
+      ...init,
       headers: {
         Authorization: authorization,
-        Accept: "application/json"
+        Accept: "application/json",
+        ...(init?.headers ?? {})
       }
     });
   } catch (error) {
@@ -159,17 +199,17 @@ async function jiraFetchWithAuthType(
   }
 }
 
-async function jiraFetchAuthed(url: string, credentials: JiraCredentials) {
+async function jiraFetchAuthed(url: string, credentials: JiraCredentials, init?: RequestInit) {
   if (credentials.authType) {
-    return jiraFetchWithAuthType(url, credentials, credentials.authType);
+    return jiraFetchWithAuthType(url, credentials, credentials.authType, init);
   }
 
-  const basicResponse = await jiraFetchWithAuthType(url, credentials, "basic");
+  const basicResponse = await jiraFetchWithAuthType(url, credentials, "basic", init);
   if (basicResponse.status !== 401 && basicResponse.status !== 403) {
     return basicResponse;
   }
 
-  return jiraFetchWithAuthType(url, credentials, "bearer");
+  return jiraFetchWithAuthType(url, credentials, "bearer", init);
 }
 
 export async function validateJiraCredentials(input: {
@@ -224,13 +264,7 @@ export async function fetchOpenAssignedIssuesForCredentials(
 }
 
 export async function fetchOpenAssignedIssues(sinceIso: string) {
-  const connection = getIntegrationConnection("jira");
-  if (!connection?.configJson) {
-    throw new Error("Jira integration is not connected");
-  }
-
-  const config = JSON.parse(connection.configJson) as JiraCredentials;
-  return fetchOpenAssignedIssuesForCredentials(config, sinceIso);
+  return fetchOpenAssignedIssuesForCredentials(getJiraCredentials(), sinceIso);
 }
 
 function isDoneLikeStatus(status?: string | null) {
@@ -299,13 +333,75 @@ export async function fetchJiraIssuePlanningContextForCredentials(
 }
 
 export async function fetchJiraIssuePlanningContext(issueKey: string) {
-  const connection = getIntegrationConnection("jira");
-  if (!connection?.configJson) {
-    throw new Error("Jira integration is not connected");
-  }
+  return fetchJiraIssuePlanningContextForCredentials(getJiraCredentials(), issueKey);
+}
 
-  const config = JSON.parse(connection.configJson) as JiraCredentials;
-  return fetchJiraIssuePlanningContextForCredentials(config, issueKey);
+async function fetchJiraTransitionsForCredentials(credentials: JiraCredentials, issueKey: string): Promise<JiraTransition[]> {
+  const url = buildJiraUrl(credentials.baseUrl, `/rest/api/2/issue/${issueKey}/transitions`);
+  const response = await jiraFetchAuthed(url, credentials);
+  if (!response.ok) {
+    throw await buildJiraHttpError("Jira transitions fetch failed", response);
+  }
+  const json = (await response.json()) as JiraTransitionResponse;
+  return (json.transitions ?? [])
+    .map((transition) => ({
+      id: String(transition.id ?? "").trim(),
+      name: String(transition.name ?? "").trim(),
+      toStatus: transition.to?.name ?? null,
+      toStatusCategory: mapJiraWorkflowStatus(transition.to?.name ?? transition.name ?? null)
+    }))
+    .filter((transition) => transition.id && transition.name);
+}
+
+function pickTransitionForTaskStatus(
+  transitions: JiraTransition[],
+  targetStatus: TaskStatus,
+  currentStatus?: string | null
+) {
+  const exactCategory = transitions.filter((transition) => transition.toStatusCategory === targetStatus);
+  if (!exactCategory.length) return null;
+
+  const currentCategory = mapJiraWorkflowStatus(currentStatus);
+  const nonSameCategory = exactCategory.find((transition) => transition.toStatusCategory !== currentCategory);
+  return nonSameCategory ?? exactCategory[0] ?? null;
+}
+
+async function transitionJiraIssueForCredentials(credentials: JiraCredentials, issueKey: string, transitionId: string) {
+  const url = buildJiraUrl(credentials.baseUrl, `/rest/api/2/issue/${issueKey}/transitions`);
+  const response = await jiraFetchAuthed(url, credentials, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      transition: {
+        id: transitionId
+      }
+    })
+  });
+  if (!response.ok) {
+    throw await buildJiraHttpError("Jira transition failed", response);
+  }
+}
+
+export async function fetchJiraTransitions(issueKey: string) {
+  return fetchJiraTransitionsForCredentials(getJiraCredentials(), issueKey);
+}
+
+export async function transitionJiraIssue(issueKey: string, transitionId: string) {
+  const credentials = getJiraCredentials();
+  await transitionJiraIssueForCredentials(credentials, issueKey, transitionId);
+}
+
+export async function transitionJiraIssueToTaskStatus(issueKey: string, targetStatus: TaskStatus, currentStatus?: string | null) {
+  const credentials = getJiraCredentials();
+  const transitions = await fetchJiraTransitionsForCredentials(credentials, issueKey);
+  const transition = pickTransitionForTaskStatus(transitions, targetStatus, currentStatus);
+  if (!transition) {
+    throw new Error(`No Jira transition is available that maps to ${targetStatus}.`);
+  }
+  await transitionJiraIssueForCredentials(credentials, issueKey, transition.id);
+  return transition;
 }
 
 function adfToText(node: unknown): string {
@@ -376,13 +472,21 @@ function extractOriginalEstimateSeconds(fields: Record<string, unknown>) {
   return null;
 }
 
-export async function fetchJiraIssueDetail(issueKey: string) {
-  const connection = getIntegrationConnection("jira");
-  if (!connection?.configJson) {
-    throw new Error("Jira integration is not connected");
+export async function fetchJiraIssueForSync(issueKey: string) {
+  const credentials = getJiraCredentials();
+  const detailUrl = new URL(buildJiraUrl(credentials.baseUrl, `/rest/api/2/issue/${issueKey}`));
+  detailUrl.searchParams.set("fields", "summary,status,priority,updated,issuetype,timeoriginalestimate,timetracking");
+
+  const response = await jiraFetchAuthed(detailUrl.toString(), credentials);
+  if (!response.ok) {
+    throw await buildJiraHttpError("Jira issue fetch failed", response);
   }
 
-  const config = JSON.parse(connection.configJson) as JiraCredentials;
+  return (await response.json()) as JiraIssue;
+}
+
+export async function fetchJiraIssueDetail(issueKey: string) {
+  const config = getJiraCredentials();
   const detailUrl = new URL(buildJiraUrl(config.baseUrl, `/rest/api/2/issue/${issueKey}`));
   detailUrl.searchParams.set(
     "fields",
@@ -408,23 +512,35 @@ export async function fetchJiraIssueDetail(issueKey: string) {
 
   const json = (await response.json()) as JiraIssueDetailResponse;
   const fields = json.fields ?? {};
+  const transitions = await fetchJiraTransitionsForCredentials(config, issueKey).catch(() => []);
+  const subtasks = await Promise.all(
+    (fields.subtasks ?? []).map(async (subtask) => {
+      const subtaskTransitions = await fetchJiraTransitionsForCredentials(config, subtask.key).catch(() => []);
+      const currentStatus = subtask.fields?.status?.name ?? null;
+      return {
+        key: subtask.key,
+        title: subtask.fields?.summary ?? subtask.key,
+        status: currentStatus,
+        statusCategory: mapJiraWorkflowStatus(currentStatus),
+        transitions: subtaskTransitions
+      };
+    })
+  );
 
   return {
     type: "jira" as const,
     key: json.key,
     title: String(fields.summary ?? issueKey),
     status: fields.status?.name ?? null,
+    statusCategory: mapJiraWorkflowStatus(fields.status?.name ?? null),
     priority: fields.priority?.name ?? null,
+    transitions,
     description: adfToText(fields.description) || null,
     storyPoints: extractStoryPoints(fields),
     assignee: fields.assignee?.displayName ?? null,
     reporter: fields.reporter?.displayName ?? null,
     labels: fields.labels ?? [],
-    subtasks: (fields.subtasks ?? []).map((subtask) => ({
-      key: subtask.key,
-      title: subtask.fields?.summary ?? subtask.key,
-      status: subtask.fields?.status?.name ?? null
-    })),
+    subtasks,
     comments: (fields.comment?.comments ?? []).map((comment) => ({
       author: comment.author?.displayName ?? "Unknown",
       createdAt: comment.created ?? null,

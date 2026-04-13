@@ -4,21 +4,28 @@ import { z } from "zod";
 import { acquireGraphTokenOnBehalfOf, getOptionalMicrosoftSession } from "./auth/microsoftAuth.js";
 import {
   clearRejectedTasksBySourceThread,
+  recordTaskStateEvent,
   createManualTask,
   deleteIntegrationConnection,
   deleteTask,
+  getMeetingById,
+  listAuditEvents,
   getAutomationSettings,
+  getIgnoredRejectedTaskCount,
   getLatestPreferenceMemorySnapshot,
   getReminderById,
   getRejectedTaskById,
   getRejectedTaskBySource,
+  getRejectedTaskBySourceThread,
   getTaskById,
   getTaskBySource,
   getTaskBySourceThread,
   getSyncState,
   getUserPriorityProfile,
   listIntegrationConnections,
+  listIgnoredRejectedTasks,
   listMeetings,
+  listPlannerRunDetails,
   listReminderItems,
   listRejectedTasks,
   listTasks,
@@ -36,13 +43,25 @@ import {
   groupTasksByPriority
 } from "./db.js";
 import { env } from "./env.js";
-import { fetchJiraIssueDetail, normalizeJiraBaseUrl, validateJiraCredentials } from "./providers/jira.js";
+import {
+  buildJiraIssueBrowseUrl,
+  fetchJiraIssueDetail,
+  fetchJiraIssueForSync,
+  fetchJiraIssuePlanningContext,
+  mapJiraWorkflowStatus,
+  normalizeJiraBaseUrl,
+  transitionJiraIssue,
+  transitionJiraIssueToTaskStatus,
+  validateJiraCredentials
+} from "./providers/jira.js";
 import {
   exchangeMicrosoftCode,
+  fetchMeetingDetailWithAccessToken,
   fetchEmailDetailWithAccessToken,
   fetchMicrosoftProfileWithAccessToken,
   getMicrosoftAuthUrl
 } from "./providers/microsoft.js";
+import { sendMailWithAccessToken } from "./providers/microsoft.js";
 import {
   generatePlan,
   getDeferredTasksPayload,
@@ -51,12 +70,57 @@ import {
   syncMeetingsOnly,
   syncTasksOnly
 } from "./services/planService.js";
+import {
+  getDiagnosticsPayload,
+  getInsightsHistoryDayPayload,
+  getInsightsHistoryPayload,
+  getInsightsOverviewPayload,
+  getInsightsTodayPayload,
+  getTaskInsightsPayload
+} from "./services/insights.js";
+import { createCorrelationId, logEvent } from "./services/logger.js";
 import { analyzeFeedbackReason, defaultPriorityProfile, synthesizePriorityProfile } from "./services/personalization.js";
+import { generateEmailReplyDraft, generateMeetingPrep } from "./services/assistant.js";
 import { scheduleAutomation } from "./services/scheduler.js";
 
 const app = express();
 app.use(cors({ origin: env.appOrigin, credentials: true }));
 app.use(express.json());
+app.use((req, res, next) => {
+  const requestId = createCorrelationId();
+  const startedAt = Date.now();
+  (res.locals as Record<string, unknown>).requestId = requestId;
+  logEvent({
+    eventType: "http.request",
+    requestId,
+    status: "started",
+    source: "server",
+    message: `${req.method} ${req.path} started.`,
+    metadata: {
+      method: req.method,
+      path: req.path,
+      query: req.query
+    }
+  });
+
+  res.on("finish", () => {
+    logEvent({
+      eventType: "http.request",
+      requestId,
+      status: res.statusCode >= 500 ? "failure" : "success",
+      source: "server",
+      message: `${req.method} ${req.path} completed.`,
+      metadata: {
+        method: req.method,
+        path: req.path,
+        statusCode: res.statusCode,
+        durationMs: Date.now() - startedAt
+      }
+    });
+  });
+
+  next();
+});
 
 const taskCreateSchema = z.object({
   title: z.string().min(1),
@@ -136,7 +200,38 @@ const taskFeedbackSchema = z.object({
 });
 
 const rejectedTaskPatchSchema = z.object({
-  action: z.enum(["always_ignore_similar", "should_have_been_included", "keep_rejected"])
+  action: z.enum(["always_ignore_exact", "always_ignore_similar", "should_have_been_included", "keep_rejected"])
+});
+
+const clientEventSchema = z.object({
+  eventType: z.string().min(1),
+  level: z.enum(["debug", "info", "warn", "error"]).optional(),
+  message: z.string().min(1),
+  entityType: z.string().nullable().optional(),
+  entityId: z.string().nullable().optional(),
+  status: z.enum(["started", "success", "failure", "updated", "skipped", "info"]).optional(),
+  metadata: z.unknown().optional()
+});
+
+const emailReplyDraftSchema = z.object({
+  userIntent: z.string().nullable().optional()
+});
+
+const emailReplySendSchema = z.object({
+  to: z.array(z.string().email()).min(1),
+  cc: z.array(z.string().email()).default([]),
+  subject: z.string().min(1),
+  body: z.string().min(1)
+});
+
+const meetingPrepSchema = z.object({
+  userNotes: z.string().nullable().optional()
+});
+
+const jiraTransitionSchema = z.object({
+  issueKey: z.string().min(1).optional(),
+  transitionId: z.string().min(1),
+  parentTaskId: z.number().int().positive().optional()
 });
 
 async function captureTaskFeedback(input: {
@@ -189,6 +284,72 @@ async function captureTaskFeedback(input: {
   });
 }
 
+function getRequestId(res: express.Response) {
+  return ((res.locals as Record<string, unknown>).requestId as string | undefined) ?? null;
+}
+
+function recordUserTaskMutation(input: {
+  taskId?: number | null;
+  source: "Email" | "Jira" | "Manual" | "Calibration";
+  sourceRef?: string | null;
+  sourceThreadRef?: string | null;
+  eventType: string;
+  reason?: string | null;
+  before?: unknown;
+  after?: unknown;
+}) {
+  recordTaskStateEvent({
+    taskId: input.taskId ?? null,
+    source: input.source,
+    sourceRef: input.sourceRef ?? null,
+    sourceThreadRef: input.sourceThreadRef ?? null,
+    eventType: input.eventType,
+    actor: "user",
+    reason: input.reason ?? null,
+    beforeJson: input.before ? JSON.stringify(input.before) : null,
+    afterJson: input.after ? JSON.stringify(input.after) : null
+  });
+}
+
+function extractIssueKeys(value: string) {
+  return [...new Set((value.toUpperCase().match(/\b[A-Z][A-Z0-9]+-\d+\b/g) ?? []).map((key) => key.trim()))];
+}
+
+async function refreshJiraTaskFromSource(taskId: number, issueKey: string) {
+  const issue = await fetchJiraIssueForSync(issueKey);
+  let planningContext: Awaited<ReturnType<typeof fetchJiraIssuePlanningContext>> | null = null;
+  try {
+    planningContext = await fetchJiraIssuePlanningContext(issueKey);
+  } catch {
+    planningContext = null;
+  }
+
+  const jiraConnection = listIntegrationConnections().find((entry) => entry.provider === "jira");
+  const jiraConfig =
+    typeof jiraConnection?.configJson === "string"
+      ? (JSON.parse(jiraConnection.configJson) as { baseUrl?: string })
+      : null;
+  const row = updateTask(taskId, {
+    title: `${issue.key} ${issue.fields.summary}`,
+    status: mapJiraWorkflowStatus(issue.fields.status?.name),
+    sourceLink: jiraConfig?.baseUrl ? buildJiraIssueBrowseUrl(jiraConfig.baseUrl, issue.key) : issue.self,
+    jiraStatus: issue.fields.status?.name ?? null,
+    jiraEstimateSeconds:
+      issue.fields.timeoriginalestimate ?? issue.fields.timetracking?.originalEstimateSeconds ?? null,
+    jiraSubtaskEstimateSeconds: planningContext?.openSubtaskEstimateSeconds ?? null,
+    jiraPlanningSubtasks: planningContext?.subtasks ?? [],
+    lastActivityAt: issue.fields.updated ?? new Date().toISOString(),
+    lastChangedBy: "user",
+    lastChangedAt: new Date().toISOString(),
+    wasUserOverridden: true
+  });
+
+  if (!row) {
+    throw new Error("Failed to refresh Jira task after transition");
+  }
+  return normalizeTask(row as Record<string, unknown>);
+}
+
 app.get("/api/health", (_req, res) => {
   res.json({ ok: true });
 });
@@ -197,8 +358,66 @@ app.get("/api/today", (_req, res) => {
   res.json(getTodaySnapshot());
 });
 
+app.get("/api/insights/overview", (_req, res) => {
+  res.json(getInsightsOverviewPayload());
+});
+
+app.get("/api/insights/today", (_req, res) => {
+  res.json(getInsightsTodayPayload());
+});
+
+app.get("/api/insights/history", (req, res) => {
+  const limit = Number(req.query.limit ?? 30);
+  res.json(getInsightsHistoryPayload(Number.isFinite(limit) ? limit : 30));
+});
+
+app.get("/api/insights/history/:dayKey", (req, res) => {
+  const payload = getInsightsHistoryDayPayload(req.params.dayKey);
+  if (!payload) {
+    return res.status(404).json({ message: "History not found for this day" });
+  }
+  return res.json(payload);
+});
+
+app.get("/api/insights/tasks/:taskId", (req, res) => {
+  const payload = getTaskInsightsPayload(Number(req.params.taskId));
+  if (!payload) {
+    return res.status(404).json({ message: "Task insights not found" });
+  }
+  return res.json(payload);
+});
+
+app.get("/api/debug/runs", (_req, res) => {
+  res.json({ runs: listPlannerRunDetails(30), diagnostics: getDiagnosticsPayload() });
+});
+
+app.get("/api/debug/logs", (req, res) => {
+  const limit = Number(req.query.limit ?? 200);
+  res.json({ logs: listAuditEvents(Number.isFinite(limit) ? limit : 200) });
+});
+
+app.post("/api/debug/client-events", (req, res) => {
+  const parsed = clientEventSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ message: "Invalid client event payload" });
+  }
+  logEvent({
+    level: parsed.data.level ?? "info",
+    eventType: parsed.data.eventType,
+    requestId: getRequestId(res),
+    entityType: parsed.data.entityType ?? null,
+    entityId: parsed.data.entityId ?? null,
+    status: parsed.data.status ?? "info",
+    source: "client",
+    message: parsed.data.message,
+    metadata: parsed.data.metadata
+  });
+  return res.status(201).json({ ok: true });
+});
+
 app.post("/api/plan/generate", async (req, res) => {
   try {
+    const runId = createCorrelationId();
     let microsoftGraphAccessToken: string | null = null;
     let microsoftWarning: string | null = null;
     const preferredTimeZone =
@@ -231,7 +450,8 @@ app.post("/api/plan/generate", async (req, res) => {
     const payload = await generatePlan({
       microsoftGraphAccessToken,
       microsoftWarning,
-      preferredTimeZone
+      preferredTimeZone,
+      runId
     }, "manual");
     res.json(payload);
   } catch (error) {
@@ -243,6 +463,7 @@ app.post("/api/plan/generate", async (req, res) => {
 
 app.post("/api/plan/generate-now", async (req, res) => {
   try {
+    const runId = createCorrelationId();
     let microsoftGraphAccessToken: string | null = null;
     let microsoftWarning: string | null = null;
     const preferredTimeZone =
@@ -266,7 +487,8 @@ app.post("/api/plan/generate-now", async (req, res) => {
       {
         microsoftGraphAccessToken,
         microsoftWarning,
-        preferredTimeZone
+        preferredTimeZone,
+        runId
       },
       "manual"
     );
@@ -280,6 +502,7 @@ app.post("/api/plan/generate-now", async (req, res) => {
 
 app.post("/api/sync/meetings", async (req, res) => {
   try {
+    const runId = createCorrelationId();
     let microsoftGraphAccessToken: string | null = null;
     let microsoftWarning: string | null = null;
     const preferredTimeZone =
@@ -303,7 +526,8 @@ app.post("/api/sync/meetings", async (req, res) => {
       await syncMeetingsOnly({
         microsoftGraphAccessToken,
         microsoftWarning,
-        preferredTimeZone
+        preferredTimeZone,
+        runId
       })
     );
   } catch (error) {
@@ -315,6 +539,7 @@ app.post("/api/sync/meetings", async (req, res) => {
 
 app.post("/api/sync/tasks", async (req, res) => {
   try {
+    const runId = createCorrelationId();
     let microsoftGraphAccessToken: string | null = null;
     let microsoftWarning: string | null = null;
     const preferredTimeZone =
@@ -338,7 +563,8 @@ app.post("/api/sync/tasks", async (req, res) => {
       await syncTasksOnly({
         microsoftGraphAccessToken,
         microsoftWarning,
-        preferredTimeZone
+        preferredTimeZone,
+        runId
       })
     );
   } catch (error) {
@@ -358,7 +584,39 @@ app.get("/api/tasks/deferred", (_req, res) => {
 });
 
 app.get("/api/tasks/rejected", (_req, res) => {
-  res.json({ tasks: listRejectedTasks().filter((task) => task.decisionState !== "restored") });
+  const jiraKeys = new Set(
+    listTasks(undefined, { includeDeferred: true })
+      .filter((task) => task.source === "Jira")
+      .flatMap((task) => [
+        ...(task.sourceRef ? [String(task.sourceRef)] : []),
+        ...task.jiraPlanningSubtasks.map((subtask) => subtask.key)
+      ])
+  );
+
+  const allowVisibleRejectedTask = (task: { source: string; decisionState: string; title: string; candidatePayloadJson: string | null }) => {
+    if (task.decisionState === "restored" || task.decisionState === "ignored") {
+      return false;
+    }
+
+    if (task.source !== "Email") {
+      return true;
+    }
+
+    const keys = extractIssueKeys(`${task.title} ${task.candidatePayloadJson ?? ""}`);
+    return !keys.some((key) => jiraKeys.has(key));
+  };
+
+  const tasks = listRejectedTasks().filter(allowVisibleRejectedTask);
+  const ignoredTasks = listIgnoredRejectedTasks().filter((task) => {
+    if (task.source !== "Email") {
+      return true;
+    }
+
+    const keys = extractIssueKeys(`${task.title} ${task.candidatePayloadJson ?? ""}`);
+    return !keys.some((key) => jiraKeys.has(key));
+  });
+
+  res.json({ tasks, ignoredTasks });
 });
 
 app.get("/api/tasks/:id/details", async (req, res) => {
@@ -399,13 +657,142 @@ app.get("/api/tasks/:id/details", async (req, res) => {
   }
 });
 
+app.post("/api/tasks/:id/email-reply/draft", async (req, res) => {
+  const parsed = emailReplyDraftSchema.safeParse(req.body ?? {});
+  if (!parsed.success) {
+    return res.status(400).json({ message: "Invalid email draft payload" });
+  }
+  const task = getTaskById(Number(req.params.id));
+  if (!task || task.source !== "Email" || !task.sourceRef) {
+    return res.status(404).json({ message: "Email task not found" });
+  }
+
+  try {
+    const session = await getOptionalMicrosoftSession(req);
+    if (!session) {
+      return res.status(401).json({ message: "Microsoft is not connected for this browser session." });
+    }
+    const graphToken = await acquireGraphTokenOnBehalfOf(session);
+    const detail = await fetchEmailDetailWithAccessToken(task.sourceRef, task.sourceThreadRef, graphToken);
+    const draft = await generateEmailReplyDraft(detail, parsed.data.userIntent ?? null);
+    logEvent({
+      eventType: "email.reply_draft",
+      requestId: getRequestId(res),
+      entityType: "task",
+      entityId: String(task.id),
+      provider: "microsoft",
+      status: "success",
+      message: "Generated email reply draft.",
+      metadata: { sourceRef: task.sourceRef }
+    });
+    return res.json({ draft });
+  } catch (error) {
+    return res.status(500).json({ message: error instanceof Error ? error.message : "Failed to generate email draft" });
+  }
+});
+
+app.post("/api/tasks/:id/email-reply/send", async (req, res) => {
+  const parsed = emailReplySendSchema.safeParse(req.body ?? {});
+  if (!parsed.success) {
+    return res.status(400).json({ message: "Invalid email send payload" });
+  }
+  const task = getTaskById(Number(req.params.id));
+  if (!task || task.source !== "Email") {
+    return res.status(404).json({ message: "Email task not found" });
+  }
+
+  try {
+    const session = await getOptionalMicrosoftSession(req);
+    if (!session) {
+      return res.status(401).json({ message: "Microsoft is not connected for this browser session." });
+    }
+    const graphToken = await acquireGraphTokenOnBehalfOf(session);
+    await sendMailWithAccessToken(graphToken, parsed.data);
+    logEvent({
+      eventType: "email.reply_send",
+      requestId: getRequestId(res),
+      entityType: "task",
+      entityId: String(task.id),
+      provider: "microsoft",
+      status: "success",
+      message: "Sent email reply from planner.",
+      metadata: { sourceRef: task.sourceRef, toCount: parsed.data.to.length, ccCount: parsed.data.cc.length }
+    });
+    return res.json({ ok: true });
+  } catch (error) {
+    return res.status(500).json({ message: error instanceof Error ? error.message : "Failed to send email reply" });
+  }
+});
+
+app.post("/api/meetings/:id/prepare", async (req, res) => {
+  const parsed = meetingPrepSchema.safeParse(req.body ?? {});
+  if (!parsed.success) {
+    return res.status(400).json({ message: "Invalid meeting prep payload" });
+  }
+  const meeting = getMeetingById(Number(req.params.id));
+  if (!meeting?.externalId) {
+    return res.status(404).json({ message: "Meeting not found" });
+  }
+
+  try {
+    const session = await getOptionalMicrosoftSession(req);
+    if (!session) {
+      return res.status(401).json({ message: "Microsoft is not connected for this browser session." });
+    }
+    const graphToken = await acquireGraphTokenOnBehalfOf(session);
+    const detail = await fetchMeetingDetailWithAccessToken(meeting.externalId, graphToken);
+    const prep = await generateMeetingPrep({
+      title: detail.subject ?? meeting.title,
+      startTime: detail.start?.dateTime ?? meeting.startTime,
+      endTime: detail.end?.dateTime ?? meeting.endTime,
+      timeZone: detail.start?.timeZone ?? meeting.timeZone,
+      description: detail.body?.content ?? detail.bodyPreview ?? "",
+      organizer: detail.organizer?.emailAddress?.name ?? detail.organizer?.emailAddress?.address ?? null,
+      attendees: (detail.attendees ?? [])
+        .map((entry) => entry.emailAddress?.name ?? entry.emailAddress?.address ?? "")
+        .filter(Boolean),
+      userNotes: parsed.data.userNotes ?? null
+    });
+    logEvent({
+      eventType: "meeting.prep_generate",
+      requestId: getRequestId(res),
+      entityType: "meeting",
+      entityId: String(meeting.id),
+      provider: "microsoft",
+      status: "success",
+      message: "Generated meeting preparation notes.",
+      metadata: { externalId: meeting.externalId }
+    });
+    return res.json({ prep });
+  } catch (error) {
+    return res.status(500).json({ message: error instanceof Error ? error.message : "Failed to generate meeting prep" });
+  }
+});
+
 app.post("/api/tasks", (req, res) => {
   const parsed = taskCreateSchema.safeParse(req.body);
   if (!parsed.success) {
     return res.status(400).json({ message: "Invalid task payload" });
   }
   const row = createManualTask(parsed.data);
-  return res.status(201).json({ task: normalizeTask(row as Record<string, unknown>) });
+  const task = normalizeTask(row as Record<string, unknown>);
+  recordUserTaskMutation({
+    taskId: task.id,
+    source: task.source,
+    eventType: "create_manual",
+    reason: "Created manual task.",
+    after: task
+  });
+  logEvent({
+    eventType: "task.create",
+    requestId: getRequestId(res),
+    entityType: "task",
+    entityId: String(task.id),
+    status: "success",
+    message: "Manual task created.",
+    metadata: { taskId: task.id, title: task.title }
+  });
+  return res.status(201).json({ task });
 });
 
 app.patch("/api/tasks/:id", (req, res) => {
@@ -414,11 +801,78 @@ app.patch("/api/tasks/:id", (req, res) => {
     return res.status(400).json({ message: "Invalid task payload" });
   }
   const existingTask = getTaskById(Number(req.params.id));
-  const row = updateTask(Number(req.params.id), parsed.data);
+  if (existingTask?.source === "Jira" && parsed.data.status && parsed.data.status !== existingTask.status) {
+    if (!existingTask.sourceRef) {
+      return res.status(400).json({ message: "Jira task is missing its issue key" });
+    }
+    transitionJiraIssueToTaskStatus(existingTask.sourceRef ?? "", parsed.data.status, existingTask.jiraStatus)
+      .then(async () => {
+        const task = await refreshJiraTaskFromSource(existingTask.id, existingTask.sourceRef ?? "");
+        recordUserTaskMutation({
+          taskId: task.id,
+          source: task.source,
+          sourceRef: task.sourceRef ?? null,
+          sourceThreadRef: task.sourceThreadRef ?? null,
+          eventType: "task_updated",
+          reason: "Jira task transitioned from planner.",
+          before: existingTask,
+          after: task
+        });
+        if (parsed.data.status !== existingTask.status) {
+          await captureTaskFeedback({
+            taskId: task.id,
+            source: task.source,
+            sourceRef: task.sourceRef ?? null,
+            sourceThreadRef: task.sourceThreadRef ?? null,
+            action: parsed.data.status === "Completed" ? "completed" : "status_changed",
+            title: task.title,
+            beforePriority: task.priority,
+            afterPriority: task.priority,
+            decisionReason: task.decisionReason,
+            decisionReasonTags: task.decisionReasonTags
+          });
+        }
+        logEvent({
+          eventType: "task.update",
+          requestId: getRequestId(res),
+          entityType: "task",
+          entityId: String(task.id),
+          provider: "jira",
+          status: "updated",
+          message: "Jira task transitioned and refreshed.",
+          metadata: {
+            jiraIssueKey: task.sourceRef,
+            targetStatus: parsed.data.status,
+            jiraStatus: task.jiraStatus
+          }
+        });
+        return res.json({ task });
+      })
+      .catch((error) => {
+        res.status(400).json({ message: error instanceof Error ? error.message : "Failed to transition Jira task" });
+      });
+    return;
+  }
+  const row = updateTask(Number(req.params.id), {
+    ...parsed.data,
+    lastChangedBy: "user",
+    lastChangedAt: new Date().toISOString(),
+    wasUserOverridden: true
+  });
   if (!row) {
     return res.status(404).json({ message: "Task not found" });
   }
   const task = normalizeTask(row as Record<string, unknown>);
+  recordUserTaskMutation({
+    taskId: task.id,
+    source: task.source,
+    sourceRef: task.sourceRef ?? null,
+    sourceThreadRef: task.sourceThreadRef ?? null,
+    eventType: "task_updated",
+    reason: "Task edited by user.",
+    before: existingTask,
+    after: task
+  });
   if (existingTask) {
     if (parsed.data.priority && parsed.data.priority !== existingTask.priority) {
       void captureTaskFeedback({
@@ -449,7 +903,67 @@ app.patch("/api/tasks/:id", (req, res) => {
       });
     }
   }
+  logEvent({
+    eventType: "task.update",
+    requestId: getRequestId(res),
+    entityType: "task",
+    entityId: String(task.id),
+    status: "updated",
+    message: "Task updated.",
+    metadata: {
+      taskId: task.id,
+      changedPriority: parsed.data.priority ?? null,
+      changedStatus: parsed.data.status ?? null
+    }
+  });
   return res.json({ task });
+});
+
+app.post("/api/jira/issues/:issueKey/transition", async (req, res) => {
+  const parsed = jiraTransitionSchema.safeParse({
+    ...req.body,
+    issueKey: req.params.issueKey
+  });
+  if (!parsed.success) {
+    return res.status(400).json({ message: "Invalid Jira transition payload" });
+  }
+  const issueKey = parsed.data.issueKey;
+  if (!issueKey) {
+    return res.status(400).json({ message: "Missing Jira issue key" });
+  }
+
+  try {
+    await transitionJiraIssue(issueKey, parsed.data.transitionId);
+    let linkedTask = parsed.data.parentTaskId ? getTaskById(parsed.data.parentTaskId) : null;
+
+    if (linkedTask?.source === "Jira" && linkedTask.sourceRef) {
+      linkedTask = await refreshJiraTaskFromSource(linkedTask.id, linkedTask.sourceRef);
+    }
+
+    const detail = await fetchJiraIssueDetail(issueKey);
+    logEvent({
+      eventType: "jira.transition",
+      requestId: getRequestId(res),
+      entityType: "jira_issue",
+      entityId: issueKey,
+      provider: "jira",
+      status: "updated",
+      message: "Jira issue transitioned from planner UI.",
+      metadata: {
+        issueKey,
+        transitionId: parsed.data.transitionId,
+        parentTaskId: parsed.data.parentTaskId ?? null
+      }
+    });
+    return res.json({
+      detail,
+      task: linkedTask
+    });
+  } catch (error) {
+    return res.status(400).json({
+      message: error instanceof Error ? error.message : "Failed to update Jira status"
+    });
+  }
 });
 
 app.patch("/api/tasks/:id/defer", (req, res) => {
@@ -462,12 +976,24 @@ app.patch("/api/tasks/:id/defer", (req, res) => {
   }
   const row = updateTask(Number(req.params.id), {
     deferredUntil: parsed.data.deferredUntil,
-    manualOverrideFlags: ["deferredUntil"]
+    manualOverrideFlags: ["deferredUntil"],
+    lastChangedBy: "user",
+    lastChangedAt: new Date().toISOString(),
+    wasUserOverridden: true
   });
   if (!row) {
     return res.status(404).json({ message: "Task not found" });
   }
   const task = normalizeTask(row as Record<string, unknown>);
+  recordUserTaskMutation({
+    taskId: task.id,
+    source: task.source,
+    sourceRef: task.sourceRef ?? null,
+    sourceThreadRef: task.sourceThreadRef ?? null,
+    eventType: "deferred",
+    reason: parsed.data.deferredUntil ? "Task deferred." : "Task restored from defer.",
+    after: task
+  });
   void captureTaskFeedback({
     taskId: task.id,
     source: task.source,
@@ -480,6 +1006,15 @@ app.patch("/api/tasks/:id/defer", (req, res) => {
     decisionReason: task.decisionReason,
     decisionReasonTags: task.decisionReasonTags,
     context: parsed.data.deferredUntil
+  });
+  logEvent({
+    eventType: "task.defer",
+    requestId: getRequestId(res),
+    entityType: "task",
+    entityId: String(task.id),
+    status: "updated",
+    message: "Task defer state updated.",
+    metadata: { taskId: task.id, deferredUntil: parsed.data.deferredUntil }
   });
   return res.json({ task });
 });
@@ -552,6 +1087,25 @@ app.delete("/api/tasks/:id", (req, res) => {
   if (!deleted) {
     return res.status(404).json({ message: "Task not found" });
   }
+  if (task) {
+    recordUserTaskMutation({
+      taskId: task.id,
+      source: task.source,
+      sourceRef: task.sourceRef ?? null,
+      sourceThreadRef: task.sourceThreadRef ?? null,
+      eventType: task.source === "Manual" ? "remove_manual" : "reject",
+      reason: task.source === "Manual" ? "Manual task removed." : "Task rejected from active plan.",
+      before: task
+    });
+  }
+  logEvent({
+    eventType: "task.delete",
+    requestId: getRequestId(res),
+    entityType: "task",
+    entityId: task ? String(task.id) : req.params.id,
+    status: "updated",
+    message: task?.source === "Manual" ? "Manual task removed." : "Task rejected from active plan."
+  });
   return res.status(204).send();
 });
 
@@ -563,6 +1117,24 @@ app.patch("/api/tasks/rejected/:id", async (req, res) => {
   const rejected = getRejectedTaskById(Number(req.params.id));
   if (!rejected) {
     return res.status(404).json({ message: "Rejected task not found" });
+  }
+
+  if (parsed.data.action === "always_ignore_exact") {
+    const updated = updateRejectedTask(rejected.id, {
+      decisionState: "ignored",
+      decisionReason: `${rejected.decisionReason ?? "Rejected"} Marked to always ignore this exact item.`,
+      restoredAt: null
+    });
+    recordUserTaskMutation({
+      source: rejected.source,
+      sourceRef: rejected.sourceRef,
+      sourceThreadRef: rejected.sourceThreadRef,
+      eventType: "ignore_exact",
+      reason: "Ignored this exact rejected item.",
+      before: rejected,
+      after: updated
+    });
+    return res.json({ task: updated });
   }
 
   if (parsed.data.action === "always_ignore_similar") {
@@ -606,7 +1178,12 @@ app.patch("/api/tasks/rejected/:id", async (req, res) => {
   }
 
   const updated = updateRejectedTask(rejected.id, {
-    decisionState: parsed.data.action === "should_have_been_included" ? "uncertain" : rejected.decisionState,
+    decisionState:
+      parsed.data.action === "always_ignore_similar"
+        ? "ignored"
+        : parsed.data.action === "should_have_been_included"
+          ? "uncertain"
+          : rejected.decisionState,
     decisionConfidence:
       parsed.data.action === "should_have_been_included"
         ? Math.max(0.35, Math.min(0.95, (rejected.decisionConfidence ?? 0.5) - 0.2))
@@ -618,6 +1195,15 @@ app.patch("/api/tasks/rejected/:id", async (req, res) => {
           ? `${rejected.decisionReason ?? "Rejected"} You marked this as something that should have been included, so similar items will be ranked higher.`
           : rejected.decisionReason
   });
+  recordUserTaskMutation({
+    source: rejected.source,
+    sourceRef: rejected.sourceRef,
+    sourceThreadRef: rejected.sourceThreadRef,
+    eventType: parsed.data.action,
+    reason: parsed.data.action === "always_ignore_similar" ? "Ignore similar items saved." : "Rejected item marked as under-included.",
+    before: rejected,
+    after: updated
+  });
   return res.json({ task: updated });
 });
 
@@ -626,6 +1212,12 @@ app.post("/api/tasks/rejected/:id/restore", async (req, res) => {
   if (!rejected) {
     return res.status(404).json({ message: "Rejected task not found" });
   }
+  const profile = getUserPriorityProfile();
+  const nextTags = [...new Set([...profile.positiveReasonTags, ...rejected.decisionReasonTags])];
+  saveUserPriorityProfile({
+    positiveReasonTags: nextTags,
+    lastProfileRefreshAt: new Date().toISOString()
+  });
   const restoredAt = new Date().toISOString();
   const exactTask =
     rejected.sourceRef !== null ? getTaskBySource(rejected.source, rejected.sourceRef, { includeIgnored: true }) : null;
@@ -673,6 +1265,15 @@ app.post("/api/tasks/rejected/:id/restore", async (req, res) => {
   const updated = updateRejectedTask(rejected.id, {
     decisionState: "restored",
     restoredAt
+  });
+  recordUserTaskMutation({
+    source: rejected.source,
+    sourceRef: rejected.sourceRef,
+    sourceThreadRef: rejected.sourceThreadRef,
+    eventType: "restore",
+    reason: "Rejected item restored to plan.",
+    before: rejected,
+    after: updated
   });
   await captureTaskFeedback({
     source: rejected.source,
@@ -878,6 +1479,15 @@ app.patch("/api/reminders/:id", (req, res) => {
     status: nextStatus,
     dismissedAt: nextStatus === "dismissed" ? new Date().toISOString() : null
   });
+  logEvent({
+    eventType: "reminder.update",
+    requestId: getRequestId(res),
+    entityType: "reminder",
+    entityId: String(reminder.id),
+    status: "updated",
+    message: "Reminder updated.",
+    metadata: { status: nextStatus }
+  });
   return res.json({ reminder: updated });
 });
 
@@ -914,6 +1524,16 @@ app.post("/api/settings/integrations/jira", async (req, res) => {
       expiresAt: null,
       errorMessage: null
     });
+    logEvent({
+      eventType: "integration.jira.save",
+      requestId: getRequestId(res),
+      entityType: "integration",
+      entityId: "jira",
+      provider: "jira",
+      status: "success",
+      message: "Jira integration saved.",
+      metadata: { accountLabel: validation.profile.emailAddress ?? validation.profile.displayName ?? normalizedInput.email }
+    });
     return res.status(201).json({ ok: true });
   } catch (error) {
     saveIntegrationConnection({
@@ -935,6 +1555,16 @@ app.post("/api/settings/integrations/jira", async (req, res) => {
       expiresAt: null,
       errorMessage: error instanceof Error ? error.message : "Jira validation failed"
     });
+    logEvent({
+      level: "error",
+      eventType: "integration.jira.save",
+      requestId: getRequestId(res),
+      entityType: "integration",
+      entityId: "jira",
+      provider: "jira",
+      status: "failure",
+      message: error instanceof Error ? error.message : "Jira validation failed"
+    });
     return res.status(400).json({
       message: error instanceof Error ? error.message : "Jira validation failed"
     });
@@ -948,6 +1578,15 @@ app.delete("/api/settings/integrations/:provider", (req, res) => {
   }
 
   deleteIntegrationConnection(provider);
+  logEvent({
+    eventType: "integration.revoke",
+    requestId: getRequestId(res),
+    entityType: "integration",
+    entityId: provider,
+    provider,
+    status: "updated",
+    message: `${provider} integration revoked.`
+  });
   return res.status(204).send();
 });
 
@@ -955,6 +1594,15 @@ app.get("/api/auth/microsoft/start", (_req, res) => {
   if (!env.microsoftClientId || !env.microsoftClientSecret) {
     return res.status(400).json({ message: "Microsoft OAuth is not configured in apps/api/.env" });
   }
+  logEvent({
+    eventType: "integration.microsoft.start",
+    requestId: getRequestId(res),
+    entityType: "integration",
+    entityId: "microsoft",
+    provider: "microsoft",
+    status: "started",
+    message: "Microsoft auth flow requested."
+  });
   res.json({ url: getMicrosoftAuthUrl() });
 });
 
@@ -965,16 +1613,56 @@ app.get("/api/auth/microsoft/callback", async (req, res) => {
   }
   try {
     await exchangeMicrosoftCode(code);
+    logEvent({
+      eventType: "integration.microsoft.callback",
+      requestId: getRequestId(res),
+      entityType: "integration",
+      entityId: "microsoft",
+      provider: "microsoft",
+      status: "success",
+      message: "Microsoft auth callback succeeded."
+    });
     return res.redirect(`${env.appOrigin}/settings?connected=microsoft`);
   } catch (error) {
+    logEvent({
+      level: "error",
+      eventType: "integration.microsoft.callback",
+      requestId: getRequestId(res),
+      entityType: "integration",
+      entityId: "microsoft",
+      provider: "microsoft",
+      status: "failure",
+      message: error instanceof Error ? error.message : "Microsoft connection failed"
+    });
     return res
       .status(400)
       .send(error instanceof Error ? error.message : "Microsoft connection failed");
   }
 });
 
+app.use((error: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+  logEvent({
+    level: "error",
+    eventType: "http.unhandled_error",
+    requestId: getRequestId(res),
+    status: "failure",
+    source: "server",
+    message: error instanceof Error ? error.message : "Unhandled server error"
+  });
+  res.status(500).json({
+    message: error instanceof Error ? error.message : "Internal server error"
+  });
+});
+
 app.listen(env.port, () => {
-  console.log(`API listening on http://localhost:${env.port}`);
+  logEvent({
+    eventType: "server.start",
+    entityType: "server",
+    entityId: String(env.port),
+    status: "success",
+    source: "server",
+    message: `API listening on http://localhost:${env.port}`
+  });
 });
 
 scheduleAutomation();

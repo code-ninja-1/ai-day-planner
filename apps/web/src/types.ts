@@ -2,7 +2,7 @@ export type TaskPriority = "High" | "Medium" | "Low";
 export type TaskStatus = "Not Started" | "In Progress" | "Completed";
 export type TaskEffortBucket = "15 min" | "30 min" | "1 hour" | "2+ hours";
 export type ReminderStatus = "active" | "dismissed" | "resolved";
-export type TaskDecisionState = "accepted" | "rejected" | "uncertain" | "restored";
+export type TaskDecisionState = "accepted" | "rejected" | "uncertain" | "restored" | "ignored";
 export type FilteringStyle = "conservative" | "balanced" | "aggressive";
 export type PriorityBias = "focus" | "balanced" | "coverage";
 export type DayPlanBlockKind = "task" | "meeting" | "buffer";
@@ -75,6 +75,19 @@ export interface Task {
   wasUserOverridden: boolean;
   restoredAt: string | null;
   rejectedAt: string | null;
+  selectionReason?: string | null;
+  priorityReason?: string | null;
+  scoreBreakdown?: ScoreBreakdownItem[];
+  historySignals?: string[];
+  lastChangedBy?: string | null;
+  lastChangedAt?: string | null;
+}
+
+export interface ScoreBreakdownItem {
+  key: string;
+  label: string;
+  value: number;
+  reason: string;
 }
 
 export interface Meeting {
@@ -221,6 +234,148 @@ export interface PersonalizationInsight {
   source: "profile" | "history";
 }
 
+export interface TaskStateEvent {
+  id: number;
+  taskId: number | null;
+  source: "Email" | "Jira" | "Manual" | "Calibration";
+  sourceRef: string | null;
+  sourceThreadRef: string | null;
+  eventType: string;
+  actor: "system" | "user";
+  reason: string | null;
+  beforeJson: string | null;
+  afterJson: string | null;
+  createdAt: string;
+}
+
+export interface AuditEvent {
+  id: number;
+  timestamp: string;
+  level: "debug" | "info" | "warn" | "error";
+  eventType: string;
+  requestId: string | null;
+  runId: string | null;
+  entityType: string | null;
+  entityId: string | null;
+  provider: string | null;
+  status: "started" | "success" | "failure" | "updated" | "skipped" | "info";
+  source: "server" | "client";
+  message: string;
+  metadataJson: string | null;
+}
+
+export interface PlannerRunDetail {
+  id: number;
+  runId: string;
+  triggerType: "manual" | "scheduled" | "sync";
+  summaryJson: string;
+  taskCount: number;
+  meetingCount: number;
+  warningCount: number;
+  selectedTaskIdsJson: string;
+  spilloverTaskIdsJson: string;
+  generatedAt: string;
+}
+
+export interface InsightsOverview {
+  activeTaskCount: number;
+  deferredTaskCount: number;
+  rejectedTaskCount: number;
+  ignoredTaskCount: number;
+  reminderCount: number;
+  completionRate7d: number | null;
+  completionRate30d: number | null;
+  averagePlannedMinutes7d: number | null;
+  averageCompletedMinutes7d: number | null;
+  topInsights: PersonalizationInsight[];
+  latestRun: PlannerRunDetail | null;
+}
+
+export interface InsightsTodayTask {
+  task: Task;
+  inDayPlan: boolean;
+  planBlockTitle: string | null;
+  whyToday: string;
+  whyPriority: string;
+  whyNotHigher: string | null;
+  whyNotSelected: string | null;
+}
+
+export interface InsightsTodayPayload {
+  generatedAt: string | null;
+  tasks: InsightsTodayTask[];
+  rejected: RejectedTask[];
+  ignored: RejectedTask[];
+}
+
+export interface DayHistorySummary {
+  dayKey: string;
+  guidance: string;
+  plannedTaskCount: number;
+  completedTaskCount: number;
+  deferredTaskCount: number;
+  rejectedTaskCount: number;
+  restoredTaskCount: number;
+  scheduledMeetingCount: number;
+  scheduledMeetingMinutes: number;
+  plannedTaskMinutes: number;
+  completedTaskMinutes: number;
+  spilloverTaskCount: number;
+  agreementPercent: number | null;
+  completionPercent: number | null;
+}
+
+export interface DayHistoryDetail {
+  summary: DayHistorySummary;
+  plannedTasks: Array<{
+    taskId: number | null;
+    title: string;
+    minutes: number;
+    source: "Email" | "Jira" | "Manual" | "Calendar" | null;
+    priority: TaskPriority | null;
+    status: string;
+  }>;
+  completedTasks: Task[];
+  deferredTasks: Task[];
+  rejectedTasks: RejectedTask[];
+  ignoredTasks: RejectedTask[];
+  changeEvents: TaskStateEvent[];
+}
+
+export interface TaskInsightsPayload {
+  task: Task;
+  recentEvents: TaskStateEvent[];
+  decisionEvents: Array<{
+    action: FeedbackAction;
+    source: "Email" | "Jira" | "Manual" | "Calibration";
+    sourceRef: string | null;
+    beforePriority: TaskPriority | null;
+    afterPriority: TaskPriority | null;
+    inferredReason: string | null;
+    inferredReasonTag: ReasonTag | null;
+    preferencePolarity: "positive" | "negative" | "neutral";
+    createdAt: string;
+  }>;
+  reasoning: {
+    selectionReason: string | null | undefined;
+    priorityReason: string | null | undefined;
+    scoreBreakdown: ScoreBreakdownItem[] | null | undefined;
+    historySignals: string[] | null | undefined;
+  };
+}
+
+export interface DiagnosticsPayload {
+  runs: PlannerRunDetail[];
+  profile: UserPriorityProfile;
+  memory: {
+    version: number;
+    insights: PersonalizationInsight[];
+    sourceEventCount: number;
+    createdAt: string | null;
+  };
+  latestDecisionEvents: Array<Record<string, unknown>>;
+}
+
 export interface WorkloadSummary {
   totalMeetingMinutes: number;
   totalTaskMinutes: number;
@@ -246,7 +401,14 @@ export interface JiraTaskDetail {
   key: string;
   title: string;
   status: string | null;
+  statusCategory: TaskStatus;
   priority: string | null;
+  transitions: Array<{
+    id: string;
+    name: string;
+    toStatus: string | null;
+    toStatusCategory: TaskStatus;
+  }>;
   description: string | null;
   storyPoints: number | null;
   assignee: string | null;
@@ -256,6 +418,13 @@ export interface JiraTaskDetail {
     key: string;
     title: string;
     status: string | null;
+    statusCategory: TaskStatus;
+    transitions: Array<{
+      id: string;
+      name: string;
+      toStatus: string | null;
+      toStatusCategory: TaskStatus;
+    }>;
   }>;
   comments: Array<{
     author: string;
@@ -292,3 +461,25 @@ export interface EmailTaskDetail {
 }
 
 export type TaskDetail = JiraTaskDetail | EmailTaskDetail;
+
+export interface EmailReplyDraft {
+  subject: string;
+  to: string[];
+  cc: string[];
+  body: string;
+  summary: string;
+  actionItems: string[];
+  rationale: string;
+}
+
+export interface MeetingPrep {
+  title: string;
+  summary: string;
+  objectives: string[];
+  checklist: string[];
+  talkingPoints: string[];
+  questions: string[];
+  risks: string[];
+  notes: string;
+  rationale: string;
+}

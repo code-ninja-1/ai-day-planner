@@ -8,6 +8,8 @@
     "build": "tsc -p tsconfig.json",
     "start": "node dist/server.js",
     "typecheck": "tsc -p tsconfig.json --noEmit",
+    "reset:soft": "node --import tsx src/scripts/resetDb.ts soft",
+    "reset:hard": "node --import tsx src/scripts/resetDb.ts hard",
     "test:jira-integration": "tsx src/scripts/testJiraIntegration.ts",
     "test:email-integration": "tsx src/scripts/testEmailIntegration.ts"
   },

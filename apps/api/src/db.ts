@@ -3,22 +3,30 @@ import path from "node:path";
 import Database from "better-sqlite3";
 import { env } from "./env.js";
 import type {
+  AuditEvent,
+  AuditEventStatus,
+  AuditLogLevel,
   AutomationSettings,
   BehaviorFeedbackEvent,
   FeedbackAction,
   FeedbackPolarity,
   IntegrationConnection,
+  InsightsOverview,
   Meeting,
+  PlannerRunDetail,
   PersonalizationInsight,
   Reminder,
   ReminderKind,
   ReminderStatus,
   RejectedTask,
   ReasonTag,
+  ScoreBreakdownItem,
   Task,
+  TaskInsightsPayload,
   TaskDecisionState,
   TaskEffortBucket,
   TaskPriority,
+  TaskStateEvent,
   TaskSource,
   TaskStatus,
   UserPriorityProfile
@@ -226,6 +234,50 @@ db.exec(`
     active INTEGER NOT NULL DEFAULT 1,
     created_at TEXT NOT NULL
   );
+
+  CREATE TABLE IF NOT EXISTS audit_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TEXT NOT NULL,
+    level TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    request_id TEXT,
+    run_id TEXT,
+    entity_type TEXT,
+    entity_id TEXT,
+    provider TEXT,
+    status TEXT NOT NULL,
+    source TEXT,
+    message TEXT NOT NULL,
+    metadata_json TEXT
+  );
+
+  CREATE TABLE IF NOT EXISTS planner_run_details (
+    run_id TEXT PRIMARY KEY,
+    trigger_type TEXT NOT NULL,
+    preferred_time_zone TEXT,
+    warnings_json TEXT NOT NULL DEFAULT '[]',
+    meeting_count INTEGER NOT NULL DEFAULT 0,
+    active_task_count INTEGER NOT NULL DEFAULT 0,
+    rejected_task_count INTEGER NOT NULL DEFAULT 0,
+    deferred_task_count INTEGER NOT NULL DEFAULT 0,
+    workload_state TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS task_state_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id INTEGER,
+    source TEXT NOT NULL,
+    source_ref TEXT,
+    source_thread_ref TEXT,
+    event_type TEXT NOT NULL,
+    actor TEXT NOT NULL,
+    reason TEXT,
+    before_json TEXT,
+    after_json TEXT,
+    created_at TEXT NOT NULL
+  );
 `);
 
 function ensureColumn(table: string, column: string, definition: string) {
@@ -262,6 +314,12 @@ ensureColumn("tasks", "jira_estimate_seconds", "INTEGER");
 ensureColumn("tasks", "jira_subtask_estimate_seconds", "INTEGER");
 ensureColumn("tasks", "jira_planning_subtasks_json", "TEXT NOT NULL DEFAULT '[]'");
 ensureColumn("user_priority_profile", "prioritization_prompt", "TEXT");
+ensureColumn("tasks", "selection_reason", "TEXT");
+ensureColumn("tasks", "priority_reason", "TEXT");
+ensureColumn("tasks", "score_breakdown_json", "TEXT NOT NULL DEFAULT '[]'");
+ensureColumn("tasks", "history_signals_json", "TEXT NOT NULL DEFAULT '[]'");
+ensureColumn("tasks", "last_changed_by", "TEXT");
+ensureColumn("tasks", "last_changed_at", "TEXT");
 
 db.prepare(
   `
@@ -286,6 +344,15 @@ function parseJsonArray(value: unknown) {
     return Array.isArray(parsed) ? parsed.filter((entry): entry is string => typeof entry === "string") : [];
   } catch {
     return [];
+  }
+}
+
+function parseJsonValue<T>(value: unknown, fallback: T): T {
+  if (typeof value !== "string" || !value.trim()) return fallback;
+  try {
+    return JSON.parse(value) as T;
+  } catch {
+    return fallback;
   }
 }
 
@@ -323,34 +390,36 @@ const taskRowToTask = (row: Record<string, unknown>): Task => ({
       ? null
       : Number(row.jira_subtask_estimate_seconds),
   jiraPlanningSubtasks: (() => {
-    try {
-      const parsed = JSON.parse(String(row.jira_planning_subtasks_json ?? "[]")) as unknown;
-      return Array.isArray(parsed)
-        ? parsed
-            .filter((entry): entry is Record<string, unknown> => Boolean(entry) && typeof entry === "object")
-            .map((entry) => ({
-              key: String(entry.key ?? ""),
-              title: String(entry.title ?? entry.key ?? ""),
-              status: typeof entry.status === "string" ? entry.status : null,
-              estimateSeconds:
-                typeof entry.estimateSeconds === "number"
-                  ? entry.estimateSeconds
-                  : typeof entry.estimate_seconds === "number"
-                    ? entry.estimate_seconds
-                    : null
-            }))
-            .filter((entry) => entry.key)
-        : [];
-    } catch {
-      return [];
-    }
+    const parsed = parseJsonValue<unknown>(row.jira_planning_subtasks_json, []);
+    return Array.isArray(parsed)
+      ? parsed
+          .filter((entry): entry is Record<string, unknown> => Boolean(entry) && typeof entry === "object")
+          .map((entry) => ({
+            key: String(entry.key ?? ""),
+            title: String(entry.title ?? entry.key ?? ""),
+            status: typeof entry.status === "string" ? entry.status : null,
+            estimateSeconds:
+              typeof entry.estimateSeconds === "number"
+                ? entry.estimateSeconds
+                : typeof entry.estimate_seconds === "number"
+                  ? entry.estimate_seconds
+                  : null
+          }))
+          .filter((entry) => entry.key)
+      : [];
   })(),
   priorityScore: row.priority_score === null || row.priority_score === undefined ? null : Number(row.priority_score),
   priorityExplanation: (row.priority_explanation as string | null) ?? null,
+  selectionReason: (row.selection_reason as string | null) ?? null,
+  priorityReason: (row.priority_reason as string | null) ?? null,
+  scoreBreakdown: parseJsonValue<ScoreBreakdownItem[]>(row.score_breakdown_json, []),
+  historySignals: parseJsonArray(row.history_signals_json),
   taskAgeDays: Number(row.task_age_days ?? 0),
   carryForwardCount: Number(row.carry_forward_count ?? 0),
   completedAt: (row.completed_at as string | null) ?? null,
   lastActivityAt: (row.last_activity_at as string | null) ?? null,
+  lastChangedBy: (row.last_changed_by as string | null) ?? null,
+  lastChangedAt: (row.last_changed_at as string | null) ?? null,
   manualOverrideFlags: parseJsonArray(row.manual_override_flags),
   decisionState: (row.decision_state as TaskDecisionState | null) ?? null,
   decisionConfidence:
@@ -692,10 +761,65 @@ export function saveUserPriorityProfile(
 }
 
 export function listRejectedTasks() {
-  return db
-    .prepare("SELECT * FROM rejected_tasks ORDER BY rejected_at DESC")
+  const tasks = db
+    .prepare("SELECT * FROM rejected_tasks WHERE decision_state NOT IN ('restored', 'ignored') ORDER BY updated_at DESC, rejected_at DESC")
     .all()
     .map((row: unknown) => rejectedTaskRowToRejectedTask(row as Record<string, unknown>));
+
+  const seenExact = new Set<string>();
+  const seenEmailThreads = new Set<string>();
+
+  return tasks.filter((task) => {
+    if (task.source === "Email" && task.sourceThreadRef) {
+      const threadKey = `${task.source}:${task.sourceThreadRef}`;
+      if (seenEmailThreads.has(threadKey)) {
+        return false;
+      }
+      seenEmailThreads.add(threadKey);
+      return true;
+    }
+
+    if (task.sourceRef) {
+      const exactKey = `${task.source}:${task.sourceRef}`;
+      if (seenExact.has(exactKey)) {
+        return false;
+      }
+      seenExact.add(exactKey);
+    }
+
+    return true;
+  });
+}
+
+export function listIgnoredRejectedTasks() {
+  const tasks = db
+    .prepare("SELECT * FROM rejected_tasks WHERE decision_state = 'ignored' ORDER BY updated_at DESC, rejected_at DESC")
+    .all()
+    .map((row: unknown) => rejectedTaskRowToRejectedTask(row as Record<string, unknown>));
+
+  const seenExact = new Set<string>();
+  const seenEmailThreads = new Set<string>();
+
+  return tasks.filter((task) => {
+    if (task.source === "Email" && task.sourceThreadRef) {
+      const threadKey = `${task.source}:${task.sourceThreadRef}`;
+      if (seenEmailThreads.has(threadKey)) {
+        return false;
+      }
+      seenEmailThreads.add(threadKey);
+      return true;
+    }
+
+    if (task.sourceRef) {
+      const exactKey = `${task.source}:${task.sourceRef}`;
+      if (seenExact.has(exactKey)) {
+        return false;
+      }
+      seenExact.add(exactKey);
+    }
+
+    return true;
+  });
 }
 
 export function getRejectedTaskById(id: number) {
@@ -708,6 +832,16 @@ export function getRejectedTaskBySource(source: TaskSource, sourceRef: string | 
   const row = db
     .prepare("SELECT * FROM rejected_tasks WHERE source = ? AND source_ref = ?")
     .get(source, sourceRef) as Record<string, unknown> | undefined;
+  return row ? rejectedTaskRowToRejectedTask(row) : null;
+}
+
+export function getRejectedTaskBySourceThread(source: TaskSource, sourceThreadRef: string | null) {
+  if (!sourceThreadRef) return null;
+  const row = db
+    .prepare(
+      "SELECT * FROM rejected_tasks WHERE source = ? AND source_thread_ref = ? AND decision_state NOT IN ('restored', 'ignored') ORDER BY updated_at DESC LIMIT 1"
+    )
+    .get(source, sourceThreadRef) as Record<string, unknown> | undefined;
   return row ? rejectedTaskRowToRejectedTask(row) : null;
 }
 
@@ -730,17 +864,48 @@ export function upsertRejectedTask(input: {
 }) {
   const now = new Date().toISOString();
   const rejectedAt = input.rejectedAt ?? now;
-  if (input.sourceRef) {
-    const existing = db
-      .prepare("SELECT id FROM rejected_tasks WHERE source = ? AND source_ref = ?")
-      .get(input.source, input.sourceRef) as { id: number } | undefined;
+  const existingBySourceRef =
+    input.sourceRef
+      ? (db
+          .prepare("SELECT id, decision_state FROM rejected_tasks WHERE source = ? AND source_ref = ?")
+          .get(input.source, input.sourceRef) as { id: number; decision_state: TaskDecisionState } | undefined)
+      : undefined;
+  const threadExisting =
+    input.source === "Email" && input.sourceThreadRef
+      ? (db
+          .prepare(
+            "SELECT id FROM rejected_tasks WHERE source = 'Email' AND source_thread_ref = ? AND decision_state NOT IN ('restored', 'ignored') ORDER BY updated_at DESC LIMIT 1"
+          )
+          .get(input.sourceThreadRef) as { id: number } | undefined)
+      : undefined;
+  const ignoredThreadExisting =
+    input.source === "Email" && input.sourceThreadRef
+      ? (db
+          .prepare(
+            "SELECT id, decision_state FROM rejected_tasks WHERE source = 'Email' AND source_thread_ref = ? AND decision_state = 'ignored' ORDER BY updated_at DESC LIMIT 1"
+          )
+          .get(input.sourceThreadRef) as { id: number; decision_state: TaskDecisionState } | undefined)
+      : undefined;
 
-    if (existing) {
+  const ignoredExistingId =
+    existingBySourceRef?.decision_state === "ignored"
+      ? existingBySourceRef.id
+      : ignoredThreadExisting?.decision_state === "ignored"
+        ? ignoredThreadExisting.id
+        : null;
+
+  if (ignoredExistingId !== null) {
+    return getRejectedTaskById(ignoredExistingId);
+  }
+
+  if (input.sourceRef) {
+    if (existingBySourceRef || threadExisting) {
       db.prepare(
         `
         UPDATE rejected_tasks
         SET title = @title,
             source_link = @sourceLink,
+            source_ref = @sourceRef,
             source_thread_ref = @sourceThreadRef,
             jira_status = @jiraStatus,
             proposed_priority = @proposedPriority,
@@ -756,9 +921,10 @@ export function upsertRejectedTask(input: {
         WHERE id = @id
         `
       ).run({
-        id: existing.id,
+        id: existingBySourceRef?.id ?? threadExisting?.id,
         title: input.title,
         sourceLink: input.sourceLink ?? null,
+        sourceRef: input.sourceRef ?? null,
         sourceThreadRef: input.sourceThreadRef ?? null,
         jiraStatus: input.jiraStatus ?? null,
         proposedPriority: input.proposedPriority,
@@ -836,7 +1002,15 @@ export function upsertRejectedTask(input: {
     });
   }
 
-  return input.sourceRef ? getRejectedTaskBySource(input.source, input.sourceRef) : null;
+  if (input.sourceRef) {
+    return getRejectedTaskBySource(input.source, input.sourceRef);
+  }
+
+  if (input.source === "Email" && input.sourceThreadRef) {
+    return getRejectedTaskBySourceThread(input.source, input.sourceThreadRef);
+  }
+
+  return null;
 }
 
 export function updateRejectedTask(
@@ -971,6 +1145,172 @@ export function getDecisionEventCount() {
   return Number(row.count ?? 0);
 }
 
+const auditRowToEvent = (row: Record<string, unknown>): AuditEvent => ({
+  id: Number(row.id),
+  timestamp: String(row.timestamp),
+  level: row.level as AuditLogLevel,
+  eventType: String(row.event_type),
+  requestId: (row.request_id as string | null) ?? null,
+  runId: (row.run_id as string | null) ?? null,
+  entityType: (row.entity_type as string | null) ?? null,
+  entityId: (row.entity_id as string | null) ?? null,
+  provider: (row.provider as string | null) ?? null,
+  status: row.status as AuditEventStatus,
+  source: (row.source as string | null) ?? null,
+  message: String(row.message),
+  metadataJson: (row.metadata_json as string | null) ?? null
+});
+
+const plannerRunRowToDetail = (row: Record<string, unknown>): PlannerRunDetail => ({
+  runId: String(row.run_id),
+  triggerType: row.trigger_type as PlannerRunDetail["triggerType"],
+  preferredTimeZone: (row.preferred_time_zone as string | null) ?? null,
+  warnings: parseJsonValue<string[]>(row.warnings_json, []),
+  meetingCount: Number(row.meeting_count ?? 0),
+  activeTaskCount: Number(row.active_task_count ?? 0),
+  rejectedTaskCount: Number(row.rejected_task_count ?? 0),
+  deferredTaskCount: Number(row.deferred_task_count ?? 0),
+  workloadState: (row.workload_state as PlannerRunDetail["workloadState"]) ?? null,
+  createdAt: String(row.created_at),
+  updatedAt: String(row.updated_at)
+});
+
+const taskStateEventRowToEvent = (row: Record<string, unknown>): TaskStateEvent => ({
+  id: Number(row.id),
+  taskId: row.task_id === null || row.task_id === undefined ? null : Number(row.task_id),
+  source: row.source as TaskStateEvent["source"],
+  sourceRef: (row.source_ref as string | null) ?? null,
+  sourceThreadRef: (row.source_thread_ref as string | null) ?? null,
+  eventType: String(row.event_type),
+  actor: row.actor as TaskStateEvent["actor"],
+  reason: (row.reason as string | null) ?? null,
+  beforeJson: (row.before_json as string | null) ?? null,
+  afterJson: (row.after_json as string | null) ?? null,
+  createdAt: String(row.created_at)
+});
+
+export function recordAuditEvent(input: Omit<AuditEvent, "id" | "timestamp"> & { timestamp?: string }) {
+  db.prepare(
+    `
+    INSERT INTO audit_events (
+      timestamp, level, event_type, request_id, run_id, entity_type, entity_id, provider, status, source, message, metadata_json
+    ) VALUES (
+      @timestamp, @level, @eventType, @requestId, @runId, @entityType, @entityId, @provider, @status, @source, @message, @metadataJson
+    )
+    `
+  ).run({
+    timestamp: input.timestamp ?? new Date().toISOString(),
+    level: input.level,
+    eventType: input.eventType,
+    requestId: input.requestId ?? null,
+    runId: input.runId ?? null,
+    entityType: input.entityType ?? null,
+    entityId: input.entityId ?? null,
+    provider: input.provider ?? null,
+    status: input.status,
+    source: input.source ?? null,
+    message: input.message,
+    metadataJson: input.metadataJson ?? null
+  });
+}
+
+export function listAuditEvents(limit = 200) {
+  return db
+    .prepare("SELECT * FROM audit_events ORDER BY timestamp DESC, id DESC LIMIT ?")
+    .all(limit)
+    .map((row: unknown) => auditRowToEvent(row as Record<string, unknown>));
+}
+
+export function upsertPlannerRunDetail(input: Omit<PlannerRunDetail, "createdAt" | "updatedAt">) {
+  const now = new Date().toISOString();
+  db.prepare(
+    `
+    INSERT INTO planner_run_details (
+      run_id, trigger_type, preferred_time_zone, warnings_json, meeting_count, active_task_count,
+      rejected_task_count, deferred_task_count, workload_state, created_at, updated_at
+    ) VALUES (
+      @runId, @triggerType, @preferredTimeZone, @warningsJson, @meetingCount, @activeTaskCount,
+      @rejectedTaskCount, @deferredTaskCount, @workloadState, @createdAt, @updatedAt
+    )
+    ON CONFLICT(run_id) DO UPDATE SET
+      trigger_type = excluded.trigger_type,
+      preferred_time_zone = excluded.preferred_time_zone,
+      warnings_json = excluded.warnings_json,
+      meeting_count = excluded.meeting_count,
+      active_task_count = excluded.active_task_count,
+      rejected_task_count = excluded.rejected_task_count,
+      deferred_task_count = excluded.deferred_task_count,
+      workload_state = excluded.workload_state,
+      updated_at = excluded.updated_at
+    `
+  ).run({
+    runId: input.runId,
+    triggerType: input.triggerType,
+    preferredTimeZone: input.preferredTimeZone ?? null,
+    warningsJson: JSON.stringify(input.warnings ?? []),
+    meetingCount: input.meetingCount,
+    activeTaskCount: input.activeTaskCount,
+    rejectedTaskCount: input.rejectedTaskCount,
+    deferredTaskCount: input.deferredTaskCount,
+    workloadState: input.workloadState ?? null,
+    createdAt: now,
+    updatedAt: now
+  });
+}
+
+export function listPlannerRunDetails(limit = 30) {
+  return db
+    .prepare("SELECT * FROM planner_run_details ORDER BY created_at DESC LIMIT ?")
+    .all(limit)
+    .map((row: unknown) => plannerRunRowToDetail(row as Record<string, unknown>));
+}
+
+export function recordTaskStateEvent(input: Omit<TaskStateEvent, "id" | "createdAt"> & { createdAt?: string }) {
+  db.prepare(
+    `
+    INSERT INTO task_state_events (
+      task_id, source, source_ref, source_thread_ref, event_type, actor, reason, before_json, after_json, created_at
+    ) VALUES (
+      @taskId, @source, @sourceRef, @sourceThreadRef, @eventType, @actor, @reason, @beforeJson, @afterJson, @createdAt
+    )
+    `
+  ).run({
+    taskId: input.taskId ?? null,
+    source: input.source,
+    sourceRef: input.sourceRef ?? null,
+    sourceThreadRef: input.sourceThreadRef ?? null,
+    eventType: input.eventType,
+    actor: input.actor,
+    reason: input.reason ?? null,
+    beforeJson: input.beforeJson ?? null,
+    afterJson: input.afterJson ?? null,
+    createdAt: input.createdAt ?? new Date().toISOString()
+  });
+}
+
+export function listTaskStateEvents(options?: { taskId?: number; dayKey?: string; limit?: number }) {
+  const filters: string[] = [];
+  const values: Array<string | number> = [];
+
+  if (options?.taskId !== undefined) {
+    filters.push("task_id = ?");
+    values.push(options.taskId);
+  }
+
+  if (options?.dayKey) {
+    filters.push("substr(created_at, 1, 10) = ?");
+    values.push(options.dayKey);
+  }
+
+  const whereClause = filters.length ? `WHERE ${filters.join(" AND ")}` : "";
+  const limitClause = options?.limit ? `LIMIT ${Number(options.limit)}` : "";
+
+  return db
+    .prepare(`SELECT * FROM task_state_events ${whereClause} ORDER BY created_at DESC, id DESC ${limitClause}`)
+    .all(...values)
+    .map((row: unknown) => taskStateEventRowToEvent(row as Record<string, unknown>));
+}
+
 export function savePreferenceMemorySnapshot(input: {
   snapshotJson: string;
   insights: PersonalizationInsight[];
@@ -1047,6 +1387,11 @@ export function listMeetings() {
     .map((row: unknown) => meetingRowToMeeting(row as Record<string, unknown>));
 }
 
+export function getMeetingById(id: number) {
+  const row = db.prepare("SELECT * FROM meetings WHERE id = ?").get(id) as Record<string, unknown> | undefined;
+  return row ? meetingRowToMeeting(row) : null;
+}
+
 function mergeOverrideFlags(existing: string[], next: string[]) {
   return [...new Set([...existing, ...next])];
 }
@@ -1068,6 +1413,12 @@ export function upsertTask(input: {
   restoredAt?: string | null;
   rejectedAt?: string | null;
   lastActivityAt?: string | null;
+  selectionReason?: string | null;
+  priorityReason?: string | null;
+  scoreBreakdown?: ScoreBreakdownItem[];
+  historySignals?: string[];
+  lastChangedBy?: string | null;
+  lastChangedAt?: string | null;
   jiraEstimateSeconds?: number | null;
   jiraSubtaskEstimateSeconds?: number | null;
   jiraPlanningSubtasks?: Array<{
@@ -1105,6 +1456,12 @@ export function upsertTask(input: {
           decision_reason = @decisionReason,
           decision_reason_tags = @decisionReasonTags,
           personalization_version = @personalizationVersion,
+          selection_reason = @selectionReason,
+          priority_reason = @priorityReason,
+          score_breakdown_json = @scoreBreakdownJson,
+          history_signals_json = @historySignalsJson,
+          last_changed_by = @lastChangedBy,
+          last_changed_at = @lastChangedAt,
           restored_at = @restoredAt,
           rejected_at = @rejectedAt,
           last_activity_at = @lastActivityAt,
@@ -1133,6 +1490,12 @@ export function upsertTask(input: {
       decisionReason: input.decisionReason ?? existing.decision_reason ?? null,
       decisionReasonTags: JSON.stringify(input.decisionReasonTags ?? parseJsonArray(existing.decision_reason_tags)),
       personalizationVersion: input.personalizationVersion ?? existing.personalization_version ?? null,
+      selectionReason: input.selectionReason ?? existing.selection_reason ?? null,
+      priorityReason: input.priorityReason ?? existing.priority_reason ?? null,
+      scoreBreakdownJson: JSON.stringify(input.scoreBreakdown ?? parseJsonValue(existing.score_breakdown_json, [])),
+      historySignalsJson: JSON.stringify(input.historySignals ?? parseJsonArray(existing.history_signals_json)),
+      lastChangedBy: input.lastChangedBy ?? existing.last_changed_by ?? null,
+      lastChangedAt: input.lastChangedAt ?? existing.last_changed_at ?? now,
       restoredAt: input.restoredAt ?? existing.restored_at ?? null,
       rejectedAt: input.rejectedAt ?? existing.rejected_at ?? null,
       lastActivityAt: input.lastActivityAt ?? existing.last_activity_at ?? now,
@@ -1150,14 +1513,16 @@ export function upsertTask(input: {
         ignored, deferred_until, reminder_state, last_reminded_at, estimated_effort_bucket,
         priority_score, priority_explanation, task_age_days, carry_forward_count, completed_at,
         last_activity_at, manual_override_flags, decision_state, decision_confidence, decision_reason,
-        decision_reason_tags, personalization_version, was_user_overridden, restored_at, rejected_at,
+        decision_reason_tags, personalization_version, selection_reason, priority_reason, score_breakdown_json,
+        history_signals_json, last_changed_by, last_changed_at, was_user_overridden, restored_at, rejected_at,
         created_at, updated_at
       ) VALUES (
         @title, @source, @priority, @status, @sourceLink, @sourceRef, @sourceThreadRef, @jiraStatus,
         @jiraEstimateSeconds,
         @jiraSubtaskEstimateSeconds, @jiraPlanningSubtasksJson,
         0, NULL, NULL, NULL, NULL, NULL, NULL, 0, 0, NULL, @lastActivityAt, '[]', @decisionState, @decisionConfidence,
-        @decisionReason, @decisionReasonTags, @personalizationVersion, 0, @restoredAt, @rejectedAt, @createdAt, @updatedAt
+        @decisionReason, @decisionReasonTags, @personalizationVersion, @selectionReason, @priorityReason, @scoreBreakdownJson,
+        @historySignalsJson, @lastChangedBy, @lastChangedAt, 0, @restoredAt, @rejectedAt, @createdAt, @updatedAt
       )
       `
     ).run({
@@ -1177,6 +1542,12 @@ export function upsertTask(input: {
       decisionReason: input.decisionReason ?? null,
       decisionReasonTags: JSON.stringify(input.decisionReasonTags ?? []),
       personalizationVersion: input.personalizationVersion ?? null,
+      selectionReason: input.selectionReason ?? null,
+      priorityReason: input.priorityReason ?? null,
+      scoreBreakdownJson: JSON.stringify(input.scoreBreakdown ?? []),
+      historySignalsJson: JSON.stringify(input.historySignals ?? []),
+      lastChangedBy: input.lastChangedBy ?? "system",
+      lastChangedAt: input.lastChangedAt ?? now,
       restoredAt: input.restoredAt ?? null,
       rejectedAt: input.rejectedAt ?? null,
       lastActivityAt: input.lastActivityAt ?? now,
@@ -1199,10 +1570,12 @@ export function createManualTask(input: {
       INSERT INTO tasks (
         title, source, priority, status, ignored, deferred_until, reminder_state, last_reminded_at,
         estimated_effort_bucket, priority_score, priority_explanation, task_age_days, carry_forward_count,
-        completed_at, last_activity_at, manual_override_flags, created_at, updated_at
+        completed_at, last_activity_at, manual_override_flags, selection_reason, priority_reason,
+        score_breakdown_json, history_signals_json, last_changed_by, last_changed_at, created_at, updated_at
       ) VALUES (
         @title, 'Manual', @priority, @status, 0, NULL, NULL, NULL,
-        NULL, NULL, NULL, 0, 0, @completedAt, @lastActivityAt, '["priority","status"]', @createdAt, @updatedAt
+        NULL, NULL, NULL, 0, 0, @completedAt, @lastActivityAt, '["priority","status"]', @selectionReason, @priorityReason,
+        '[]', '[]', 'user', @lastChangedAt, @createdAt, @updatedAt
       )
       `
     )
@@ -1212,6 +1585,9 @@ export function createManualTask(input: {
       status,
       completedAt: status === "Completed" ? now : null,
       lastActivityAt: now,
+      selectionReason: "Created manually by you.",
+      priorityReason: input.priority ? `You set this as ${input.priority.toLowerCase()} priority.` : "Manual task defaults to medium priority.",
+      lastChangedAt: now,
       createdAt: now,
       updatedAt: now
     });
@@ -1223,7 +1599,7 @@ export function createManualTask(input: {
 
 export function updateTask(
   id: number,
-  patch: Partial<Pick<Task, "title" | "priority" | "status" | "deferredUntil">> & {
+  patch: Partial<Pick<Task, "title" | "priority" | "status" | "deferredUntil" | "sourceLink" | "jiraStatus">> & {
     manualOverrideFlags?: string[];
     priorityScore?: number | null;
     priorityExplanation?: string | null;
@@ -1246,6 +1622,12 @@ export function updateTask(
     decisionReason?: string | null;
     decisionReasonTags?: ReasonTag[];
     personalizationVersion?: number | null;
+    selectionReason?: string | null;
+    priorityReason?: string | null;
+    scoreBreakdown?: ScoreBreakdownItem[];
+    historySignals?: string[];
+    lastChangedBy?: string | null;
+    lastChangedAt?: string | null;
     wasUserOverridden?: boolean;
     restoredAt?: string | null;
     rejectedAt?: string | null;
@@ -1266,6 +1648,8 @@ export function updateTask(
     SET title = @title,
         priority = @priority,
         status = @status,
+        source_link = @sourceLink,
+        jira_status = @jiraStatus,
         deferred_until = @deferredUntil,
         estimated_effort_bucket = @estimatedEffortBucket,
         jira_estimate_seconds = @jiraEstimateSeconds,
@@ -1285,6 +1669,12 @@ export function updateTask(
         decision_reason = @decisionReason,
         decision_reason_tags = @decisionReasonTags,
         personalization_version = @personalizationVersion,
+        selection_reason = @selectionReason,
+        priority_reason = @priorityReason,
+        score_breakdown_json = @scoreBreakdownJson,
+        history_signals_json = @historySignalsJson,
+        last_changed_by = @lastChangedBy,
+        last_changed_at = @lastChangedAt,
         was_user_overridden = @wasUserOverridden,
         restored_at = @restoredAt,
         rejected_at = @rejectedAt,
@@ -1296,6 +1686,8 @@ export function updateTask(
     title: patch.title ?? existing.title,
     priority: patch.priority ?? existing.priority,
     status: nextStatus,
+    sourceLink: patch.sourceLink ?? existing.source_link ?? null,
+    jiraStatus: patch.jiraStatus ?? existing.jira_status ?? null,
     deferredUntil: patch.deferredUntil ?? existing.deferred_until,
     estimatedEffortBucket: patch.estimatedEffortBucket ?? existing.estimated_effort_bucket ?? null,
     jiraEstimateSeconds: patch.jiraEstimateSeconds ?? existing.jira_estimate_seconds ?? null,
@@ -1324,6 +1716,12 @@ export function updateTask(
     decisionReason: patch.decisionReason ?? existing.decision_reason ?? null,
     decisionReasonTags: JSON.stringify(patch.decisionReasonTags ?? parseJsonArray(existing.decision_reason_tags)),
     personalizationVersion: patch.personalizationVersion ?? existing.personalization_version ?? null,
+    selectionReason: patch.selectionReason ?? existing.selection_reason ?? null,
+    priorityReason: patch.priorityReason ?? existing.priority_reason ?? null,
+    scoreBreakdownJson: JSON.stringify(patch.scoreBreakdown ?? parseJsonValue(existing.score_breakdown_json, [])),
+    historySignalsJson: JSON.stringify(patch.historySignals ?? parseJsonArray(existing.history_signals_json)),
+    lastChangedBy: patch.lastChangedBy ?? existing.last_changed_by ?? null,
+    lastChangedAt: patch.lastChangedAt ?? existing.last_changed_at ?? updatedAt,
     wasUserOverridden: Number(
       patch.wasUserOverridden ?? (Number(existing.was_user_overridden ?? 0) === 1)
     ),
@@ -1588,11 +1986,79 @@ export function listRecentDailyPlanSnapshots(limit = 28) {
     .all(limit) as Array<Record<string, unknown>>;
 }
 
+export function getDailyPlanSnapshot(dayKey: string) {
+  return db
+    .prepare("SELECT * FROM daily_plan_snapshots WHERE day_key = ? LIMIT 1")
+    .get(dayKey) as Record<string, unknown> | undefined;
+}
+
 export function getRejectedTaskCount() {
   const row = db
     .prepare("SELECT COUNT(*) as count FROM rejected_tasks WHERE decision_state IN ('rejected', 'uncertain')")
     .get() as { count: number };
   return Number(row.count ?? 0);
+}
+
+export function getIgnoredRejectedTaskCount() {
+  const row = db
+    .prepare("SELECT COUNT(*) as count FROM rejected_tasks WHERE decision_state = 'ignored'")
+    .get() as { count: number };
+  return Number(row.count ?? 0);
+}
+
+export function clearSoftDevelopmentData() {
+  const transaction = db.transaction(() => {
+    db.prepare("DELETE FROM tasks WHERE source IN ('Email', 'Jira')").run();
+    db.prepare("DELETE FROM meetings").run();
+    db.prepare("DELETE FROM reminders").run();
+    db.prepare("DELETE FROM rejected_tasks").run();
+    db.prepare("DELETE FROM task_decision_log").run();
+    db.prepare("DELETE FROM preference_memory_snapshots").run();
+    db.prepare("DELETE FROM generation_runs").run();
+    db.prepare("DELETE FROM daily_plan_snapshots").run();
+    db.prepare("DELETE FROM audit_events").run();
+    db.prepare("DELETE FROM planner_run_details").run();
+    db.prepare("DELETE FROM task_state_events").run();
+    db.prepare("DELETE FROM sync_state WHERE provider IN ('microsoft', 'jira', 'plan')").run();
+  });
+
+  transaction();
+}
+
+export function clearHardDevelopmentData() {
+  db.exec(`
+    DELETE FROM tasks;
+    DELETE FROM meetings;
+    DELETE FROM integration_connections;
+    DELETE FROM sync_state;
+    DELETE FROM reminders;
+    DELETE FROM automation_settings;
+    DELETE FROM generation_runs;
+    DELETE FROM daily_plan_snapshots;
+    DELETE FROM user_priority_profile;
+    DELETE FROM rejected_tasks;
+    DELETE FROM task_decision_log;
+    DELETE FROM preference_memory_snapshots;
+    DELETE FROM audit_events;
+    DELETE FROM planner_run_details;
+    DELETE FROM task_state_events;
+  `);
+
+  db.prepare(
+    `
+    INSERT INTO automation_settings (id)
+    VALUES (1)
+    ON CONFLICT(id) DO NOTHING
+    `
+  ).run();
+
+  db.prepare(
+    `
+    INSERT INTO user_priority_profile (id, updated_at)
+    VALUES (1, ?)
+    ON CONFLICT(id) DO NOTHING
+    `
+  ).run(new Date().toISOString());
 }
 
 export function groupTasksByPriority(tasks: Task[]) {

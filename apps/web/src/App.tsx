@@ -8,26 +8,37 @@ import {
   type MicrosoftAccount
 } from "./auth";
 import type {
+  AuditEvent,
   AutomationSettings,
+  DayHistoryDetail,
+  DayHistorySummary,
+  DiagnosticsPayload,
   EmailTaskDetail,
+  EmailReplyDraft,
+  InsightsOverview,
+  InsightsTodayPayload,
   IntegrationStatus,
   JiraTaskDetail,
+  Meeting,
+  MeetingPrep,
   PersonalizationInsight,
+  PlannerRunDetail,
   RejectedTask,
   Reminder,
   Task,
   TaskDetail,
+  TaskInsightsPayload,
   TaskPriority,
   TaskStatus,
   TodayResponse,
   UserPriorityProfile
 } from "./types";
 
-type View = "today" | "tasks" | "deferred" | "rejected" | "reminders" | "settings";
+type View = "today" | "tasks" | "deferred" | "rejected" | "reminders" | "insights" | "settings";
 type TaskFilter = TaskStatus | "All";
 
 const priorityOrder: TaskPriority[] = ["High", "Medium", "Low"];
-const statusOptions: TaskStatus[] = ["Not Started", "In Progress", "Completed"];
+const statusOptions: TaskStatus[] = ["In Progress", "Not Started", "Completed"];
 
 function formatDateTime(value: string | null) {
   if (!value) return "Never";
@@ -53,12 +64,25 @@ function formatPercent(value: number) {
   return `${Math.round(value * 100)}%`;
 }
 
+function formatPercentValue(value: number | null | undefined) {
+  if (value === null || value === undefined) return "—";
+  return `${Math.round(value)}%`;
+}
+
 function formatPreferenceLines(values: string[]) {
   return values.join("\n");
 }
 
 function parsePreferenceLines(value: string) {
   return [...new Set(value.split(/\n|,/).map((item) => item.trim()).filter(Boolean))];
+}
+
+async function logClientEventSafe(input: Parameters<typeof api.logClientEvent>[0]) {
+  try {
+    await api.logClientEvent(input);
+  } catch {
+    // Best-effort only. Client logging must never break the UI.
+  }
 }
 
 function getBrowserTimeZone() {
@@ -196,7 +220,7 @@ function sourceLabel(task: Task) {
   if (task.source === "Jira" && task.jiraStatus) {
     return task.jiraStatus;
   }
-  return task.status;
+  return null;
 }
 
 function nextJiraSubtask(task: Task) {
@@ -231,7 +255,55 @@ function jiraStorySummary(task: Task) {
 }
 
 function compareTasks(left: Task, right: Task) {
+  const statusRank = (status: TaskStatus) => {
+    switch (status) {
+      case "In Progress":
+        return 0;
+      case "Not Started":
+        return 1;
+      case "Completed":
+        return 2;
+      default:
+        return 3;
+    }
+  };
+  const priorityRank = (priority: TaskPriority) => {
+    switch (priority) {
+      case "High":
+        return 0;
+      case "Medium":
+        return 1;
+      case "Low":
+        return 2;
+      default:
+        return 3;
+    }
+  };
+
+  const statusDiff = statusRank(left.status) - statusRank(right.status);
+  if (statusDiff !== 0) return statusDiff;
+
+  const priorityDiff = priorityRank(left.priority) - priorityRank(right.priority);
+  if (priorityDiff !== 0) return priorityDiff;
+
   return new Date(right.updatedAt ?? 0).getTime() - new Date(left.updatedAt ?? 0).getTime();
+}
+
+function taskStatusClassName(status: TaskStatus) {
+  return status.toLowerCase().replace(/\s+/g, "-");
+}
+
+function taskStatusLabel(status: TaskStatus) {
+  switch (status) {
+    case "In Progress":
+      return "In progress";
+    case "Not Started":
+      return "Not started";
+    case "Completed":
+      return "Completed";
+    default:
+      return status;
+  }
 }
 
 function simplifyEmailTaskTitle(title: string) {
@@ -304,6 +376,17 @@ function joinList(values: string[]) {
   return values.length ? values.join(", ") : "None";
 }
 
+function splitEmailAddresses(value: string) {
+  return value
+    .split(",")
+    .map((entry) => entry.trim())
+    .map((entry) => {
+      const match = entry.match(/<([^>]+)>/);
+      return (match?.[1] ?? entry).replace(/^mailto:/i, "").trim();
+    })
+    .filter((entry) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(entry));
+}
+
 function hasText(value: string | null | undefined) {
   return Boolean(value?.trim());
 }
@@ -346,6 +429,7 @@ function AppHeader(props: { active: View; onChange: (view: View) => void }) {
           ["deferred", "Deferred"],
           ["rejected", "Rejected"],
           ["reminders", "Reminders"],
+          ["insights", "Insights"],
           ["settings", "Settings"]
         ].map(([id, label]) => (
           <button
@@ -568,6 +652,33 @@ function SettingsSkeleton() {
   );
 }
 
+function InsightsSkeleton() {
+  return (
+    <section className="panel-stack">
+      <div className="hero-card skeleton-block hero-skeleton" />
+      <div className="dashboard-grid">
+        <div className="panel skeleton-panel">
+          <div className="skeleton-line wide" />
+          <div className="skeleton-line medium" />
+          <div className="skeleton-stack">
+            <div className="skeleton-card" />
+            <div className="skeleton-card" />
+            <div className="skeleton-card" />
+          </div>
+        </div>
+        <div className="panel skeleton-panel">
+          <div className="skeleton-line wide" />
+          <div className="skeleton-line medium" />
+          <div className="skeleton-stack">
+            <div className="skeleton-card" />
+            <div className="skeleton-card" />
+          </div>
+        </div>
+      </div>
+    </section>
+  );
+}
+
 function StatusSelect(props: {
   value: TaskStatus;
   onChange: (status: TaskStatus) => Promise<void>;
@@ -616,7 +727,19 @@ function PrioritySelect(props: {
   );
 }
 
-function JiraDetailView(props: { detail: JiraTaskDetail }) {
+function JiraDetailView(props: {
+  detail: JiraTaskDetail;
+  updatingIssueKey: string | null;
+  onTransition: (issueKey: string, transitionId: string) => Promise<void>;
+}) {
+  const [storyTransitionId, setStoryTransitionId] = useState("");
+  const [subtaskTransitionIds, setSubtaskTransitionIds] = useState<Record<string, string>>({});
+
+  useEffect(() => {
+    setStoryTransitionId("");
+    setSubtaskTransitionIds({});
+  }, [props.detail.key]);
+
   return (
     <div className="detail-stack">
       <div className="detail-grid">
@@ -637,6 +760,34 @@ function JiraDetailView(props: { detail: JiraTaskDetail }) {
           <strong>{props.detail.assignee ?? "Unassigned"}</strong>
         </div>
       </div>
+
+      <section className="detail-section">
+        <h4>Update story status</h4>
+        {props.detail.transitions.length ? (
+          <div className="jira-transition-row">
+            <label className="status-select compact">
+              <span>Transition</span>
+              <select value={storyTransitionId} onChange={(event) => setStoryTransitionId(event.target.value)}>
+                <option value="">Choose next Jira status</option>
+                {props.detail.transitions.map((transition) => (
+                  <option key={transition.id} value={transition.id}>
+                    {transition.name} → {transition.toStatus ?? transition.toStatusCategory}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <button
+              className="primary-button"
+              disabled={!storyTransitionId || props.updatingIssueKey === props.detail.key}
+              onClick={() => void props.onTransition(props.detail.key, storyTransitionId)}
+            >
+              {props.updatingIssueKey === props.detail.key ? "Updating..." : "Update story"}
+            </button>
+          </div>
+        ) : (
+          <p className="empty-state">No Jira transitions are available for this story right now.</p>
+        )}
+      </section>
 
       <section className="detail-section">
         <h4>Description</h4>
@@ -662,10 +813,44 @@ function JiraDetailView(props: { detail: JiraTaskDetail }) {
         {props.detail.subtasks.length ? (
           <div className="detail-list">
             {props.detail.subtasks.map((subtask) => (
-              <article className="detail-row" key={subtask.key}>
-                <strong>{subtask.key}</strong>
+              <article className="detail-row stacked" key={subtask.key}>
+                <div className="detail-row-header">
+                  <strong>{subtask.key}</strong>
+                  <span className="subtle-pill">{subtask.status ?? "Unknown"}</span>
+                </div>
                 <p>{subtask.title}</p>
-                <span className="subtle-pill">{subtask.status ?? "Unknown"}</span>
+                {subtask.transitions.length ? (
+                  <div className="jira-transition-row">
+                    <label className="status-select compact">
+                      <span>Transition</span>
+                      <select
+                        value={subtaskTransitionIds[subtask.key] ?? ""}
+                        onChange={(event) =>
+                          setSubtaskTransitionIds((current) => ({
+                            ...current,
+                            [subtask.key]: event.target.value
+                          }))
+                        }
+                      >
+                        <option value="">Choose next Jira status</option>
+                        {subtask.transitions.map((transition) => (
+                          <option key={transition.id} value={transition.id}>
+                            {transition.name} → {transition.toStatus ?? transition.toStatusCategory}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                    <button
+                      className="ghost-button subtle-action"
+                      disabled={!subtaskTransitionIds[subtask.key] || props.updatingIssueKey === subtask.key}
+                      onClick={() => void props.onTransition(subtask.key, subtaskTransitionIds[subtask.key] ?? "")}
+                    >
+                      {props.updatingIssueKey === subtask.key ? "Updating..." : "Update subtask"}
+                    </button>
+                  </div>
+                ) : (
+                  <p className="empty-state">No Jira transitions are available for this subtask.</p>
+                )}
               </article>
             ))}
           </div>
@@ -717,7 +902,17 @@ function JiraDetailView(props: { detail: JiraTaskDetail }) {
   );
 }
 
-function EmailDetailView(props: { detail: EmailTaskDetail }) {
+function EmailDetailView(props: {
+  detail: EmailTaskDetail;
+  draftInput: string;
+  draft: EmailReplyDraft | null;
+  draftLoading: boolean;
+  sendStatus: string | null;
+  onDraftInputChange: (value: string) => void;
+  onGenerateDraft: () => Promise<void>;
+  onUpdateDraft: (patch: Partial<EmailReplyDraft>) => void;
+  onCopyDraft: () => Promise<void>;
+}) {
   const showThread = props.detail.thread.length > 0;
   const hasFrom = hasText(props.detail.from);
   const hasTo = hasItems(props.detail.to);
@@ -751,6 +946,86 @@ function EmailDetailView(props: { detail: EmailTaskDetail }) {
       <section className="detail-section">
         <h4>Email content</h4>
         <pre className="detail-content">{props.detail.body || "No message content available."}</pre>
+      </section>
+
+      <section className="detail-section">
+        <div className="panel-header">
+          <div>
+            <h4>Reply Composer</h4>
+            <p className="timeline-header-note">
+              Generate a grounded reply from the real message and thread, then edit recipients, subject, and content before copying it into your email.
+            </p>
+          </div>
+        </div>
+        <div className="field-card compact-card">
+          <span>What should the reply accomplish? Optional</span>
+          <textarea
+            className="prompt-editor"
+            value={props.draftInput}
+            onChange={(event) => props.onDraftInputChange(event.target.value)}
+            placeholder="For example: acknowledge the request, say I will review this today, and ask one clarifying question about ownership."
+          />
+        </div>
+        <div className="integration-actions">
+          <button className="primary-button" onClick={() => void props.onGenerateDraft()} disabled={props.draftLoading}>
+            {props.draftLoading ? "Generating..." : "Generate draft"}
+          </button>
+        </div>
+        {props.draft ? (
+          <div className="detail-stack reply-composer">
+            <div className="detail-grid compact">
+              <div className="field-card compact-card">
+                <span>Draft focus</span>
+                <p>{props.draft.summary}</p>
+              </div>
+              <div className="field-card compact-card">
+                <span>Detected actions</span>
+                <p>{props.draft.actionItems.length ? props.draft.actionItems.join(" • ") : "No clear action signal detected."}</p>
+              </div>
+            </div>
+            <label className="field-card compact-card">
+              <span>To</span>
+              <input
+                value={props.draft.to.join(", ")}
+                onChange={(event) => props.onUpdateDraft({ to: splitEmailAddresses(event.target.value) })}
+                placeholder="recipient@company.com"
+              />
+            </label>
+            <label className="field-card compact-card">
+              <span>CC</span>
+              <input
+                value={props.draft.cc.join(", ")}
+                onChange={(event) => props.onUpdateDraft({ cc: splitEmailAddresses(event.target.value) })}
+                placeholder="cc1@company.com, cc2@company.com"
+              />
+            </label>
+            <label className="field-card compact-card">
+              <span>Subject</span>
+              <input
+                value={props.draft.subject}
+                onChange={(event) => props.onUpdateDraft({ subject: event.target.value })}
+              />
+            </label>
+            <label className="field-card compact-card">
+              <span>Reply body</span>
+              <textarea
+                className="prompt-editor"
+                value={props.draft.body}
+                onChange={(event) => props.onUpdateDraft({ body: event.target.value })}
+              />
+            </label>
+            <div className="field-card compact-card">
+              <span>Why this draft</span>
+              <p>{props.draft.rationale}</p>
+            </div>
+            {props.sendStatus ? <p className="muted">{props.sendStatus}</p> : null}
+            <div className="integration-actions">
+              <button className="primary-button" onClick={() => void props.onCopyDraft()}>
+                Copy draft
+              </button>
+            </div>
+          </div>
+        ) : null}
       </section>
 
       {showThread ? (
@@ -795,11 +1070,153 @@ function EmailDetailView(props: { detail: EmailTaskDetail }) {
   );
 }
 
+function MeetingPrepDialog(props: {
+  meeting: Meeting | null;
+  prep: MeetingPrep | null;
+  input: string;
+  loading: boolean;
+  status: string | null;
+  onInputChange: (value: string) => void;
+  onGenerate: () => Promise<void>;
+  onClose: () => void;
+}) {
+  if (!props.meeting) return null;
+  const meeting = props.meeting;
+
+  const downloadPrep = () => {
+    if (!props.prep) return;
+    const blob = new Blob([props.prep.notes], { type: "text/plain;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = `${meeting.title.replace(/[^\w-]+/g, "_").slice(0, 60) || "meeting-prep"}.txt`;
+    anchor.click();
+    URL.revokeObjectURL(url);
+  };
+
+  return (
+    <div className="detail-overlay" onClick={props.onClose}>
+      <div className="detail-modal" onClick={(event) => event.stopPropagation()}>
+        <div className="detail-modal-header">
+          <div>
+            <p className="eyebrow">Meeting Prep</p>
+            <h3>{meeting.title}</h3>
+          </div>
+          <button className="ghost-button subtle-action" onClick={props.onClose}>
+            Close
+          </button>
+        </div>
+        <div className="detail-stack">
+          <div className="detail-grid compact">
+            <div className="detail-stat">
+              <span>Time</span>
+                <strong>
+                {formatMeetingTime(meeting.startTime, meeting.timeZone)} to {formatMeetingTime(meeting.endTime, meeting.timeZone)}
+                </strong>
+              </div>
+              <div className="detail-stat">
+                <span>Action</span>
+              <strong>{meeting.meetingLinkType === "join" ? "Join meeting" : "Open in Calendar"}</strong>
+              </div>
+            </div>
+          <label className="field-card compact-card">
+            <span>Optional focus for prep</span>
+            <textarea
+              className="prompt-editor"
+              value={props.input}
+              onChange={(event) => props.onInputChange(event.target.value)}
+              placeholder="Optional guidance, for example: focus on blockers, expected decisions, and what I should be ready to say."
+            />
+          </label>
+          <div className="integration-actions">
+            <button className="primary-button" onClick={() => void props.onGenerate()} disabled={props.loading}>
+              {props.loading ? "Preparing..." : "Prepare for meeting"}
+            </button>
+            {props.prep ? (
+              <button className="ghost-button subtle-action" onClick={downloadPrep}>
+                Download notes
+              </button>
+            ) : null}
+          </div>
+          {props.status ? <p className="muted">{props.status}</p> : null}
+          {props.prep ? (
+            <>
+              <div className="detail-grid compact">
+                <div className="field-card compact-card">
+                  <span>Preparation summary</span>
+                  <p>{props.prep.summary}</p>
+                </div>
+                <div className="field-card compact-card">
+                  <span>Why this prep</span>
+                  <p>{props.prep.rationale}</p>
+                </div>
+              </div>
+              <div className="detail-grid compact">
+                <div className="field-card compact-card">
+                  <span>Objectives</span>
+                  <ul className="detail-bullet-list">
+                    {props.prep.objectives.map((item) => (
+                      <li key={item}>{item}</li>
+                    ))}
+                  </ul>
+                </div>
+                <div className="field-card compact-card">
+                  <span>Checklist</span>
+                  <ul className="detail-bullet-list">
+                    {props.prep.checklist.map((item) => (
+                      <li key={item}>{item}</li>
+                    ))}
+                  </ul>
+                </div>
+              </div>
+              <div className="detail-grid compact">
+                <div className="field-card compact-card">
+                  <span>Talking points</span>
+                  <ul className="detail-bullet-list">
+                    {props.prep.talkingPoints.map((item) => (
+                      <li key={item}>{item}</li>
+                    ))}
+                  </ul>
+                </div>
+                <div className="field-card compact-card">
+                  <span>Questions and risks</span>
+                  <ul className="detail-bullet-list">
+                    {props.prep.questions.map((item) => (
+                      <li key={`q-${item}`}>{item}</li>
+                    ))}
+                    {props.prep.risks.map((item) => (
+                      <li key={`r-${item}`}>{item}</li>
+                    ))}
+                  </ul>
+                </div>
+              </div>
+              <section className="detail-section">
+                <h4>Downloadable notes</h4>
+                <pre className="detail-content">{props.prep.notes}</pre>
+              </section>
+            </>
+          ) : null}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function TaskDetailsDialog(props: {
   task: Task | null;
   detail: TaskDetail | null;
   loading: boolean;
   error: string | null;
+  updatingIssueKey: string | null;
+  onTransitionJiraIssue: (issueKey: string, transitionId: string) => Promise<void>;
+  emailDraftInput: string;
+  emailDraft: EmailReplyDraft | null;
+  emailDraftLoading: boolean;
+  emailSendStatus: string | null;
+  onEmailDraftInputChange: (value: string) => void;
+  onGenerateEmailDraft: () => Promise<void>;
+  onUpdateEmailDraft: (patch: Partial<EmailReplyDraft>) => void;
+  onCopyEmailDraft: () => Promise<void>;
   onClose: () => void;
 }) {
   if (!props.task) return null;
@@ -819,8 +1236,26 @@ function TaskDetailsDialog(props: {
 
         {props.loading ? <p className="muted">Loading source details…</p> : null}
         {props.error ? <p className="error-text">{props.error}</p> : null}
-        {!props.loading && !props.error && props.detail?.type === "jira" ? <JiraDetailView detail={props.detail} /> : null}
-        {!props.loading && !props.error && props.detail?.type === "email" ? <EmailDetailView detail={props.detail} /> : null}
+        {!props.loading && !props.error && props.detail?.type === "jira" ? (
+          <JiraDetailView
+            detail={props.detail}
+            updatingIssueKey={props.updatingIssueKey}
+            onTransition={props.onTransitionJiraIssue}
+          />
+        ) : null}
+        {!props.loading && !props.error && props.detail?.type === "email" ? (
+          <EmailDetailView
+            detail={props.detail}
+            draftInput={props.emailDraftInput}
+            draft={props.emailDraft}
+            draftLoading={props.emailDraftLoading}
+            sendStatus={props.emailSendStatus}
+            onDraftInputChange={props.onEmailDraftInputChange}
+            onGenerateDraft={props.onGenerateEmailDraft}
+            onUpdateDraft={props.onUpdateEmailDraft}
+            onCopyDraft={props.onCopyEmailDraft}
+          />
+        ) : null}
       </div>
     </div>
   );
@@ -845,7 +1280,7 @@ function TaskCard(props: {
 
   return (
     <article
-      className={props.dense ? "task-card dense" : "task-card"}
+      className={`${props.dense ? "task-card dense" : "task-card"} task-card-status-${taskStatusClassName(props.task.status)}`}
       draggable={props.draggable}
       onDragStart={() => props.onDragStart?.(props.task)}
       onDragEnd={() => props.onDragEnd?.()}
@@ -868,7 +1303,10 @@ function TaskCard(props: {
       >
         <div className="task-meta">
           <span className={`pill pill-${props.task.source.toLowerCase()}`}>{props.task.source}</span>
-          <span className="subtle-pill">{sourceLabel(props.task)}</span>
+          {sourceLabel(props.task) ? <span className="subtle-pill">{sourceLabel(props.task)}</span> : null}
+          <span className={`status-badge task-status-badge status-${taskStatusClassName(props.task.status)}`}>
+            {taskStatusLabel(props.task.status)}
+          </span>
           {props.showPriority !== false ? (
             <span className={`priority-dot ${props.task.priority.toLowerCase()}`}>{props.task.priority}</span>
           ) : null}
@@ -990,6 +1428,7 @@ function TodayView(props: {
   onTaskStatusChange: (task: Task, status: TaskStatus) => Promise<void>;
   onTaskPriorityChange: (task: Task, priority: TaskPriority) => Promise<void>;
   onOpenDetails: (task: Task) => Promise<void>;
+  onPrepareMeeting: (meeting: Meeting) => void;
 }) {
   const [draggedTask, setDraggedTask] = useState<Task | null>(null);
   const [dropPriority, setDropPriority] = useState<TaskPriority | null>(null);
@@ -1143,11 +1582,23 @@ function TodayView(props: {
                               {formatMeetingTime(meeting.endTime, meeting.timeZone)}
                             </p>
                             {meeting.meetingLink && !meeting.isCancelled && meetingActionLabel(meeting) ? (
-                              <a className="source-link" href={meeting.meetingLink} target="_blank" rel="noreferrer">
-                                {meeting.id === joinableMeetingId && meeting.meetingLinkType === "join"
-                                  ? "Join now"
-                                  : meetingActionLabel(meeting)}
-                              </a>
+                              <div className="meeting-action-row">
+                                <a className="source-link" href={meeting.meetingLink} target="_blank" rel="noreferrer">
+                                  {meeting.id === joinableMeetingId && meeting.meetingLinkType === "join"
+                                    ? "Join now"
+                                    : meetingActionLabel(meeting)}
+                                </a>
+                                <button
+                                  className="ghost-button subtle-action"
+                                  onClick={() => props.onPrepareMeeting(meeting)}
+                                >
+                                  Prepare
+                                </button>
+                              </div>
+                            ) : !meeting.isCancelled ? (
+                              <button className="ghost-button subtle-action" onClick={() => props.onPrepareMeeting(meeting)}>
+                                Prepare
+                              </button>
                             ) : null}
                           </div>
                         </div>
@@ -1244,7 +1695,17 @@ function TasksView(props: {
   onDeferUntilTomorrow: (task: Task) => Promise<void>;
 }) {
   const [title, setTitle] = useState("");
-  const items = useMemo(() => buildTaskPresentationItems(props.tasks), [props.tasks]);
+  const sections = useMemo(() => {
+    const order: TaskStatus[] =
+      props.filter === "All" ? ["In Progress", "Not Started", "Completed"] : [props.filter];
+
+    return order
+      .map((status) => ({
+        status,
+        items: buildTaskPresentationItems(props.tasks.filter((task) => task.status === status))
+      }))
+      .filter((section) => section.items.length > 0);
+  }, [props.tasks, props.filter]);
 
   return (
     <section className="panel-stack">
@@ -1290,31 +1751,52 @@ function TasksView(props: {
 
         <div className="task-table">
           {props.loading ? <p className="muted">Loading tasks…</p> : null}
-          {items.map((item) =>
-            item.kind === "cluster" ? (
-              <TaskClusterCard
-                key={item.key}
-                title={item.title}
-                tasks={item.tasks}
-                onStatusChange={(currentTask, status) => props.onUpdateStatus(currentTask, status)}
-                onPriorityChange={(currentTask, priority) => props.onUpdatePriority(currentTask, priority)}
-                onDelete={(currentTask) => props.onDelete(currentTask)}
-                onOpenDetails={props.onOpenDetails}
-                onDeferUntilTomorrow={props.onDeferUntilTomorrow}
-              />
-            ) : (
-              <TaskCard
-                key={item.key}
-                task={item.task}
-                dense
-                onStatusChange={(currentTask, status) => props.onUpdateStatus(currentTask, status)}
-                onPriorityChange={(currentTask, priority) => props.onUpdatePriority(currentTask, priority)}
-                onDelete={(currentTask) => props.onDelete(currentTask)}
-                onOpenDetails={props.onOpenDetails}
-                onDeferUntilTomorrow={props.onDeferUntilTomorrow}
-              />
-            )
-          )}
+          {sections.map((section) => (
+            <section className={`task-status-section status-${taskStatusClassName(section.status)}`} key={section.status}>
+              <div className="task-status-section-header">
+                <div>
+                  <h4>{taskStatusLabel(section.status)}</h4>
+                  <p>
+                    {section.status === "In Progress"
+                      ? "Current work, kept at the top."
+                      : section.status === "Not Started"
+                        ? "Ready to pick up next."
+                        : "Finished work, separated for clarity."}
+                  </p>
+                </div>
+                <span className={`status-badge task-status-badge status-${taskStatusClassName(section.status)}`}>
+                  {section.items.length}
+                </span>
+              </div>
+              <div className="task-status-section-list">
+                {section.items.map((item) =>
+                  item.kind === "cluster" ? (
+                    <TaskClusterCard
+                      key={item.key}
+                      title={item.title}
+                      tasks={item.tasks}
+                      onStatusChange={(currentTask, status) => props.onUpdateStatus(currentTask, status)}
+                      onPriorityChange={(currentTask, priority) => props.onUpdatePriority(currentTask, priority)}
+                      onDelete={(currentTask) => props.onDelete(currentTask)}
+                      onOpenDetails={props.onOpenDetails}
+                      onDeferUntilTomorrow={props.onDeferUntilTomorrow}
+                    />
+                  ) : (
+                    <TaskCard
+                      key={item.key}
+                      task={item.task}
+                      dense
+                      onStatusChange={(currentTask, status) => props.onUpdateStatus(currentTask, status)}
+                      onPriorityChange={(currentTask, priority) => props.onUpdatePriority(currentTask, priority)}
+                      onDelete={(currentTask) => props.onDelete(currentTask)}
+                      onOpenDetails={props.onOpenDetails}
+                      onDeferUntilTomorrow={props.onDeferUntilTomorrow}
+                    />
+                  )
+                )}
+              </div>
+            </section>
+          ))}
           {!props.tasks.length ? <p className="empty-state">No tasks match this filter yet.</p> : null}
         </div>
       </div>
@@ -1430,17 +1912,15 @@ function ReminderCenterView(props: {
 
 function RejectedView(props: {
   tasks: RejectedTask[];
+  ignoredTasks: RejectedTask[];
   loading: boolean;
   onRestore: (task: RejectedTask) => Promise<void>;
+  onIgnoreThis: (task: RejectedTask) => Promise<void>;
   onAlwaysIgnore: (task: RejectedTask) => Promise<void>;
-  onShouldInclude: (task: RejectedTask) => Promise<void>;
 }) {
   const [sourceFilter, setSourceFilter] = useState<"All" | "Email" | "Jira">("All");
   const filtered = props.tasks.filter((task) => (sourceFilter === "All" ? true : task.source === sourceFilter));
-
-  function hasIncludeLearning(task: RejectedTask) {
-    return task.decisionState === "uncertain" || (task.decisionReason ?? "").includes("should have been included");
-  }
+  const filteredIgnored = props.ignoredTasks.filter((task) => (sourceFilter === "All" ? true : task.source === sourceFilter));
 
   function hasIgnoreLearning(task: RejectedTask) {
     return (task.decisionReason ?? "").includes("ignore similar");
@@ -1467,6 +1947,15 @@ function RejectedView(props: {
         </div>
         <div className="reminder-list">
           {props.loading ? <p className="muted">Loading rejected tasks…</p> : null}
+          {filtered.length ? (
+            <div className="queue-section-banner pending-review-banner">
+              <div>
+                <h4 className="queue-section-title">Pending review</h4>
+                <p className="queue-section-copy">Potentially relevant items that still need your decision.</p>
+              </div>
+              <span className="queue-section-count">{filtered.length}</span>
+            </div>
+          ) : null}
           {filtered.map((task) => (
             <article className="reminder-card rejected-card" key={task.id}>
               <div className="task-meta">
@@ -1483,7 +1972,6 @@ function RejectedView(props: {
                     {tag.replace(/_/g, " ")}
                   </span>
                 ))}
-                {hasIncludeLearning(task) ? <span className="subtle-pill learning-pill">Learning applied</span> : null}
                 {hasIgnoreLearning(task) ? <span className="subtle-pill learning-pill">Ignore similar saved</span> : null}
               </div>
               <div className="reminder-footer">
@@ -1494,17 +1982,14 @@ function RejectedView(props: {
                       Open source
                     </a>
                   ) : null}
+                  <button className="ghost-button subtle-action" onClick={() => void props.onIgnoreThis(task)}>
+                    Ignore this
+                  </button>
                   <button
                     className={hasIgnoreLearning(task) ? "ghost-button subtle-action selected-action" : "ghost-button subtle-action"}
                     onClick={() => void props.onAlwaysIgnore(task)}
                   >
-                    Always ignore similar
-                  </button>
-                  <button
-                    className={hasIncludeLearning(task) ? "ghost-button subtle-action selected-action" : "ghost-button subtle-action"}
-                    onClick={() => void props.onShouldInclude(task)}
-                  >
-                    This should have been included
+                    Ignore similar in future
                   </button>
                   <button className="primary-button" onClick={() => void props.onRestore(task)}>
                     Restore to plan
@@ -1513,7 +1998,43 @@ function RejectedView(props: {
               </div>
             </article>
           ))}
-          {!filtered.length ? <p className="empty-state">Nothing is hidden right now.</p> : null}
+          {!filtered.length ? <p className="empty-state">Nothing is waiting for review right now.</p> : null}
+
+          {filteredIgnored.length ? (
+            <div className="queue-section-divider" aria-hidden="true" />
+          ) : null}
+          {filteredIgnored.length ? (
+            <div className="queue-section-banner ignored-items-banner">
+              <div>
+                <h4 className="queue-section-title muted-section">Ignored items</h4>
+                <p className="queue-section-copy">Items you intentionally hid so they stop distracting the review queue.</p>
+              </div>
+              <span className="queue-section-count">{filteredIgnored.length}</span>
+            </div>
+          ) : null}
+          {filteredIgnored.map((task) => (
+            <article className="reminder-card rejected-card ignored-card" key={task.id}>
+              <div className="task-meta">
+                <span className={`pill pill-${task.source.toLowerCase()}`}>{task.source}</span>
+                <span className="subtle-pill">Ignored</span>
+              </div>
+              <strong>{task.title}</strong>
+              <p className="muted">{task.decisionReason ?? "You chose to ignore this specific item."}</p>
+              <div className="reminder-footer">
+                <span className="small-text">Hidden {formatDateTime(task.updatedAt)}</span>
+                <div className="integration-actions">
+                  {task.sourceLink ? (
+                    <a className="ghost-button subtle-action" href={task.sourceLink} target="_blank" rel="noreferrer">
+                      Open source
+                    </a>
+                  ) : null}
+                  <button className="primary-button" onClick={() => void props.onRestore(task)}>
+                    Restore to plan
+                  </button>
+                </div>
+              </div>
+            </article>
+          ))}
         </div>
       </div>
     </section>
@@ -2072,6 +2593,445 @@ function SettingsView(props: {
   );
 }
 
+function InsightsView(props: {
+  loading: boolean;
+  overview: InsightsOverview | null;
+  todayInsights: InsightsTodayPayload | null;
+  profile: UserPriorityProfile | null;
+  personalizationInsights: PersonalizationInsight[];
+  historyDays: DayHistorySummary[];
+  selectedDay: string | null;
+  historyDetail: DayHistoryDetail | null;
+  diagnostics: { runs: PlannerRunDetail[]; diagnostics: DiagnosticsPayload } | null;
+  debugLogs: AuditEvent[];
+  selectedTaskInsights: TaskInsightsPayload | null;
+  onSelectDay: (dayKey: string) => Promise<void>;
+  onInspectTask: (task: Task) => Promise<void>;
+  onOpenTaskDetails: (task: Task) => Promise<void>;
+}) {
+  const todayKey = new Intl.DateTimeFormat("en-CA", {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit"
+  }).format(new Date());
+  const [activeTab, setActiveTab] = useState<"reasoning" | "metrics">("reasoning");
+  const [rangeStart, setRangeStart] = useState(todayKey);
+  const [rangeEnd, setRangeEnd] = useState(todayKey);
+
+  useEffect(() => {
+    const fallbackDay = props.selectedDay ?? props.historyDays[0]?.dayKey ?? todayKey;
+    setRangeStart((current) => current || fallbackDay);
+    setRangeEnd((current) => current || fallbackDay);
+  }, [props.historyDays, props.selectedDay, todayKey]);
+
+  const filteredHistoryDays = useMemo(() => {
+    const start = rangeStart || "0000-00-00";
+    const end = rangeEnd || "9999-99-99";
+    return props.historyDays.filter((day) => day.dayKey >= start && day.dayKey <= end);
+  }, [props.historyDays, rangeStart, rangeEnd]);
+
+  const rangeMetrics = useMemo(() => {
+    const days = filteredHistoryDays;
+    const average = (values: number[]) =>
+      values.length ? values.reduce((sum, value) => sum + value, 0) / values.length : null;
+    const plannedTaskCount = days.reduce((sum, day) => sum + day.plannedTaskCount, 0);
+    const completedTaskCount = days.reduce((sum, day) => sum + day.completedTaskCount, 0);
+    const plannedTaskMinutes = days.reduce((sum, day) => sum + day.plannedTaskMinutes, 0);
+    const completedTaskMinutes = days.reduce((sum, day) => sum + day.completedTaskMinutes, 0);
+    const scheduledMeetingCount = days.reduce((sum, day) => sum + day.scheduledMeetingCount, 0);
+    const scheduledMeetingMinutes = days.reduce((sum, day) => sum + day.scheduledMeetingMinutes, 0);
+    const spilloverCount = days.reduce((sum, day) => sum + day.spilloverTaskCount, 0);
+    const deferredCount = days.reduce((sum, day) => sum + day.deferredTaskCount, 0);
+    const rejectedCount = days.reduce((sum, day) => sum + day.rejectedTaskCount, 0);
+    const restoredCount = days.reduce((sum, day) => sum + day.restoredTaskCount, 0);
+    const completionPercent = plannedTaskMinutes > 0 ? Math.round((completedTaskMinutes / plannedTaskMinutes) * 100) : null;
+    const agreementPercent = average(days.map((day) => day.agreementPercent).filter((value): value is number => value !== null));
+
+    return {
+      dayCount: days.length,
+      plannedTaskCount,
+      completedTaskCount,
+      plannedTaskMinutes,
+      completedTaskMinutes,
+      scheduledMeetingCount,
+      scheduledMeetingMinutes,
+      spilloverCount,
+      deferredCount,
+      rejectedCount,
+      restoredCount,
+      completionPercent,
+      agreementPercent: agreementPercent === null ? null : Math.round(agreementPercent),
+      userUpdateCount: deferredCount + rejectedCount + restoredCount
+    };
+  }, [filteredHistoryDays]);
+
+  return (
+    <section className="panel-stack">
+      <div className="hero-card settings-hero">
+        <div className="hero-copy">
+          <p className="eyebrow">Insights</p>
+          <h2>Transparent planning and measurable execution.</h2>
+          <p className="muted">
+            Inspect why today&apos;s plan was built the way it was, then switch to metrics to review task completion, agreement, and plan quality over time.
+          </p>
+        </div>
+      </div>
+
+      <div className="insights-tab-bar">
+        <button
+          className={activeTab === "reasoning" ? "insights-tab-button active" : "insights-tab-button"}
+          onClick={() => setActiveTab("reasoning")}
+        >
+          Today&apos;s Plan Reasoning
+        </button>
+        <button
+          className={activeTab === "metrics" ? "insights-tab-button active" : "insights-tab-button"}
+          onClick={() => setActiveTab("metrics")}
+        >
+          Metrics & User Updates
+        </button>
+      </div>
+
+      {activeTab === "reasoning" ? (
+        <div className="dashboard-grid insights-grid">
+          <div className="panel">
+            <div className="panel-header">
+              <div>
+                <h3>Today&apos;s Plan Reasoning</h3>
+                <p className="timeline-header-note">
+                  Why each task is in today&apos;s plan, why it holds its current priority, and how your previous behavior influenced it.
+                </p>
+              </div>
+              <span>{props.todayInsights?.generatedAt ? formatDateTime(props.todayInsights.generatedAt) : "No run yet"}</span>
+            </div>
+            <div className="detail-list insights-task-list">
+              {(props.todayInsights?.tasks ?? []).map((item) => (
+                <article className="detail-row insight-card" key={item.task.id}>
+                  <div className="insight-card-top">
+                    <div className="task-meta">
+                      <span className={`pill pill-${item.task.source.toLowerCase()}`}>{item.task.source}</span>
+                      <span className={`subtle-pill status-${taskStatusClassName(item.task.status)}`}>{taskStatusLabel(item.task.status)}</span>
+                      <span className={`priority-pill priority-pill-${item.task.priority.toLowerCase()}`}>{item.task.priority}</span>
+                    </div>
+                    <div className="integration-actions">
+                      <button className="ghost-button subtle-action" onClick={() => void props.onInspectTask(item.task)}>
+                        Inspect reasoning
+                      </button>
+                      <button className="ghost-button subtle-action" onClick={() => void props.onOpenTaskDetails(item.task)}>
+                        View task
+                      </button>
+                    </div>
+                  </div>
+                  <strong>{item.task.title}</strong>
+                  {item.planBlockTitle ? <p className="muted">Scheduled block: {item.planBlockTitle}</p> : null}
+                  <div className="insights-reason-grid">
+                    <div className="field-card compact-card">
+                      <span>Why today</span>
+                      <p>{item.whyToday}</p>
+                    </div>
+                    <div className="field-card compact-card">
+                      <span>Why this priority</span>
+                      <p>{item.whyPriority}</p>
+                    </div>
+                    {item.whyNotHigher ? (
+                      <div className="field-card compact-card">
+                        <span>Why not higher</span>
+                        <p>{item.whyNotHigher}</p>
+                      </div>
+                    ) : null}
+                    {item.whyNotSelected ? (
+                      <div className="field-card compact-card">
+                        <span>Why not selected today</span>
+                        <p>{item.whyNotSelected}</p>
+                      </div>
+                    ) : null}
+                  </div>
+                  {item.task.scoreBreakdown?.length ? (
+                    <div className="task-link-row">
+                      {item.task.scoreBreakdown.map((part) => (
+                        <span className="subtle-pill" key={`${item.task.id}-${part.key}`}>
+                          {part.label}: {part.value > 0 ? `+${part.value}` : part.value}
+                        </span>
+                      ))}
+                    </div>
+                  ) : null}
+                  {item.task.historySignals?.length ? (
+                    <p className="muted small-text">History signals: {item.task.historySignals.join(" • ")}</p>
+                  ) : null}
+                </article>
+              ))}
+              {!props.todayInsights?.tasks.length ? <p className="empty-state">Run the planner once to populate detailed reasoning.</p> : null}
+            </div>
+          </div>
+
+          <div className="panel">
+            <div className="panel-header">
+              <div>
+                <h3>Planner Context</h3>
+                <p className="timeline-header-note">The user preferences and learned patterns shaping today&apos;s plan.</p>
+              </div>
+            </div>
+            <div className="detail-list">
+              <article className="detail-row">
+                <strong>Role focus</strong>
+                <span>{props.profile?.roleFocus ?? "Not set"}</span>
+              </article>
+              <article className="detail-row">
+                <strong>Filtering style</strong>
+                <span>{props.profile?.filteringStyle ?? "balanced"}</span>
+              </article>
+              <article className="detail-row">
+                <strong>Priority bias</strong>
+                <span>{props.profile?.priorityBias ?? "balanced"}</span>
+              </article>
+            </div>
+            <div className="insights-preference-grid">
+              <div className="field-card compact-card">
+                <span>Always prioritize</span>
+                <p>{props.profile?.mustNotMiss?.length ? props.profile.mustNotMiss.join(", ") : "No explicit must-not-miss rules yet."}</p>
+              </div>
+              <div className="field-card compact-card">
+                <span>Focus areas</span>
+                <p>{props.profile?.importantWork?.length ? props.profile.importantWork.join(", ") : "No focus areas saved yet."}</p>
+              </div>
+              <div className="field-card compact-card">
+                <span>Priority people & projects</span>
+                <p>
+                  {[...(props.profile?.importantPeople ?? []), ...(props.profile?.importantProjects ?? [])].length
+                    ? [...(props.profile?.importantPeople ?? []), ...(props.profile?.importantProjects ?? [])].join(", ")
+                    : "No people or project boosts set yet."}
+                </p>
+              </div>
+              <div className="field-card compact-card">
+                <span>Common ignore patterns</span>
+                <p>{props.profile?.noiseWork?.length ? props.profile.noiseWork.join(", ") : "No ignore patterns saved yet."}</p>
+              </div>
+            </div>
+            <div className="detail-list">
+              {(props.personalizationInsights.length ? props.personalizationInsights : props.overview?.topInsights ?? []).map((insight, index) => (
+                <article className="detail-row" key={`${insight.statement}-${index}`}>
+                  <strong>{insight.statement}</strong>
+                  <span className="subtle-pill">{Math.round(insight.confidence * 100)}%</span>
+                </article>
+              ))}
+            </div>
+            {props.selectedTaskInsights ? (
+              <div className="insight-detail-panel">
+                <div className="panel-header">
+                  <div>
+                    <h3>Task Inspection</h3>
+                    <p className="timeline-header-note">{props.selectedTaskInsights.task.title}</p>
+                  </div>
+                </div>
+                <div className="insights-reason-grid">
+                  <div className="field-card compact-card">
+                    <span>Selection reason</span>
+                    <p>{props.selectedTaskInsights.reasoning.selectionReason ?? "No selection reason recorded."}</p>
+                  </div>
+                  <div className="field-card compact-card">
+                    <span>Priority reason</span>
+                    <p>{props.selectedTaskInsights.reasoning.priorityReason ?? "No priority reason recorded."}</p>
+                  </div>
+                </div>
+                {props.selectedTaskInsights.reasoning.scoreBreakdown?.length ? (
+                  <div className="task-link-row">
+                    {props.selectedTaskInsights.reasoning.scoreBreakdown.map((part) => (
+                      <span className="subtle-pill" key={part.key}>
+                        {part.label}: {part.value > 0 ? `+${part.value}` : part.value}
+                      </span>
+                    ))}
+                  </div>
+                ) : null}
+                {props.selectedTaskInsights.reasoning.historySignals?.length ? (
+                  <p className="muted small-text">
+                    History signals: {props.selectedTaskInsights.reasoning.historySignals.join(" • ")}
+                  </p>
+                ) : null}
+                <div className="detail-list">
+                  {props.selectedTaskInsights.recentEvents.slice(0, 8).map((event) => (
+                    <article className="detail-row" key={event.id}>
+                      <strong>{event.eventType.replace(/_/g, " ")}</strong>
+                      <span>{formatDateTime(event.createdAt)}</span>
+                    </article>
+                  ))}
+                </div>
+              </div>
+            ) : null}
+          </div>
+        </div>
+      ) : (
+        <div className="panel-stack">
+          <div className="panel">
+            <div className="panel-header">
+              <div>
+                <h3>Metrics & User Updates</h3>
+                <p className="timeline-header-note">
+                  Review task completion, plan success ratio, agreement percentage, meeting load, and user corrections across any day range.
+                </p>
+              </div>
+            </div>
+            <div className="metrics-range-bar">
+              <label className="field-card compact-card">
+                <span>From</span>
+                <input type="date" value={rangeStart} max={rangeEnd} onChange={(event) => setRangeStart(event.target.value)} />
+              </label>
+              <label className="field-card compact-card">
+                <span>To</span>
+                <input type="date" value={rangeEnd} min={rangeStart} onChange={(event) => setRangeEnd(event.target.value)} />
+              </label>
+              <div className="integration-actions">
+                <button
+                  className="ghost-button subtle-action"
+                  onClick={() => {
+                    setRangeStart(todayKey);
+                    setRangeEnd(todayKey);
+                  }}
+                >
+                  Today
+                </button>
+                <button
+                  className="ghost-button subtle-action"
+                  onClick={() => {
+                    const sevenDays = props.historyDays.slice(0, 7);
+                    if (!sevenDays.length) return;
+                    setRangeStart(sevenDays[sevenDays.length - 1].dayKey);
+                    setRangeEnd(sevenDays[0].dayKey);
+                  }}
+                >
+                  Last 7 days
+                </button>
+                <button
+                  className="ghost-button subtle-action"
+                  onClick={() => {
+                    if (!props.historyDays.length) return;
+                    setRangeStart(props.historyDays[props.historyDays.length - 1].dayKey);
+                    setRangeEnd(props.historyDays[0].dayKey);
+                  }}
+                >
+                  All history
+                </button>
+              </div>
+            </div>
+            <div className="overview-strip">
+              <div className="overview-card">
+                <span>Plan success ratio</span>
+                <strong>{formatPercentValue(rangeMetrics.completionPercent)}</strong>
+                <p>{rangeMetrics.completedTaskCount} completed out of {rangeMetrics.plannedTaskCount} planned tasks</p>
+              </div>
+              <div className="overview-card">
+                <span>Plan agreement</span>
+                <strong>{formatPercentValue(rangeMetrics.agreementPercent)}</strong>
+                <p>Average agreement across {rangeMetrics.dayCount} day{rangeMetrics.dayCount === 1 ? "" : "s"}</p>
+              </div>
+              <div className="overview-card">
+                <span>Task effort</span>
+                <strong>{formatMinutesAsHours(rangeMetrics.completedTaskMinutes)}</strong>
+                <p>{formatMinutesAsHours(rangeMetrics.plannedTaskMinutes)} planned across the selected range</p>
+              </div>
+              <div className="overview-card">
+                <span>User updates</span>
+                <strong>{rangeMetrics.userUpdateCount}</strong>
+                <p>{rangeMetrics.deferredCount} deferred • {rangeMetrics.rejectedCount} rejected • {rangeMetrics.restoredCount} restored</p>
+              </div>
+              <div className="overview-card">
+                <span>Meetings scheduled</span>
+                <strong>{rangeMetrics.scheduledMeetingCount}</strong>
+                <p>{formatMinutesAsHours(rangeMetrics.scheduledMeetingMinutes)} scheduled meeting time</p>
+              </div>
+              <div className="overview-card">
+                <span>Spillovers</span>
+                <strong>{rangeMetrics.spilloverCount}</strong>
+                <p>Tasks that could not fit cleanly into the selected plans</p>
+              </div>
+            </div>
+          </div>
+
+          <div className="dashboard-grid insights-grid">
+            <div className="panel">
+              <div className="panel-header">
+                <div>
+                  <h3>Daily Metrics</h3>
+                  <p className="timeline-header-note">Select a day in the chosen range to inspect its detailed plan and user actions.</p>
+                </div>
+              </div>
+              <div className="history-day-list history-day-list-wide">
+                {filteredHistoryDays.map((day) => (
+                  <button
+                    key={day.dayKey}
+                    className={props.selectedDay === day.dayKey ? "history-day-card active" : "history-day-card"}
+                    onClick={() => void props.onSelectDay(day.dayKey)}
+                  >
+                    <strong>{formatDate(day.dayKey)}</strong>
+                    <span>{day.plannedTaskCount} planned • {day.completedTaskCount} completed</span>
+                    <span>{formatPercentValue(day.agreementPercent)} agreement • {formatPercentValue(day.completionPercent)} success</span>
+                  </button>
+                ))}
+                {!filteredHistoryDays.length ? <p className="empty-state">No history exists for the selected date range yet.</p> : null}
+              </div>
+            </div>
+
+            <div className="panel">
+              <div className="panel-header">
+                <div>
+                  <h3>Selected Day Detail</h3>
+                  <p className="timeline-header-note">Detailed plan and change activity for the currently selected day.</p>
+                </div>
+              </div>
+              {props.historyDetail ? (
+                <>
+                  <div className="overview-strip history-overview">
+                    <div className="overview-card">
+                      <span>Planned vs completed</span>
+                      <strong>
+                        {props.historyDetail.summary.plannedTaskCount} / {props.historyDetail.summary.completedTaskCount}
+                      </strong>
+                      <p>{formatMinutesAsHours(props.historyDetail.summary.plannedTaskMinutes)} planned • {formatMinutesAsHours(props.historyDetail.summary.completedTaskMinutes)} completed</p>
+                    </div>
+                    <div className="overview-card">
+                      <span>Agreement</span>
+                      <strong>{formatPercentValue(props.historyDetail.summary.agreementPercent)}</strong>
+                      <p>{props.historyDetail.summary.rejectedTaskCount} rejected • {props.historyDetail.summary.restoredTaskCount} restored</p>
+                    </div>
+                    <div className="overview-card">
+                      <span>Meetings</span>
+                      <strong>{props.historyDetail.summary.scheduledMeetingCount}</strong>
+                      <p>{formatMinutesAsHours(props.historyDetail.summary.scheduledMeetingMinutes)} scheduled</p>
+                    </div>
+                  </div>
+                  <div className="field-card compact-card">
+                    <span>Planner guidance</span>
+                    <p>{props.historyDetail.summary.guidance}</p>
+                  </div>
+                  <div className="detail-list">
+                    {props.historyDetail.plannedTasks.map((task, index) => (
+                      <article className="detail-row" key={`${task.title}-${index}`}>
+                        <strong>{task.title}</strong>
+                        <span>
+                          {task.priority ?? "—"} • {task.minutes} min • {task.status}
+                        </span>
+                      </article>
+                    ))}
+                  </div>
+                  <div className="detail-list">
+                    {props.historyDetail.changeEvents.slice(0, 12).map((event) => (
+                      <article className="detail-row" key={event.id}>
+                        <strong>{event.eventType.replace(/_/g, " ")}</strong>
+                        <span>{formatDateTime(event.createdAt)}</span>
+                      </article>
+                    ))}
+                  </div>
+                </>
+              ) : (
+                <p className="empty-state">Select a day to inspect its detailed planning and user updates.</p>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+    </section>
+  );
+}
+
 function replaceTaskInGroups(data: TodayResponse | null, taskId: number, updater: (task: Task) => Task) {
   if (!data) return data;
   const nextTasks = Object.fromEntries(
@@ -2119,10 +3079,19 @@ export function App() {
   const [allTasks, setAllTasks] = useState<Task[]>([]);
   const [deferredTasks, setDeferredTasks] = useState<Task[]>([]);
   const [rejectedTasks, setRejectedTasks] = useState<RejectedTask[]>([]);
+  const [ignoredRejectedTasks, setIgnoredRejectedTasks] = useState<RejectedTask[]>([]);
   const [reminders, setReminders] = useState<Reminder[]>([]);
   const [automation, setAutomation] = useState<AutomationSettings | null>(null);
   const [profile, setProfile] = useState<UserPriorityProfile | null>(null);
   const [insights, setInsights] = useState<PersonalizationInsight[]>([]);
+  const [insightsOverview, setInsightsOverview] = useState<InsightsOverview | null>(null);
+  const [insightsToday, setInsightsToday] = useState<InsightsTodayPayload | null>(null);
+  const [historyDays, setHistoryDays] = useState<DayHistorySummary[]>([]);
+  const [selectedHistoryDay, setSelectedHistoryDay] = useState<string | null>(null);
+  const [historyDetail, setHistoryDetail] = useState<DayHistoryDetail | null>(null);
+  const [taskInsights, setTaskInsights] = useState<TaskInsightsPayload | null>(null);
+  const [diagnostics, setDiagnostics] = useState<{ runs: PlannerRunDetail[]; diagnostics: DiagnosticsPayload } | null>(null);
+  const [debugLogs, setDebugLogs] = useState<AuditEvent[]>([]);
   const [taskFilter, setTaskFilter] = useState<TaskFilter>("All");
   const [integrations, setIntegrations] = useState<{ microsoft: IntegrationStatus; jira: IntegrationStatus } | null>(
     null
@@ -2133,6 +3102,7 @@ export function App() {
     deferred: false,
     rejected: false,
     reminders: false,
+    insights: false,
     settings: false
   });
   const [loadedViews, setLoadedViews] = useState<Record<View, boolean>>({
@@ -2141,6 +3111,7 @@ export function App() {
     deferred: false,
     rejected: false,
     reminders: false,
+    insights: false,
     settings: false
   });
   const [loading, setLoading] = useState(false);
@@ -2155,6 +3126,16 @@ export function App() {
   const [detailData, setDetailData] = useState<TaskDetail | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
   const [detailError, setDetailError] = useState<string | null>(null);
+  const [jiraTransitionIssueKey, setJiraTransitionIssueKey] = useState<string | null>(null);
+  const [emailDraftInput, setEmailDraftInput] = useState("");
+  const [emailDraft, setEmailDraft] = useState<EmailReplyDraft | null>(null);
+  const [emailDraftLoading, setEmailDraftLoading] = useState(false);
+  const [emailSendStatus, setEmailSendStatus] = useState<string | null>(null);
+  const [meetingPrepMeeting, setMeetingPrepMeeting] = useState<Meeting | null>(null);
+  const [meetingPrepInput, setMeetingPrepInput] = useState("");
+  const [meetingPrep, setMeetingPrep] = useState<MeetingPrep | null>(null);
+  const [meetingPrepLoading, setMeetingPrepLoading] = useState(false);
+  const [meetingPrepStatus, setMeetingPrepStatus] = useState<string | null>(null);
 
   async function getMicrosoftSessionToken() {
     const account = getMicrosoftAccount();
@@ -2191,6 +3172,7 @@ export function App() {
       setProfile(profileData.profile);
       setInsights(insightsData.insights);
       setRejectedTasks(rejectedData.tasks);
+      setIgnoredRejectedTasks(rejectedData.ignoredTasks);
       setLoadedViews((current) => ({ ...current, today: true }));
     } finally {
       setPageLoading((current) => ({ ...current, today: false }));
@@ -2224,6 +3206,7 @@ export function App() {
     try {
       const response = await api.getRejectedTasks();
       setRejectedTasks(response.tasks);
+      setIgnoredRejectedTasks(response.ignoredTasks);
       setLoadedViews((current) => ({ ...current, rejected: true }));
     } finally {
       setPageLoading((current) => ({ ...current, rejected: false }));
@@ -2264,8 +3247,80 @@ export function App() {
     }
   }
 
+  async function loadInsightsPage(preferredDayKey?: string | null) {
+    setPageLoading((current) => ({ ...current, insights: true }));
+    try {
+      const [overviewData, todayData, historyData, runsData, logsData] = await Promise.all([
+        api.getInsightsOverview(),
+        api.getInsightsToday(),
+        api.getInsightsHistory(),
+        api.getDebugRuns(),
+        api.getDebugLogs()
+      ]);
+      setInsightsOverview(overviewData);
+      setInsightsToday(todayData);
+      setHistoryDays(historyData.days);
+      setDiagnostics(runsData);
+      setDebugLogs(logsData.logs);
+      const nextSelectedDay = preferredDayKey ?? selectedHistoryDay ?? historyData.days[0]?.dayKey ?? null;
+      setSelectedHistoryDay(nextSelectedDay);
+      if (nextSelectedDay) {
+        setHistoryDetail(await api.getInsightsHistoryDay(nextSelectedDay));
+      } else {
+        setHistoryDetail(null);
+      }
+      setLoadedViews((current) => ({ ...current, insights: true }));
+    } finally {
+      setPageLoading((current) => ({ ...current, insights: false }));
+    }
+  }
+
   useEffect(() => {
     void loadTodayPage();
+  }, []);
+
+  useEffect(() => {
+    void logClientEventSafe({
+      eventType: "ui.page_view",
+      status: "info",
+      message: `Opened ${view} view.`,
+      entityType: "view",
+      entityId: view
+    });
+  }, [view]);
+
+  useEffect(() => {
+    const handleError = (event: ErrorEvent) => {
+      void logClientEventSafe({
+        eventType: "ui.error",
+        level: "error",
+        status: "failure",
+        message: event.message || "Unhandled client error",
+        entityType: "window",
+        metadata: {
+          filename: event.filename,
+          lineno: event.lineno,
+          colno: event.colno
+        }
+      });
+    };
+
+    const handleRejection = (event: PromiseRejectionEvent) => {
+      void logClientEventSafe({
+        eventType: "ui.unhandled_rejection",
+        level: "error",
+        status: "failure",
+        message:
+          event.reason instanceof Error ? event.reason.message : typeof event.reason === "string" ? event.reason : "Unhandled promise rejection"
+      });
+    };
+
+    window.addEventListener("error", handleError);
+    window.addEventListener("unhandledrejection", handleRejection);
+    return () => {
+      window.removeEventListener("error", handleError);
+      window.removeEventListener("unhandledrejection", handleRejection);
+    };
   }, []);
 
   useEffect(() => {
@@ -2286,6 +3341,9 @@ export function App() {
     }
     if (view === "rejected" && !loadedViews.rejected && !pageLoading.rejected) {
       void loadRejectedPage();
+    }
+    if (view === "insights" && !loadedViews.insights && !pageLoading.insights) {
+      void loadInsightsPage();
     }
   }, [view, loadedViews, pageLoading]);
 
@@ -2316,6 +3374,10 @@ export function App() {
     setProfile(profileData.profile);
     setInsights(insightsData.insights);
     setRejectedTasks(rejectedData.tasks);
+    setIgnoredRejectedTasks(rejectedData.ignoredTasks);
+    if (loadedViews.insights) {
+      await loadInsightsPage(selectedHistoryDay);
+    }
   }
 
   async function refreshTasksPage() {
@@ -2324,6 +3386,13 @@ export function App() {
   }
 
   async function handleTaskStatusChange(task: Task, status: TaskStatus) {
+    void logClientEventSafe({
+      eventType: "ui.task_status_change",
+      status: "started",
+      message: `Updating task status to ${status}`,
+      entityType: "task",
+      entityId: String(task.id)
+    });
     const originalStatus = task.status;
     setAllTasks((current) => current.map((item) => (item.id === task.id ? { ...item, status } : item)));
     setToday((current) => replaceTaskInGroups(current, task.id, (item) => ({ ...item, status })));
@@ -2334,6 +3403,14 @@ export function App() {
       setToday((current) => replaceTaskInGroups(current, task.id, () => response.task));
     } catch (error) {
       console.error(error);
+      void logClientEventSafe({
+        eventType: "ui.task_status_change",
+        level: "error",
+        status: "failure",
+        message: error instanceof Error ? error.message : "Failed to update task status",
+        entityType: "task",
+        entityId: String(task.id)
+      });
       setAllTasks((current) =>
         current.map((item) => (item.id === task.id ? { ...item, status: originalStatus } : item))
       );
@@ -2343,6 +3420,13 @@ export function App() {
 
   async function handleTaskPriorityChange(task: Task, priority: TaskPriority) {
     if (task.priority === priority) return;
+    void logClientEventSafe({
+      eventType: "ui.task_priority_change",
+      status: "started",
+      message: `Updating task priority to ${priority}`,
+      entityType: "task",
+      entityId: String(task.id)
+    });
 
     const originalPriority = task.priority;
     const optimisticTask = { ...task, priority, updatedAt: new Date().toISOString() };
@@ -2382,6 +3466,14 @@ export function App() {
       );
     } catch (error) {
       console.error(error);
+      void logClientEventSafe({
+        eventType: "ui.task_priority_change",
+        level: "error",
+        status: "failure",
+        message: error instanceof Error ? error.message : "Failed to update task priority",
+        entityType: "task",
+        entityId: String(task.id)
+      });
       setAllTasks((current) =>
         replaceTaskInList(current, task.id, (item) => ({ ...item, priority: originalPriority }))
       );
@@ -2403,10 +3495,20 @@ export function App() {
   }
 
   async function openTaskDetails(task: Task) {
+    void logClientEventSafe({
+      eventType: "ui.task_details_open",
+      status: "started",
+      message: `Opening details for ${task.title}`,
+      entityType: "task",
+      entityId: String(task.id)
+    });
     setDetailTask(task);
     setDetailLoading(true);
     setDetailError(null);
     setDetailData(null);
+    setEmailDraftInput("");
+    setEmailDraft(null);
+    setEmailSendStatus(null);
 
     try {
       const microsoftAccessToken = task.source === "Email" ? await getMicrosoftSessionToken() : null;
@@ -2417,12 +3519,151 @@ export function App() {
       setDetailData(response.detail);
     } catch (error) {
       setDetailError(error instanceof Error ? error.message : "Failed to load task details");
+      void logClientEventSafe({
+        eventType: "ui.task_details_open",
+        level: "error",
+        status: "failure",
+        message: error instanceof Error ? error.message : "Failed to load task details",
+        entityType: "task",
+        entityId: String(task.id)
+      });
     } finally {
       setDetailLoading(false);
     }
   }
 
+  async function handleGenerateEmailDraft() {
+    if (!detailTask || detailTask.source !== "Email") return;
+    setEmailDraftLoading(true);
+    setEmailSendStatus(null);
+    try {
+      const microsoftAccessToken = await getMicrosoftSessionToken();
+      if (!microsoftAccessToken) {
+        throw new Error("Microsoft is not connected for this browser session.");
+      }
+      const response = await api.generateEmailReplyDraftWithMicrosoftSession(detailTask.id, microsoftAccessToken, {
+        userIntent: emailDraftInput.trim() || null
+      });
+      setEmailDraft(response.draft);
+    } catch (error) {
+      setEmailSendStatus(error instanceof Error ? error.message : "Failed to generate reply draft");
+    } finally {
+      setEmailDraftLoading(false);
+    }
+  }
+
+  async function handleCopyEmailDraft() {
+    if (!detailTask || detailTask.source !== "Email" || !emailDraft) return;
+    try {
+      const draftText = [
+        `To: ${emailDraft.to.join(", ") || "—"}`,
+        `CC: ${emailDraft.cc.join(", ") || "—"}`,
+        `Subject: ${emailDraft.subject}`,
+        "",
+        emailDraft.body
+      ].join("\n");
+      await navigator.clipboard.writeText(draftText);
+      setEmailSendStatus("Draft copied. Paste it into your email client.");
+    } catch (error) {
+      setEmailSendStatus(error instanceof Error ? error.message : "Failed to copy draft");
+    }
+  }
+
+  async function handleGenerateMeetingPrep() {
+    if (!meetingPrepMeeting) return;
+    setMeetingPrepLoading(true);
+    setMeetingPrepStatus(null);
+    try {
+      const microsoftAccessToken = await getMicrosoftSessionToken();
+      if (!microsoftAccessToken) {
+        throw new Error("Microsoft is not connected for this browser session.");
+      }
+      const response = await api.generateMeetingPrepWithMicrosoftSession(meetingPrepMeeting.id, microsoftAccessToken, {
+        userNotes: meetingPrepInput.trim() || null
+      });
+      setMeetingPrep(response.prep);
+      setMeetingPrepStatus("Meeting preparation is ready.");
+    } catch (error) {
+      setMeetingPrepStatus(error instanceof Error ? error.message : "Failed to prepare for meeting");
+    } finally {
+      setMeetingPrepLoading(false);
+    }
+  }
+
+  async function handleJiraIssueTransition(issueKey: string, transitionId: string) {
+    if (!detailTask) return;
+    setJiraTransitionIssueKey(issueKey);
+    setDetailError(null);
+    try {
+      const response = await api.transitionJiraIssue(issueKey, {
+        transitionId,
+        parentTaskId: detailTask.source === "Jira" ? detailTask.id : undefined
+      });
+      setDetailData(response.detail);
+      if (response.task) {
+        setAllTasks((current) => replaceTaskInList(current, response.task!.id, () => response.task!));
+        setDeferredTasks((current) => replaceTaskInList(current, response.task!.id, () => response.task!));
+        setToday((current) =>
+          current
+            ? {
+                ...current,
+                tasks: groupTasksByPriority(
+                  replaceTaskInList(
+                    [...current.tasks.High, ...current.tasks.Medium, ...current.tasks.Low],
+                    response.task!.id,
+                    () => response.task!
+                  )
+                )
+              }
+            : current
+        );
+        if (detailTask.id === response.task.id) {
+          setDetailTask(response.task);
+        }
+      } else if (detailTask.source === "Jira" && detailTask.sourceRef === issueKey) {
+        await openTaskDetails(detailTask);
+      } else if (detailTask.source === "Jira") {
+        const refreshed = await api.getTaskDetails(detailTask.id);
+        setDetailData(refreshed.detail);
+      }
+      await refreshTodayAndIntegrations();
+    } catch (error) {
+      setDetailError(error instanceof Error ? error.message : "Failed to update Jira status");
+    } finally {
+      setJiraTransitionIssueKey(null);
+    }
+  }
+
+  async function openTaskInsights(task: Task) {
+    void logClientEventSafe({
+      eventType: "ui.task_insights_open",
+      status: "started",
+      message: `Inspecting reasoning for ${task.title}`,
+      entityType: "task",
+      entityId: String(task.id)
+    });
+    try {
+      const response = await api.getTaskInsights(task.id);
+      setTaskInsights(response);
+    } catch (error) {
+      void logClientEventSafe({
+        eventType: "ui.task_insights_open",
+        level: "error",
+        status: "failure",
+        message: error instanceof Error ? error.message : "Failed to inspect task reasoning",
+        entityType: "task",
+        entityId: String(task.id)
+      });
+    }
+  }
+
   async function handleGeneratePlan() {
+    void logClientEventSafe({
+      eventType: "ui.plan_generate",
+      status: "started",
+      message: "Generating full plan from UI.",
+      entityType: "planner"
+    });
     setLoading(true);
     try {
       const microsoftAccessToken = await getMicrosoftSessionToken();
@@ -2435,12 +3676,21 @@ export function App() {
       await loadDeferredPage();
       await loadRemindersPage();
       await loadSettingsPage();
+      if (loadedViews.insights) {
+        await loadInsightsPage(selectedHistoryDay);
+      }
     } finally {
       setLoading(false);
     }
   }
 
   async function handleSyncMeetings() {
+    void logClientEventSafe({
+      eventType: "ui.sync_meetings",
+      status: "started",
+      message: "Meeting sync triggered from UI.",
+      entityType: "meeting"
+    });
     setSyncMeetingsLoading(true);
     try {
       const microsoftAccessToken = await getMicrosoftSessionToken();
@@ -2455,6 +3705,12 @@ export function App() {
   }
 
   async function handleSyncTasks() {
+    void logClientEventSafe({
+      eventType: "ui.sync_tasks",
+      status: "started",
+      message: "Task sync triggered from UI.",
+      entityType: "task"
+    });
     setSyncTasksLoading(true);
     try {
       const microsoftAccessToken = await getMicrosoftSessionToken();
@@ -2467,8 +3723,34 @@ export function App() {
       await loadDeferredPage();
       await loadRemindersPage();
       await loadSettingsPage();
+      if (loadedViews.insights) {
+        await loadInsightsPage(selectedHistoryDay);
+      }
     } finally {
       setSyncTasksLoading(false);
+    }
+  }
+
+  async function handleSelectHistoryDay(dayKey: string) {
+    setSelectedHistoryDay(dayKey);
+    try {
+      setHistoryDetail(await api.getInsightsHistoryDay(dayKey));
+      void logClientEventSafe({
+        eventType: "ui.history_day_open",
+        status: "info",
+        message: `Opened history for ${dayKey}`,
+        entityType: "history",
+        entityId: dayKey
+      });
+    } catch (error) {
+      void logClientEventSafe({
+        eventType: "ui.history_day_open",
+        level: "error",
+        status: "failure",
+        message: error instanceof Error ? error.message : "Failed to load day history",
+        entityType: "history",
+        entityId: dayKey
+      });
     }
   }
 
@@ -2492,6 +3774,12 @@ export function App() {
                 onTaskStatusChange={handleTaskStatusChange}
                 onTaskPriorityChange={handleTaskPriorityChange}
                 onOpenDetails={openTaskDetails}
+                onPrepareMeeting={(meeting) => {
+                  setMeetingPrepMeeting(meeting);
+                  setMeetingPrepInput("");
+                  setMeetingPrep(null);
+                  setMeetingPrepStatus(null);
+                }}
               />
             )
           ) : null}
@@ -2572,6 +3860,7 @@ export function App() {
             ) : (
               <RejectedView
                 tasks={rejectedTasks}
+                ignoredTasks={ignoredRejectedTasks}
                 loading={pageLoading.rejected}
                 onRestore={async (task) => {
                   const response = await api.restoreRejectedTask(task.id);
@@ -2579,19 +3868,28 @@ export function App() {
                     setAllTasks((current) => [response.task as Task, ...current.filter((item) => item.id !== response.task?.id)]);
                   }
                   setRejectedTasks((current) => current.filter((item) => item.id !== task.id));
+                  setIgnoredRejectedTasks((current) => current.filter((item) => item.id !== task.id));
+                  await refreshTodayAndIntegrations();
+                }}
+                onIgnoreThis={async (task) => {
+                  const response = await api.updateRejectedTask(task.id, { action: "always_ignore_exact" });
+                  setRejectedTasks((current) => current.filter((item) => item.id !== task.id));
+                  if (response.task) {
+                    setIgnoredRejectedTasks((current) => [
+                      response.task!,
+                      ...current.filter((item) => item.id !== response.task!.id)
+                    ]);
+                  }
                   await refreshTodayAndIntegrations();
                 }}
                 onAlwaysIgnore={async (task) => {
                   const response = await api.updateRejectedTask(task.id, { action: "always_ignore_similar" });
+                  setRejectedTasks((current) => current.filter((item) => item.id !== task.id));
                   if (response.task) {
-                    setRejectedTasks((current) => current.map((item) => (item.id === task.id ? response.task! : item)));
-                  }
-                  await refreshTodayAndIntegrations();
-                }}
-                onShouldInclude={async (task) => {
-                  const response = await api.updateRejectedTask(task.id, { action: "should_have_been_included" });
-                  if (response.task) {
-                    setRejectedTasks((current) => current.map((item) => (item.id === task.id ? response.task! : item)));
+                    setIgnoredRejectedTasks((current) => [
+                      response.task!,
+                      ...current.filter((item) => item.id !== response.task!.id)
+                    ]);
                   }
                   await refreshTodayAndIntegrations();
                 }}
@@ -2614,6 +3912,29 @@ export function App() {
                   const response = await api.updateReminder(reminder.id, { status: "active" });
                   setReminders((current) => current.map((item) => (item.id === reminder.id ? response.reminder : item)));
                 }}
+              />
+            )
+          ) : null}
+
+          {view === "insights" ? (
+            !loadedViews.insights ? (
+              <InsightsSkeleton />
+            ) : (
+              <InsightsView
+                loading={pageLoading.insights}
+                overview={insightsOverview}
+                todayInsights={insightsToday}
+                profile={profile}
+                personalizationInsights={insights}
+                historyDays={historyDays}
+                selectedDay={selectedHistoryDay}
+                historyDetail={historyDetail}
+                diagnostics={diagnostics}
+                debugLogs={debugLogs}
+                selectedTaskInsights={taskInsights}
+                onSelectDay={handleSelectHistoryDay}
+                onInspectTask={openTaskInsights}
+                onOpenTaskDetails={openTaskDetails}
               />
             )
           ) : null}
@@ -2740,10 +4061,39 @@ export function App() {
         detail={detailData}
         loading={detailLoading}
         error={detailError}
+        updatingIssueKey={jiraTransitionIssueKey}
+        onTransitionJiraIssue={handleJiraIssueTransition}
+        emailDraftInput={emailDraftInput}
+        emailDraft={emailDraft}
+        emailDraftLoading={emailDraftLoading}
+        emailSendStatus={emailSendStatus}
+        onEmailDraftInputChange={setEmailDraftInput}
+        onGenerateEmailDraft={handleGenerateEmailDraft}
+        onUpdateEmailDraft={(patch) => setEmailDraft((current) => (current ? { ...current, ...patch } : current))}
+        onCopyEmailDraft={handleCopyEmailDraft}
         onClose={() => {
           setDetailTask(null);
           setDetailData(null);
           setDetailError(null);
+          setJiraTransitionIssueKey(null);
+          setEmailDraftInput("");
+          setEmailDraft(null);
+          setEmailSendStatus(null);
+        }}
+      />
+      <MeetingPrepDialog
+        meeting={meetingPrepMeeting}
+        prep={meetingPrep}
+        input={meetingPrepInput}
+        loading={meetingPrepLoading}
+        status={meetingPrepStatus}
+        onInputChange={setMeetingPrepInput}
+        onGenerate={handleGenerateMeetingPrep}
+        onClose={() => {
+          setMeetingPrepMeeting(null);
+          setMeetingPrep(null);
+          setMeetingPrepInput("");
+          setMeetingPrepStatus(null);
         }}
       />
     </>

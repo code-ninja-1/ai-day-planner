@@ -11,7 +11,8 @@
     "dev:api": "npm run dev --workspace apps/api",
     "dev:web": "npm run dev --workspace apps/web",
     "build": "npm run build --workspace apps/api && npm run build --workspace apps/web",
-    "typecheck": "npm run typecheck --workspace apps/api && npm run typecheck --workspace apps/web"
+    "typecheck": "npm run typecheck --workspace apps/api && npm run typecheck --workspace apps/web",
+    "reset:soft": "npm run reset:soft --workspace apps/api",
+    "reset:hard": "npm run reset:hard --workspace apps/api"
   }
 }
-

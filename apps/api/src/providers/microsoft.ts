@@ -191,6 +191,9 @@ export interface GraphEvent {
     contentType?: string;
     content?: string;
   };
+  organizer?: { emailAddress?: { name?: string; address?: string } };
+  attendees?: Array<{ emailAddress?: { name?: string; address?: string } }>;
+  location?: { displayName?: string };
   isCancelled?: boolean;
 }
 
@@ -395,27 +398,45 @@ function formatAddress(entry?: { emailAddress?: { name?: string; address?: strin
     : (entry.emailAddress.address ?? null);
 }
 
+function normalizeMailRecipient(value: string) {
+  const trimmed = value.trim();
+  const match = trimmed.match(/<([^>]+)>/);
+  const address = (match?.[1] ?? trimmed).replace(/^mailto:/i, "").trim();
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(address) ? address : null;
+}
+
 function htmlToText(content?: string) {
   if (!content) return "";
-  return content
-    .replace(/<style[\s\S]*?<\/style>/gi, "")
-    .replace(/<script[\s\S]*?<\/script>/gi, "")
-    .replace(/<br\s*\/?>/gi, "\n")
-    .replace(/<\/p>/gi, "\n\n")
-    .replace(/<[^>]+>/g, "")
-    .replace(/&nbsp;/g, " ")
-    .replace(/&amp;/g, "&")
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
+  const text = decodeHtmlEntities(
+    content
+      .replace(/<!--[\s\S]*?-->/g, "")
+      .replace(/<head[\s\S]*?<\/head>/gi, "")
+      .replace(/<style[\s\S]*?<\/style>/gi, "")
+      .replace(/<script[\s\S]*?<\/script>/gi, "")
+      .replace(/<meta[^>]*>/gi, "")
+      .replace(/<title[\s\S]*?<\/title>/gi, "")
+      .replace(/<(div|p|li|tr|h\d)[^>]*>/gi, "\n")
+      .replace(/<br\s*\/?>/gi, "\n")
+      .replace(/<\/(div|p|li|tr|table|section|article|h\d)>/gi, "\n")
+      .replace(/<a [^>]*href=["']([^"']+)["'][^>]*>(.*?)<\/a>/gi, "$2")
+      .replace(/<[^>]+>/g, "")
+  );
+
+  return text
+    .split("\n")
+    .map((line) => line.replace(/\s+/g, " ").trim())
+    .filter((line) => line && !/^content-type:|^charset=|^font-family:|^color:|^http-equiv=|^<meta/i.test(line))
+    .join("\n")
+    .replace(/\n{3,}/g, "\n\n")
     .trim();
 }
 
 function bodyToText(mail: GraphMail) {
-  if (!mail.body?.content) return mail.bodyPreview ?? "";
+  if (!mail.body?.content) return htmlToText(mail.bodyPreview ?? "");
   if (mail.body.contentType?.toLowerCase() === "html") {
     return htmlToText(mail.body.content);
   }
-  return mail.body.content;
+  return htmlToText(mail.body.content);
 }
 
 export async function fetchEmailDetailWithAccessToken(
@@ -464,4 +485,66 @@ export async function fetchEmailDetailWithAccessToken(
       body: bodyToText(mail)
     }))
   };
+}
+
+export async function sendMailWithAccessToken(
+  accessToken: string,
+  input: {
+    subject: string;
+    body: string;
+    to: string[];
+    cc: string[];
+  }
+) {
+  const toRecipients = [...new Set(input.to.map((value) => normalizeMailRecipient(value)).filter(Boolean))];
+  const ccRecipients = [...new Set(input.cc.map((value) => normalizeMailRecipient(value)).filter(Boolean))];
+  if (!toRecipients.length) {
+    throw new Error("At least one valid To recipient is required before sending.");
+  }
+
+  const response = await fetch(`${GRAPH_ROOT}/me/sendMail`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      message: {
+        subject: input.subject,
+        body: {
+          contentType: "Text",
+          content: input.body
+        },
+        toRecipients: toRecipients.map((address) => ({
+          emailAddress: {
+            address
+          }
+        })),
+        ccRecipients: ccRecipients.map((address) => ({
+          emailAddress: {
+            address
+          }
+        }))
+      },
+      saveToSentItems: true
+    })
+  });
+
+  if (!response.ok) {
+    let details = "";
+    try {
+      details = await response.text();
+    } catch {
+      details = "";
+    }
+    throw new Error(details ? `Microsoft send mail failed: ${response.status} ${details}` : `Microsoft send mail failed: ${response.status}`);
+  }
+}
+
+export async function fetchMeetingDetailWithAccessToken(eventId: string, accessToken: string) {
+  const query = buildGraphPath(`/me/events/${encodeURIComponent(eventId)}`, {
+    $select:
+      "id,subject,start,end,bodyPreview,body,webLink,onlineMeeting,onlineMeetingUrl,organizer,attendees,location,isCancelled"
+  });
+  return graphWithAccessToken<GraphEvent>(query, accessToken);
 }

@@ -24,6 +24,7 @@ import {
   saveAutomationSettings,
   savePreferenceMemorySnapshot,
   setSyncState,
+  upsertPlannerRunDetail,
   upsertDailyPlanSnapshot,
   updateRejectedTask,
   updateTask,
@@ -35,7 +36,8 @@ import {
   buildJiraIssueBrowseUrl,
   fetchJiraIssuePlanningContext,
   fetchOpenAssignedIssues,
-  getMappedJiraPriority
+  getMappedJiraPriority,
+  mapJiraWorkflowStatus
 } from "../providers/jira.js";
 import {
   fetchRecentEmails,
@@ -49,6 +51,7 @@ import {
   distillPreferenceMemory,
   evaluateCandidateWithPersonalization
 } from "./personalization.js";
+import { createCorrelationId, logEvent } from "./logger.js";
 import type { GraphEvent, GraphMail } from "../providers/microsoft.js";
 import type {
   DayPlan,
@@ -56,6 +59,7 @@ import type {
   ReminderKind,
   RejectedTask,
   ReasonTag,
+  PlannerRunDetail,
   Task,
   TaskEffortBucket,
   TaskPriority,
@@ -72,17 +76,6 @@ function startAndEndOfAgendaWindow() {
   const end = new Date(start);
   end.setDate(end.getDate() + 7);
   return { startIso: start.toISOString(), endIso: end.toISOString() };
-}
-
-function mapJiraWorkflowStatus(status?: string | null): TaskStatus {
-  const value = (status ?? "").toLowerCase();
-  if (/(done|closed|resolved|complete|completed)/.test(value)) {
-    return "Completed";
-  }
-  if (/(progress|coding|review|testing|qa|blocked|in dev|development)/.test(value)) {
-    return "In Progress";
-  }
-  return "Not Started";
 }
 
 function parseGraphCalendarDateTime(value?: string | null) {
@@ -317,6 +310,9 @@ function persistRejectedCandidate(input: {
     ...input,
     decisionState: "rejected"
   });
+  if (rejected?.decisionState === "ignored") {
+    return rejected;
+  }
   logTaskDecisionEvent({
     source: input.source,
     sourceRef: input.sourceRef ?? null,
@@ -361,8 +357,12 @@ async function applyMicrosoftResults(
   const personalization = await getPersonalizationContext();
   const jiraIssueKeys = new Set(
     listTasks(undefined, { includeDeferred: true })
-      .filter((task) => task.source === "Jira" && task.sourceRef)
-      .map((task) => String(task.sourceRef))
+      .filter((task) => task.source === "Jira")
+      .flatMap((task) => [
+        ...(task.sourceRef ? [String(task.sourceRef)] : []),
+        ...task.jiraPlanningSubtasks.map((subtask) => subtask.key)
+      ])
+      .filter(Boolean)
   );
   const meetingTitles = buildMeetingTitleIndex(listMeetings());
 
@@ -623,20 +623,46 @@ async function applyMicrosoftResults(
 async function syncMicrosoftTasks(options?: {
   microsoftGraphAccessToken?: string | null;
   microsoftWarning?: string | null;
+  runId?: string | null;
 }) {
   const warnings: string[] = [];
   const sinceIso = new Date(Date.now() - 5 * 24 * 60 * 60 * 1000).toISOString();
   const now = new Date().toISOString();
+  logEvent({
+    eventType: "sync.microsoft.tasks",
+    runId: options?.runId ?? null,
+    provider: "microsoft",
+    status: "started",
+    message: "Starting Microsoft task sync.",
+    metadata: { sinceIso, sessionMode: options?.microsoftGraphAccessToken ? "obo" : "stored" }
+  });
 
   if (options?.microsoftGraphAccessToken) {
     try {
       const emails = await fetchRecentEmailsWithAccessToken(sinceIso, options.microsoftGraphAccessToken);
       await applyMicrosoftResults(emails, [], null);
       setSyncState("microsoft", now);
+      logEvent({
+        eventType: "sync.microsoft.tasks",
+        runId: options?.runId ?? null,
+        provider: "microsoft",
+        status: "success",
+        message: "Microsoft task sync completed.",
+        metadata: { emailCount: emails.length }
+      });
     } catch (error) {
       warnings.push(
         error instanceof Error ? `Microsoft task sync failed: ${error.message}` : "Microsoft task sync failed"
       );
+      logEvent({
+        level: "error",
+        eventType: "sync.microsoft.tasks",
+        runId: options?.runId ?? null,
+        provider: "microsoft",
+        status: "failure",
+        message: "Microsoft task sync failed.",
+        metadata: { error: error instanceof Error ? error.message : String(error) }
+      });
     }
   } else {
     const microsoftConnection = getIntegrationConnection("microsoft");
@@ -645,13 +671,39 @@ async function syncMicrosoftTasks(options?: {
         const emails = await fetchRecentEmails(sinceIso);
         await applyMicrosoftResults(emails, [], null);
         setSyncState("microsoft", now);
+        logEvent({
+          eventType: "sync.microsoft.tasks",
+          runId: options?.runId ?? null,
+          provider: "microsoft",
+          status: "success",
+          message: "Microsoft task sync completed with stored session.",
+          metadata: { emailCount: emails.length }
+        });
       } catch (error) {
         warnings.push(
           error instanceof Error ? `Microsoft task sync failed: ${error.message}` : "Microsoft task sync failed"
         );
+        logEvent({
+          level: "error",
+          eventType: "sync.microsoft.tasks",
+          runId: options?.runId ?? null,
+          provider: "microsoft",
+          status: "failure",
+          message: "Microsoft task sync failed with stored session.",
+          metadata: { error: error instanceof Error ? error.message : String(error) }
+        });
       }
     } else if (options?.microsoftWarning) {
       warnings.push(options.microsoftWarning);
+      logEvent({
+        level: "warn",
+        eventType: "sync.microsoft.tasks",
+        runId: options?.runId ?? null,
+        provider: "microsoft",
+        status: "skipped",
+        message: "Microsoft task sync skipped because no session was available.",
+        metadata: { warning: options.microsoftWarning }
+      });
     }
   }
 
@@ -662,10 +714,19 @@ async function syncMicrosoftMeetings(options?: {
   microsoftGraphAccessToken?: string | null;
   microsoftWarning?: string | null;
   preferredTimeZone?: string | null;
+  runId?: string | null;
 }) {
   const warnings: string[] = [];
   const now = new Date().toISOString();
   const { startIso, endIso } = startAndEndOfAgendaWindow();
+  logEvent({
+    eventType: "sync.microsoft.meetings",
+    runId: options?.runId ?? null,
+    provider: "microsoft",
+    status: "started",
+    message: "Starting Microsoft meeting sync.",
+    metadata: { startIso, endIso, preferredTimeZone: options?.preferredTimeZone ?? null }
+  });
 
   if (options?.microsoftGraphAccessToken) {
     try {
@@ -677,10 +738,27 @@ async function syncMicrosoftMeetings(options?: {
       );
       await applyMicrosoftResults([], meetingsResult.events, meetingsResult.timeZone);
       setSyncState("microsoft", now);
+      logEvent({
+        eventType: "sync.microsoft.meetings",
+        runId: options?.runId ?? null,
+        provider: "microsoft",
+        status: "success",
+        message: "Microsoft meeting sync completed.",
+        metadata: { meetingCount: meetingsResult.events.length, timeZone: meetingsResult.timeZone }
+      });
     } catch (error) {
       warnings.push(
         error instanceof Error ? `Microsoft meeting sync failed: ${error.message}` : "Microsoft meeting sync failed"
       );
+      logEvent({
+        level: "error",
+        eventType: "sync.microsoft.meetings",
+        runId: options?.runId ?? null,
+        provider: "microsoft",
+        status: "failure",
+        message: "Microsoft meeting sync failed.",
+        metadata: { error: error instanceof Error ? error.message : String(error) }
+      });
     }
   } else {
     const microsoftConnection = getIntegrationConnection("microsoft");
@@ -689,24 +767,58 @@ async function syncMicrosoftMeetings(options?: {
         const meetingsResult = await fetchTodaysMeetings(startIso, endIso, options?.preferredTimeZone);
         await applyMicrosoftResults([], meetingsResult.events, meetingsResult.timeZone);
         setSyncState("microsoft", now);
+        logEvent({
+          eventType: "sync.microsoft.meetings",
+          runId: options?.runId ?? null,
+          provider: "microsoft",
+          status: "success",
+          message: "Microsoft meeting sync completed with stored session.",
+          metadata: { meetingCount: meetingsResult.events.length, timeZone: meetingsResult.timeZone }
+        });
       } catch (error) {
         warnings.push(
           error instanceof Error ? `Microsoft meeting sync failed: ${error.message}` : "Microsoft meeting sync failed"
         );
+        logEvent({
+          level: "error",
+          eventType: "sync.microsoft.meetings",
+          runId: options?.runId ?? null,
+          provider: "microsoft",
+          status: "failure",
+          message: "Microsoft meeting sync failed with stored session.",
+          metadata: { error: error instanceof Error ? error.message : String(error) }
+        });
       }
     } else if (options?.microsoftWarning) {
       warnings.push(options.microsoftWarning);
+      logEvent({
+        level: "warn",
+        eventType: "sync.microsoft.meetings",
+        runId: options?.runId ?? null,
+        provider: "microsoft",
+        status: "skipped",
+        message: "Microsoft meeting sync skipped because no session was available.",
+        metadata: { warning: options.microsoftWarning }
+      });
     }
   }
 
   return warnings;
 }
 
-async function syncJiraTasks() {
+async function syncJiraTasks(runId?: string | null) {
   const warnings: string[] = [];
   const now = new Date().toISOString();
   const sinceIso = new Date(Date.now() - 48 * 60 * 60 * 1000).toISOString();
   const personalization = await getPersonalizationContext();
+  logEvent({
+    eventType: "sync.jira.tasks",
+    runId: runId ?? null,
+    provider: "jira",
+    status: "started",
+    message: "Starting Jira task sync.",
+    metadata: { sinceIso }
+  });
 
   const jiraConnection = getIntegrationConnection("jira");
   if (jiraConnection?.status === "connected") {
@@ -754,7 +866,7 @@ async function syncJiraTasks() {
               title: `${issue.key} ${issue.fields.summary}`,
               source: "Jira",
               priority: existingTask.priority,
-              status: existingTask.status,
+              status: mapJiraWorkflowStatus(issue.fields.status?.name),
               sourceLink: candidatePayload.sourceLink,
               sourceRef: issue.key,
               jiraStatus: issue.fields.status?.name ?? null,
@@ -821,9 +933,35 @@ async function syncJiraTasks() {
         });
       }
       setSyncState("jira", now);
+      logEvent({
+        eventType: "sync.jira.tasks",
+        runId: runId ?? null,
+        provider: "jira",
+        status: "success",
+        message: "Jira task sync completed.",
+        metadata: { issueCount: issues.length }
+      });
     } catch (error) {
       warnings.push(error instanceof Error ? `Jira sync failed: ${error.message}` : "Jira sync failed");
+      logEvent({
+        level: "error",
+        eventType: "sync.jira.tasks",
+        runId: runId ?? null,
+        provider: "jira",
+        status: "failure",
+        message: "Jira task sync failed.",
+        metadata: { error: error instanceof Error ? error.message : String(error) }
+      });
     }
+  } else {
+    logEvent({
+      level: "warn",
+      eventType: "sync.jira.tasks",
+      runId: runId ?? null,
+      provider: "jira",
+      status: "skipped",
+      message: "Jira task sync skipped because Jira is not connected."
+    });
   }
 
   return warnings;
@@ -992,18 +1130,21 @@ function buildTaskPlanningTitle(task: Task, scheduledMinutes: number) {
   if (task.source !== "Jira") return task.title;
 
   const subtask = preferredJiraSubtask(task);
+  const subtaskEstimateMinutes = subtask?.estimateSeconds ? Math.max(15, Math.ceil(subtask.estimateSeconds / 60)) : null;
   const hasLargeSubtaskLoad =
     Boolean(task.jiraSubtaskEstimateSeconds && task.jiraSubtaskEstimateSeconds >= 90 * 60) ||
-    task.jiraPlanningSubtasks.length >= 3;
+    task.jiraPlanningSubtasks.length >= 2;
+  const hasActiveSubtask = Boolean(subtask && /(progress|coding|review|testing|qa|blocked|in dev|development)/i.test(subtask.status ?? ""));
 
-  if (subtask && hasLargeSubtaskLoad) {
+  if (subtask && subtaskEstimateMinutes && scheduledMinutes >= subtaskEstimateMinutes) {
     return `Complete subtask ${subtask.key} in ${task.sourceRef ?? "this story"}`;
   }
 
-  if (
-    subtask &&
-    scheduledMinutes <= Math.min(60, Math.max(30, Math.ceil((subtask.estimateSeconds ?? 0) / 60 || 30)))
-  ) {
+  if (subtask && (hasActiveSubtask || hasLargeSubtaskLoad || task.status === "In Progress")) {
+    return `Progress ${subtask.key} in ${task.sourceRef ?? "this story"}`;
+  }
+
+  if (subtask && scheduledMinutes <= Math.min(90, Math.max(30, subtaskEstimateMinutes ?? 45))) {
     return `Progress ${subtask.key} in ${task.sourceRef ?? "this story"}`;
   }
 
@@ -1177,7 +1318,7 @@ function buildDayPlan(tasks: Task[], meetings: ReturnType<typeof listMeetings>):
     slotMinutes: number,
     focusStreak: number
   ): { block: DayPlanBlock | null; consumedMinutes: number; nextFocusStreak: number } => {
-    if (slotMinutes < 15 || remainingTaskCapacityMinutes <= 0) {
+    if (slotMinutes < 15) {
       return { block: null, consumedMinutes: 0, nextFocusStreak: focusStreak };
     }
 
@@ -1202,7 +1343,13 @@ function buildDayPlan(tasks: Task[], meetings: ReturnType<typeof listMeetings>):
       remainingTaskCapacityMinutes -
         taskBlocks.reduce((sum, block) => sum + block.durationMinutes, 0)
     );
-    if (capacityLeft < 15) {
+    const canForceVisibilityBlock =
+      taskBlocks.length === 0 &&
+      slotMinutes >= 15 &&
+      (chosen.task.status === "In Progress" || chosen.executionBucket <= 1);
+    const effectiveCapacityLeft = capacityLeft >= 15 ? capacityLeft : canForceVisibilityBlock ? 15 : 0;
+
+    if (effectiveCapacityLeft < 15) {
       return { block: null, consumedMinutes: 0, nextFocusStreak: focusStreak };
     }
 
@@ -1213,7 +1360,7 @@ function buildDayPlan(tasks: Task[], meetings: ReturnType<typeof listMeetings>):
         : chosen.executionBucket <= 1 || planningPriority === "High" || chosen.task.status === "In Progress"
           ? Math.min(120, chosen.remainingEstimate)
           : Math.min(60, chosen.remainingEstimate);
-    const durationMinutes = Math.max(15, Math.min(slotMinutes, capacityLeft, idealChunk));
+    const durationMinutes = Math.max(15, Math.min(slotMinutes, effectiveCapacityLeft, idealChunk));
     const endTime = addMinutes(slotStart, durationMinutes);
     const status: DayPlanBlock["status"] =
       chosen.task.status === "In Progress" && slotStart.getTime() <= now.getTime() ? "in_progress" : "planned";
@@ -1373,23 +1520,39 @@ function buildDayPlan(tasks: Task[], meetings: ReturnType<typeof listMeetings>):
 function computeTaskSignals(task: Task, meetings: ReturnType<typeof listMeetings>) {
   let score = 0;
   const reasons: string[] = [];
+  const scoreBreakdown: Array<{ label: string; value: number; kind: "positive" | "negative" | "neutral" }> = [];
   const ageDays = daysBetween(task.createdAt, new Date().toISOString());
   const carryForwardCount = task.status === "Completed" ? 0 : Math.max(0, ageDays - 1);
   const effort = inferEffortBucket(task);
   const jiraPlanningPriority = task.source === "Jira" ? deriveJiraPlanningPriority(task) : task.priority;
 
-  if (jiraPlanningPriority === "High") score += 34;
-  else if (jiraPlanningPriority === "Medium") score += 18;
-  else score += 8;
+  if (jiraPlanningPriority === "High") {
+    score += 34;
+    scoreBreakdown.push({ label: "High execution priority", value: 34, kind: "positive" });
+  } else if (jiraPlanningPriority === "Medium") {
+    score += 18;
+    scoreBreakdown.push({ label: "Medium execution priority", value: 18, kind: "positive" });
+  } else {
+    score += 8;
+    scoreBreakdown.push({ label: "Low execution priority", value: 8, kind: "neutral" });
+  }
 
-  if (task.source === "Jira") score += 10;
-  if (task.source === "Email") score += 6;
+  if (task.source === "Jira") {
+    score += 10;
+    scoreBreakdown.push({ label: "Jira task baseline", value: 10, kind: "positive" });
+  }
+  if (task.source === "Email") {
+    score += 6;
+    scoreBreakdown.push({ label: "Email task baseline", value: 6, kind: "neutral" });
+  }
   if (task.source === "Jira" && isRecentlyUpdated(task.lastActivityAt)) {
     score += 16;
     reasons.push("Recent Jira activity");
+    scoreBreakdown.push({ label: "Recent Jira changes", value: 16, kind: "positive" });
   } else if (task.source === "Jira") {
     score -= 4;
     reasons.push("Open Jira issue ready after current work");
+    scoreBreakdown.push({ label: "No recent Jira change", value: -4, kind: "negative" });
   }
   if (task.source === "Jira" && jiraPlanningPriority === "High") {
     reasons.unshift("Current in-progress Jira story");
@@ -1399,7 +1562,9 @@ function computeTaskSignals(task: Task, meetings: ReturnType<typeof listMeetings
     reasons.unshift("Pending Jira story or subtask");
   }
   if (task.source === "Jira" && task.jiraSubtaskEstimateSeconds && task.jiraSubtaskEstimateSeconds > 0) {
-    score += Math.min(12, Math.ceil(task.jiraSubtaskEstimateSeconds / 3600) * 2);
+    const subtaskLoadBoost = Math.min(12, Math.ceil(task.jiraSubtaskEstimateSeconds / 3600) * 2);
+    score += subtaskLoadBoost;
+    scoreBreakdown.push({ label: "Subtask workload remaining", value: subtaskLoadBoost, kind: "positive" });
     if (task.jiraSubtaskEstimateSeconds >= 90 * 60) {
       reasons.push("Open subtasks drive the real workload");
     }
@@ -1407,6 +1572,7 @@ function computeTaskSignals(task: Task, meetings: ReturnType<typeof listMeetings
   if (task.status === "In Progress") {
     score += 12;
     reasons.push("Already in progress");
+    scoreBreakdown.push({ label: "Already in progress", value: 12, kind: "positive" });
   }
   if (task.deferredUntil) {
     const deferredTime = new Date(task.deferredUntil).getTime();
@@ -1414,25 +1580,32 @@ function computeTaskSignals(task: Task, meetings: ReturnType<typeof listMeetings
     if (hoursUntil <= 0) {
       score += 20;
       reasons.push("Deferred task is due again");
+      scoreBreakdown.push({ label: "Deferred task due again", value: 20, kind: "positive" });
     } else {
       score -= 18;
+      scoreBreakdown.push({ label: "Deferred into the future", value: -18, kind: "negative" });
     }
   }
   if (ageDays >= 3 && task.status !== "Completed") {
     score += 10;
     reasons.push(`Unfinished for ${ageDays} days`);
+    scoreBreakdown.push({ label: "Task age", value: 10, kind: "positive" });
   }
   if (carryForwardCount > 0) {
-    score += Math.min(16, carryForwardCount * 4);
+    const carryForwardBoost = Math.min(16, carryForwardCount * 4);
+    score += carryForwardBoost;
     reasons.push(`Carried forward ${carryForwardCount} day${carryForwardCount === 1 ? "" : "s"}`);
+    scoreBreakdown.push({ label: "Carry-forward pressure", value: carryForwardBoost, kind: "positive" });
   }
   if (task.source === "Email" && /(action required|follow up|approval|urgent)/i.test(task.title)) {
     score += 12;
     reasons.push("Urgency signal detected");
+    scoreBreakdown.push({ label: "Urgency signal", value: 12, kind: "positive" });
   }
   if (task.source === "Jira" && task.jiraStatus && /blocked|review|qa/i.test(task.jiraStatus)) {
     score += 8;
     reasons.push(task.jiraStatus);
+    scoreBreakdown.push({ label: "Workflow state pressure", value: 8, kind: "positive" });
   }
   const nextMeeting = meetings.find(
     (meeting) => !meeting.isCancelled && new Date(meeting.startTime).getTime() > Date.now()
@@ -1449,9 +1622,36 @@ function computeTaskSignals(task: Task, meetings: ReturnType<typeof listMeetings
         ? reasons[0] ?? "Recent email needs attention"
         : reasons[0] ?? "Manual task still active";
 
+  const selectionReason =
+    task.status === "In Progress"
+      ? "Included because this work is already in progress and should stay visible until finished."
+      : task.source === "Jira"
+        ? "Included because it is assigned Jira work that fits your current capacity and execution order."
+        : task.source === "Email"
+          ? "Included because it looks like actionable email work that still needs review or follow-through."
+          : "Included because you created it manually and it remains active.";
+
+  const priorityReason =
+    jiraPlanningPriority === "High"
+      ? "High priority because active story work, urgency, or recent signals outweigh other tasks."
+      : jiraPlanningPriority === "Medium"
+        ? "Medium priority because it matters, but more active work is ahead of it."
+        : "Low priority because it remains relevant, but higher-urgency work is already in motion.";
+
+  const historySignals = [
+    ageDays >= 3 ? `Open for ${ageDays} days` : null,
+    carryForwardCount > 0 ? `Carried forward ${carryForwardCount} times` : null,
+    task.lastChangedBy ? `Last changed by ${task.lastChangedBy}` : null,
+    task.lastChangedAt ? `Last changed at ${task.lastChangedAt}` : null
+  ].filter((entry): entry is string => Boolean(entry));
+
   return {
     priorityScore: Math.round(score),
     priorityExplanation: explanation,
+    selectionReason,
+    priorityReason,
+    scoreBreakdown,
+    historySignals,
     estimatedEffortBucket: effort,
     taskAgeDays: ageDays,
     carryForwardCount
@@ -1479,9 +1679,15 @@ function applyTaskIntelligence() {
             : derivePriorityFromScore(intelligence.priorityScore),
       priorityScore: intelligence.priorityScore,
       priorityExplanation: intelligence.priorityExplanation,
+      selectionReason: intelligence.selectionReason,
+      priorityReason: intelligence.priorityReason,
+      scoreBreakdown: intelligence.scoreBreakdown,
+      historySignals: intelligence.historySignals,
       estimatedEffortBucket: intelligence.estimatedEffortBucket,
       taskAgeDays: intelligence.taskAgeDays,
-      carryForwardCount: intelligence.carryForwardCount
+      carryForwardCount: intelligence.carryForwardCount,
+      lastChangedBy: "system",
+      lastChangedAt: new Date().toISOString()
     });
   }
 }
@@ -1662,6 +1868,20 @@ function buildPayload(warnings: string[] = []): TodayPayload {
   };
 }
 
+function persistPlannerRun(runId: string, triggerType: PlannerRunDetail["triggerType"], preferredTimeZone: string | null, payload: TodayPayload) {
+  upsertPlannerRunDetail({
+    runId,
+    triggerType,
+    preferredTimeZone,
+    warnings: payload.warnings,
+    meetingCount: payload.meetings.length,
+    activeTaskCount: [...payload.tasks.High, ...payload.tasks.Medium, ...payload.tasks.Low].length,
+    rejectedTaskCount: payload.rejectedTaskCount,
+    deferredTaskCount: payload.deferredTaskCount,
+    workloadState: payload.workload.state
+  });
+}
+
 export function getTodaySnapshot() {
   return buildPayload([]);
 }
@@ -1688,37 +1908,68 @@ export async function generatePlan(
     microsoftGraphAccessToken?: string | null;
     microsoftWarning?: string | null;
     preferredTimeZone?: string | null;
+    runId?: string | null;
   },
   triggerType: "manual" | "scheduled" = "manual"
 ): Promise<TodayPayload> {
-  const jiraWarnings = await syncJiraTasks();
-  const microsoftMeetingWarnings = await syncMicrosoftMeetings(options);
-  const microsoftTaskWarnings = await syncMicrosoftTasks(options);
+  const runId = options?.runId ?? createCorrelationId();
+  logEvent({
+    eventType: "planner.generate",
+    runId,
+    status: "started",
+    message: "Planner generation started.",
+    metadata: { triggerType, preferredTimeZone: options?.preferredTimeZone ?? null }
+  });
+  const jiraWarnings = await syncJiraTasks(runId);
+  const microsoftMeetingWarnings = await syncMicrosoftMeetings({ ...options, runId });
+  const microsoftTaskWarnings = await syncMicrosoftTasks({ ...options, runId });
   const warnings = [...microsoftTaskWarnings, ...microsoftMeetingWarnings, ...jiraWarnings];
   await postSyncMaintenance(triggerType, warnings);
-  return buildPayload(warnings);
+  const payload = buildPayload(warnings);
+  persistPlannerRun(runId, triggerType, options?.preferredTimeZone ?? null, payload);
+  logEvent({
+    eventType: "planner.generate",
+    runId,
+    status: "success",
+    message: "Planner generation completed.",
+    metadata: {
+      triggerType,
+      warningsCount: warnings.length,
+      meetingCount: payload.meetings.length,
+      activeTaskCount: [...payload.tasks.High, ...payload.tasks.Medium, ...payload.tasks.Low].length
+    }
+  });
+  return payload;
 }
 
 export async function syncMeetingsOnly(options?: {
   microsoftGraphAccessToken?: string | null;
   microsoftWarning?: string | null;
   preferredTimeZone?: string | null;
+  runId?: string | null;
 }) {
-  const warnings = await syncMicrosoftMeetings(options);
+  const runId = options?.runId ?? createCorrelationId();
+  const warnings = await syncMicrosoftMeetings({ ...options, runId });
   syncReminders();
-  return buildPayload(warnings);
+  const payload = buildPayload(warnings);
+  persistPlannerRun(runId, "sync", options?.preferredTimeZone ?? null, payload);
+  return payload;
 }
 
 export async function syncTasksOnly(options?: {
   microsoftGraphAccessToken?: string | null;
   microsoftWarning?: string | null;
   preferredTimeZone?: string | null;
+  runId?: string | null;
 }) {
-  const jiraWarnings = await syncJiraTasks();
-  const microsoftWarnings = await syncMicrosoftTasks(options);
+  const runId = options?.runId ?? createCorrelationId();
+  const jiraWarnings = await syncJiraTasks(runId);
+  const microsoftWarnings = await syncMicrosoftTasks({ ...options, runId });
   applyTaskIntelligence();
   syncReminders();
-  return buildPayload([...microsoftWarnings, ...jiraWarnings]);
+  const payload = buildPayload([...microsoftWarnings, ...jiraWarnings]);
+  persistPlannerRun(runId, "sync", options?.preferredTimeZone ?? null, payload);
+  return payload;
 }
 
 export function getDeferredTasksPayload() {
