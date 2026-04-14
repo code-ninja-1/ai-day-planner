@@ -5,18 +5,25 @@ import type {
   DayHistorySummary,
   DiagnosticsPayload,
   EmailReplyDraft,
+  HomePayload,
+  HomeSchedule,
   InsightsOverview,
   InsightsTodayPayload,
+  InsightsUpdatesPayload,
   IntegrationStatus,
+  Meeting,
   MeetingPrep,
+  MeetingDetail,
   PersonalizationInsight,
   PlannerRunDetail,
   RejectedTask,
   Reminder,
   Task,
+  TaskBoardPayload,
   TaskDetail,
   TaskInsightsPayload,
   TaskPriority,
+  TaskStage,
   TaskStatus,
   TodayResponse,
   UserPriorityProfile
@@ -56,6 +63,36 @@ async function authedRequest<T>(path: string, accessToken: string, init?: Reques
 }
 
 export const api = {
+  getHome: () => request<HomePayload>("/home"),
+  getHomeSchedule: (dayKey: string) => request<{ schedule: HomeSchedule }>(`/home/schedule?day=${encodeURIComponent(dayKey)}`),
+  saveHomeSchedule: (
+    dayKey: string,
+    entries: Array<{
+      entryId: string;
+      taskId: number;
+      startMinutes: number;
+      durationMinutes: number;
+      source: "planner" | "user";
+    }>
+  ) =>
+    request<{ schedule: HomeSchedule }>("/home/schedule/tasks", {
+      method: "PUT",
+      body: JSON.stringify({ dayKey, entries })
+    }),
+  deleteHomeScheduleEntry: (entryId: string) =>
+    request<{ schedule: HomeSchedule }>(`/home/schedule/tasks/${encodeURIComponent(entryId)}`, {
+      method: "DELETE"
+    }),
+  fillHomeSchedule: (dayKey: string) =>
+    request<{ schedule: HomeSchedule }>("/home/schedule/tasks/fill", {
+      method: "POST",
+      body: JSON.stringify({ dayKey })
+    }),
+  updateHomeMeetingSchedule: (meetingId: number, dayKey: string, action: "remove" | "attending" | "unattending") =>
+    request<{ meeting?: Meeting; schedule: HomeSchedule }>(`/home/schedule/meetings/${meetingId}`, {
+      method: "PATCH",
+      body: JSON.stringify({ dayKey, action })
+    }),
   getToday: () => request<TodayResponse>("/today"),
   getAutomationSettings: () =>
     request<{
@@ -93,11 +130,16 @@ export const api = {
       body: JSON.stringify({ timeZone })
     }),
   getDeferredTasks: () => request<{ tasks: Task[] }>("/tasks/deferred"),
+  getTaskBoard: () => request<TaskBoardPayload>("/tasks/board"),
   getRejectedTasks: () => request<{ tasks: RejectedTask[]; ignoredTasks: RejectedTask[] }>("/tasks/rejected"),
   getInsightsOverview: () => request<InsightsOverview>("/insights/overview"),
   getInsightsToday: () => request<InsightsTodayPayload>("/insights/today"),
   getInsightsHistory: (limit = 30) => request<{ days: DayHistorySummary[] }>(`/insights/history?limit=${limit}`),
   getInsightsHistoryDay: (dayKey: string) => request<DayHistoryDetail>(`/insights/history/${encodeURIComponent(dayKey)}`),
+  getInsightsUpdates: (start?: string | null, end?: string | null, limit = 300) =>
+    request<InsightsUpdatesPayload>(
+      `/insights/updates?limit=${limit}${start ? `&start=${encodeURIComponent(start)}` : ""}${end ? `&end=${encodeURIComponent(end)}` : ""}`
+    ),
   getTaskInsights: (taskId: number) => request<TaskInsightsPayload>(`/insights/tasks/${taskId}`),
   getDebugRuns: () => request<{ runs: PlannerRunDetail[]; diagnostics: DiagnosticsPayload }>("/debug/runs"),
   getDebugLogs: (limit = 200) => request<{ logs: AuditEvent[] }>(`/debug/logs?limit=${limit}`),
@@ -130,6 +172,11 @@ export const api = {
     request<{ task: Task }>(`/tasks/${id}/defer`, {
       method: "PATCH",
       body: JSON.stringify({ deferredUntil })
+    }),
+  reorderTaskBoardStage: (stage: TaskStage, orderedTaskIds: number[]) =>
+    request<{ tasks: Task[] }>("/tasks/board/reorder", {
+      method: "POST",
+      body: JSON.stringify({ stage, orderedTaskIds })
     }),
   sendTaskFeedback: (
     id: number,
@@ -168,12 +215,12 @@ export const api = {
     }),
   getTasks: (status?: TaskStatus) =>
     request<{ tasks: Task[] }>(`/tasks${status ? `?status=${encodeURIComponent(status)}` : ""}`),
-  createTask: (input: { title: string; priority?: TaskPriority; status?: TaskStatus }) =>
+  createTask: (input: { title: string; stage?: TaskStage; priority?: TaskPriority; status?: TaskStatus }) =>
     request<{ task: Task }>("/tasks", {
       method: "POST",
       body: JSON.stringify(input)
     }),
-  updateTask: (id: number, input: Partial<{ title: string; priority: TaskPriority; status: TaskStatus }>) =>
+  updateTask: (id: number, input: Partial<{ title: string; stage: TaskStage; stageOrder: number; priority: TaskPriority; status: TaskStatus }>) =>
     request<{ task: Task }>(`/tasks/${id}`, {
       method: "PATCH",
       body: JSON.stringify(input)
@@ -182,6 +229,14 @@ export const api = {
     request<{ detail: TaskDetail }>(`/tasks/${id}/details`),
   getTaskDetailsWithMicrosoftSession: (id: number, accessToken: string) =>
     authedRequest<{ detail: TaskDetail }>(`/tasks/${id}/details`, accessToken),
+  getMeetingDetail: (id: number) => request<{ detail: MeetingDetail }>(`/meetings/${id}`),
+  getMeetingDetailWithMicrosoftSession: (id: number, accessToken: string) =>
+    authedRequest<{ detail: MeetingDetail }>(`/meetings/${id}`, accessToken),
+  updateMeeting: (id: number, input: { attendanceStatus: "attending" | "unattending" }) =>
+    request<{ meeting: Meeting }>(`/meetings/${id}`, {
+      method: "PATCH",
+      body: JSON.stringify(input)
+    }),
   generateEmailReplyDraft: (id: number, input: { userIntent?: string | null }) =>
     request<{ draft: EmailReplyDraft }>(`/tasks/${id}/email-reply/draft`, {
       method: "POST",

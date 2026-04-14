@@ -166,6 +166,7 @@ export interface GraphMail {
   subject?: string;
   webLink?: string;
   bodyPreview?: string;
+  sentDateTime?: string;
   body?: {
     contentType?: string;
     content?: string;
@@ -199,16 +200,38 @@ export interface GraphEvent {
 
 interface GraphMailboxSettings {
   timeZone?: string;
+  workingHours?: {
+    startTime?: string;
+    endTime?: string;
+  };
 }
 
-async function tryFetchMailboxTimeZone(accessToken?: string) {
+function normalizeMicrosoftLocalTime(value?: string | null, fallback = "09:30") {
+  const raw = value?.trim();
+  if (!raw) return fallback;
+  const match = raw.match(/^(\d{1,2}):(\d{2})/);
+  if (!match) return fallback;
+  const hours = match[1].padStart(2, "0");
+  const minutes = match[2];
+  return `${hours}:${minutes}`;
+}
+
+async function tryFetchMailboxSettings(accessToken?: string) {
   try {
     const settings = accessToken
-      ? await graphWithAccessToken<GraphMailboxSettings>("/me/mailboxSettings?$select=timeZone", accessToken)
-      : await graph<GraphMailboxSettings>("/me/mailboxSettings?$select=timeZone");
-    return settings.timeZone ?? null;
+      ? await graphWithAccessToken<GraphMailboxSettings>("/me/mailboxSettings?$select=timeZone,workingHours", accessToken)
+      : await graph<GraphMailboxSettings>("/me/mailboxSettings?$select=timeZone,workingHours");
+    return {
+      timeZone: settings.timeZone ?? null,
+      workdayStartLocal: normalizeMicrosoftLocalTime(settings.workingHours?.startTime, "09:30"),
+      workdayEndLocal: normalizeMicrosoftLocalTime(settings.workingHours?.endTime, "18:00")
+    };
   } catch {
-    return null;
+    return {
+      timeZone: null,
+      workdayStartLocal: "09:30",
+      workdayEndLocal: "18:00"
+    };
   }
 }
 
@@ -332,7 +355,7 @@ async function enrichEventsWithJoinInfo(events: GraphEvent[], accessToken?: stri
 export async function fetchRecentEmails(sinceIso: string) {
   const query = buildGraphPath("/me/messages", {
     $top: "200",
-    $select: "id,conversationId,subject,webLink,bodyPreview,body,receivedDateTime,from",
+    $select: "id,conversationId,subject,webLink,bodyPreview,body,receivedDateTime,sentDateTime,from,toRecipients,ccRecipients",
     $filter: `receivedDateTime ge ${sinceIso}`
   });
   const data = await graph<{ value: GraphMail[] }>(query);
@@ -342,15 +365,44 @@ export async function fetchRecentEmails(sinceIso: string) {
 export async function fetchRecentEmailsWithAccessToken(sinceIso: string, accessToken: string) {
   const query = buildGraphPath("/me/messages", {
     $top: "200",
-    $select: "id,conversationId,subject,webLink,bodyPreview,body,receivedDateTime,from",
+    $select: "id,conversationId,subject,webLink,bodyPreview,body,receivedDateTime,sentDateTime,from,toRecipients,ccRecipients",
     $filter: `receivedDateTime ge ${sinceIso}`
   });
   const data = await graphWithAccessToken<{ value: GraphMail[] }>(query, accessToken);
   return sortMailsByReceivedDate(data.value, "desc");
 }
 
+export async function fetchRecentSentEmails(sinceIso: string) {
+  const query = buildGraphPath("/me/mailFolders/SentItems/messages", {
+    $top: "150",
+    $select: "id,conversationId,subject,webLink,bodyPreview,body,receivedDateTime,sentDateTime,from,toRecipients,ccRecipients",
+    $filter: `sentDateTime ge ${sinceIso}`
+  });
+  const data = await graph<{ value: GraphMail[] }>(query);
+  return [...data.value].sort((left, right) => {
+    const leftTime = left.sentDateTime ? Date.parse(left.sentDateTime) : 0;
+    const rightTime = right.sentDateTime ? Date.parse(right.sentDateTime) : 0;
+    return rightTime - leftTime;
+  });
+}
+
+export async function fetchRecentSentEmailsWithAccessToken(sinceIso: string, accessToken: string) {
+  const query = buildGraphPath("/me/mailFolders/SentItems/messages", {
+    $top: "150",
+    $select: "id,conversationId,subject,webLink,bodyPreview,body,receivedDateTime,sentDateTime,from,toRecipients,ccRecipients",
+    $filter: `sentDateTime ge ${sinceIso}`
+  });
+  const data = await graphWithAccessToken<{ value: GraphMail[] }>(query, accessToken);
+  return [...data.value].sort((left, right) => {
+    const leftTime = left.sentDateTime ? Date.parse(left.sentDateTime) : 0;
+    const rightTime = right.sentDateTime ? Date.parse(right.sentDateTime) : 0;
+    return rightTime - leftTime;
+  });
+}
+
 export async function fetchTodaysMeetings(startIso: string, endIso: string, preferredTimeZone?: string | null) {
-  const timeZone = preferredTimeZone ?? (await tryFetchMailboxTimeZone());
+  const mailboxSettings = await tryFetchMailboxSettings();
+  const timeZone = preferredTimeZone ?? mailboxSettings.timeZone;
   const query = buildGraphPath("/me/calendarView", {
     startDateTime: startIso,
     endDateTime: endIso,
@@ -362,7 +414,12 @@ export async function fetchTodaysMeetings(startIso: string, endIso: string, pref
     query,
     timeZone ? { Prefer: `outlook.timezone="${timeZone}"` } : undefined
   );
-  return { events: await enrichEventsWithJoinInfo(data.value), timeZone };
+  return {
+    events: await enrichEventsWithJoinInfo(data.value),
+    timeZone,
+    workdayStartLocal: mailboxSettings.workdayStartLocal,
+    workdayEndLocal: mailboxSettings.workdayEndLocal
+  };
 }
 
 export async function fetchTodaysMeetingsWithAccessToken(
@@ -371,7 +428,8 @@ export async function fetchTodaysMeetingsWithAccessToken(
   accessToken: string,
   preferredTimeZone?: string | null
 ) {
-  const timeZone = preferredTimeZone ?? (await tryFetchMailboxTimeZone(accessToken));
+  const mailboxSettings = await tryFetchMailboxSettings(accessToken);
+  const timeZone = preferredTimeZone ?? mailboxSettings.timeZone;
   const query = buildGraphPath("/me/calendarView", {
     startDateTime: startIso,
     endDateTime: endIso,
@@ -384,7 +442,12 @@ export async function fetchTodaysMeetingsWithAccessToken(
     accessToken,
     timeZone ? { Prefer: `outlook.timezone="${timeZone}"` } : undefined
   );
-  return { events: await enrichEventsWithJoinInfo(data.value, accessToken), timeZone };
+  return {
+    events: await enrichEventsWithJoinInfo(data.value, accessToken),
+    timeZone,
+    workdayStartLocal: mailboxSettings.workdayStartLocal,
+    workdayEndLocal: mailboxSettings.workdayEndLocal
+  };
 }
 
 export async function fetchMicrosoftProfileWithAccessToken(accessToken: string) {

@@ -13,6 +13,7 @@ import type {
   IntegrationConnection,
   InsightsOverview,
   Meeting,
+  HomeScheduleEntry,
   PlannerRunDetail,
   PersonalizationInsight,
   Reminder,
@@ -26,6 +27,7 @@ import type {
   TaskDecisionState,
   TaskEffortBucket,
   TaskPriority,
+  TaskStage,
   TaskStateEvent,
   TaskSource,
   TaskStatus,
@@ -44,6 +46,8 @@ db.exec(`
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     title TEXT NOT NULL,
     source TEXT NOT NULL,
+    stage TEXT NOT NULL DEFAULT 'Later',
+    stage_order INTEGER NOT NULL DEFAULT 0,
     priority TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'Not Started',
     source_link TEXT,
@@ -81,6 +85,7 @@ db.exec(`
     meeting_link TEXT,
     meeting_link_type TEXT,
     is_cancelled INTEGER NOT NULL DEFAULT 0,
+    attendance_status TEXT NOT NULL DEFAULT 'attending',
     created_at TEXT NOT NULL
   );
 
@@ -123,6 +128,8 @@ db.exec(`
     schedule_enabled INTEGER NOT NULL DEFAULT 0,
     schedule_time_local TEXT NOT NULL DEFAULT '08:30',
     schedule_timezone TEXT NOT NULL DEFAULT 'UTC',
+    workday_start_local TEXT NOT NULL DEFAULT '09:30',
+    workday_end_local TEXT NOT NULL DEFAULT '18:00',
     reminders_enabled INTEGER NOT NULL DEFAULT 1,
     reminder_cadence_hours INTEGER NOT NULL DEFAULT 6,
     desktop_notifications_enabled INTEGER NOT NULL DEFAULT 0,
@@ -278,6 +285,34 @@ db.exec(`
     after_json TEXT,
     created_at TEXT NOT NULL
   );
+
+  CREATE TABLE IF NOT EXISTS home_schedule_entries (
+    entry_id TEXT PRIMARY KEY,
+    day_key TEXT NOT NULL,
+    task_id INTEGER NOT NULL,
+    start_minutes INTEGER NOT NULL,
+    duration_minutes INTEGER NOT NULL,
+    source TEXT NOT NULL DEFAULT 'planner',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_home_schedule_entries_day_key
+  ON home_schedule_entries(day_key, start_minutes ASC);
+
+  CREATE TABLE IF NOT EXISTS home_meeting_overrides (
+    day_key TEXT NOT NULL,
+    meeting_id INTEGER NOT NULL,
+    visibility TEXT NOT NULL DEFAULT 'active',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(day_key, meeting_id)
+  );
+
+  CREATE TABLE IF NOT EXISTS home_schedule_days (
+    day_key TEXT PRIMARY KEY,
+    updated_at TEXT NOT NULL
+  );
 `);
 
 function ensureColumn(table: string, column: string, definition: string) {
@@ -290,8 +325,11 @@ function ensureColumn(table: string, column: string, definition: string) {
 ensureColumn("meetings", "time_zone", "TEXT");
 ensureColumn("meetings", "meeting_link_type", "TEXT");
 ensureColumn("meetings", "is_cancelled", "INTEGER NOT NULL DEFAULT 0");
+ensureColumn("meetings", "attendance_status", "TEXT NOT NULL DEFAULT 'attending'");
 
 ensureColumn("tasks", "deferred_until", "TEXT");
+ensureColumn("tasks", "stage", "TEXT NOT NULL DEFAULT 'Later'");
+ensureColumn("tasks", "stage_order", "INTEGER NOT NULL DEFAULT 0");
 ensureColumn("tasks", "reminder_state", "TEXT");
 ensureColumn("tasks", "last_reminded_at", "TEXT");
 ensureColumn("tasks", "estimated_effort_bucket", "TEXT");
@@ -320,6 +358,8 @@ ensureColumn("tasks", "score_breakdown_json", "TEXT NOT NULL DEFAULT '[]'");
 ensureColumn("tasks", "history_signals_json", "TEXT NOT NULL DEFAULT '[]'");
 ensureColumn("tasks", "last_changed_by", "TEXT");
 ensureColumn("tasks", "last_changed_at", "TEXT");
+ensureColumn("automation_settings", "workday_start_local", "TEXT NOT NULL DEFAULT '09:30'");
+ensureColumn("automation_settings", "workday_end_local", "TEXT NOT NULL DEFAULT '18:00'");
 
 db.prepare(
   `
@@ -370,6 +410,8 @@ const taskRowToTask = (row: Record<string, unknown>): Task => ({
   id: Number(row.id),
   title: String(row.title),
   source: row.source as TaskSource,
+  stage: ((row.stage as TaskStage | null) ?? "Later") as TaskStage,
+  stageOrder: Number(row.stage_order ?? 0),
   priority: row.priority as TaskPriority,
   status: row.status as TaskStatus,
   sourceLink: (row.source_link as string | null) ?? null,
@@ -459,9 +501,21 @@ const meetingRowToMeeting = (row: Record<string, unknown>): Meeting => {
     meetingLink,
     meetingLinkType,
     isCancelled,
+    attendanceStatus: ((row.attendance_status as string | null) ?? "attending") === "unattending" ? "unattending" : "attending",
     createdAt: String(row.created_at)
   };
 };
+
+const homeScheduleEntryRowToEntry = (row: Record<string, unknown>): HomeScheduleEntry => ({
+  entryId: String(row.entry_id),
+  dayKey: String(row.day_key),
+  taskId: Number(row.task_id),
+  startMinutes: Number(row.start_minutes),
+  durationMinutes: Number(row.duration_minutes),
+  source: row.source === "user" ? "user" : "planner",
+  createdAt: String(row.created_at),
+  updatedAt: String(row.updated_at)
+});
 
 const reminderRowToReminder = (row: Record<string, unknown>): Reminder => ({
   id: Number(row.id),
@@ -484,6 +538,8 @@ const automationRowToSettings = (row: Record<string, unknown>): AutomationSettin
   scheduleEnabled: Number(row.schedule_enabled) === 1,
   scheduleTimeLocal: String(row.schedule_time_local),
   scheduleTimezone: String(row.schedule_timezone),
+  workdayStartLocal: String(row.workday_start_local ?? "09:30"),
+  workdayEndLocal: String(row.workday_end_local ?? "18:00"),
   remindersEnabled: Number(row.reminders_enabled) === 1,
   reminderCadenceHours: Number(row.reminder_cadence_hours),
   desktopNotificationsEnabled: Number(row.desktop_notifications_enabled) === 1,
@@ -540,7 +596,14 @@ const priorityProfileRowToProfile = (row: Record<string, unknown>): UserPriority
 });
 
 function orderByPrioritySql() {
-  return "CASE priority WHEN 'High' THEN 1 WHEN 'Medium' THEN 2 ELSE 3 END, priority_score DESC, updated_at DESC";
+  return [
+    "CASE stage WHEN 'Now' THEN 1 WHEN 'Next' THEN 2 WHEN 'Later' THEN 3 WHEN 'Review' THEN 4 ELSE 5 END",
+    "CASE WHEN status = 'In Progress' THEN 0 WHEN status = 'Not Started' THEN 1 ELSE 2 END",
+    "stage_order ASC",
+    "CASE priority WHEN 'High' THEN 1 WHEN 'Medium' THEN 2 ELSE 3 END",
+    "priority_score DESC",
+    "updated_at DESC"
+  ].join(", ");
 }
 
 export function listTasks(
@@ -569,7 +632,29 @@ export function listTasks(
 }
 
 export function listDeferredTasks() {
-  return listTasks(undefined, { onlyDeferred: true });
+  return listTasks().filter((task) => task.stage === "Next");
+}
+
+export function listTasksByStage(stage: TaskStage) {
+  return listTasks(undefined, { includeDeferred: true }).filter((task) => task.stage === stage && task.status !== "Completed");
+}
+
+export function getNextStageOrder(stage: TaskStage) {
+  const row = db
+    .prepare("SELECT COALESCE(MAX(stage_order), -1) as max_order FROM tasks WHERE stage = ? AND ignored = 0")
+    .get(stage) as { max_order: number | null };
+  return Number(row.max_order ?? -1) + 1;
+}
+
+export function reorderTasksWithinStage(stage: TaskStage, orderedTaskIds: number[]) {
+  const transaction = db.transaction(() => {
+    const update = db.prepare("UPDATE tasks SET stage = ?, stage_order = ?, updated_at = ? WHERE id = ?");
+    const now = new Date().toISOString();
+    orderedTaskIds.forEach((taskId, index) => {
+      update.run(stage, index, now, taskId);
+    });
+  });
+  transaction();
 }
 
 export function listReminderItems(status: ReminderStatus[] = ["active"]) {
@@ -1288,7 +1373,7 @@ export function recordTaskStateEvent(input: Omit<TaskStateEvent, "id" | "created
   });
 }
 
-export function listTaskStateEvents(options?: { taskId?: number; dayKey?: string; limit?: number }) {
+export function listTaskStateEvents(options?: { taskId?: number; dayKey?: string; startDayKey?: string; endDayKey?: string; limit?: number }) {
   const filters: string[] = [];
   const values: Array<string | number> = [];
 
@@ -1300,6 +1385,16 @@ export function listTaskStateEvents(options?: { taskId?: number; dayKey?: string
   if (options?.dayKey) {
     filters.push("substr(created_at, 1, 10) = ?");
     values.push(options.dayKey);
+  }
+
+  if (options?.startDayKey) {
+    filters.push("substr(created_at, 1, 10) >= ?");
+    values.push(options.startDayKey);
+  }
+
+  if (options?.endDayKey) {
+    filters.push("substr(created_at, 1, 10) <= ?");
+    values.push(options.endDayKey);
   }
 
   const whereClause = filters.length ? `WHERE ${filters.join(" AND ")}` : "";
@@ -1392,6 +1487,119 @@ export function getMeetingById(id: number) {
   return row ? meetingRowToMeeting(row) : null;
 }
 
+export function updateMeetingAttendanceStatus(id: number, attendanceStatus: "attending" | "unattending") {
+  const existing = db.prepare("SELECT * FROM meetings WHERE id = ?").get(id) as Record<string, unknown> | undefined;
+  if (!existing) return null;
+  db.prepare(
+    `
+    UPDATE meetings
+    SET attendance_status = ?
+    WHERE id = ?
+    `
+  ).run(attendanceStatus, id);
+  const row = db.prepare("SELECT * FROM meetings WHERE id = ?").get(id) as Record<string, unknown> | undefined;
+  return row ? meetingRowToMeeting(row) : null;
+}
+
+export function listHomeScheduleEntries(dayKey: string) {
+  return db
+    .prepare("SELECT * FROM home_schedule_entries WHERE day_key = ? ORDER BY start_minutes ASC, entry_id ASC")
+    .all(dayKey)
+    .map((row: unknown) => homeScheduleEntryRowToEntry(row as Record<string, unknown>));
+}
+
+export function hasHomeScheduleOverrideDay(dayKey: string) {
+  const row = db.prepare("SELECT day_key FROM home_schedule_days WHERE day_key = ?").get(dayKey) as { day_key?: string } | undefined;
+  return Boolean(row?.day_key);
+}
+
+export function markHomeScheduleOverrideDay(dayKey: string) {
+  db.prepare(
+    `
+    INSERT INTO home_schedule_days (day_key, updated_at)
+    VALUES (?, ?)
+    ON CONFLICT(day_key) DO UPDATE SET
+      updated_at = excluded.updated_at
+    `
+  ).run(dayKey, new Date().toISOString());
+}
+
+export function replaceHomeScheduleEntries(
+  dayKey: string,
+  entries: Array<Pick<HomeScheduleEntry, "entryId" | "taskId" | "startMinutes" | "durationMinutes" | "source">>
+) {
+  const now = new Date().toISOString();
+  const transaction = db.transaction(() => {
+    db.prepare(
+      `
+      INSERT INTO home_schedule_days (day_key, updated_at)
+      VALUES (?, ?)
+      ON CONFLICT(day_key) DO UPDATE SET
+        updated_at = excluded.updated_at
+      `
+    ).run(dayKey, now);
+    db.prepare("DELETE FROM home_schedule_entries WHERE day_key = ?").run(dayKey);
+    const insert = db.prepare(
+      `
+      INSERT INTO home_schedule_entries (
+        entry_id, day_key, task_id, start_minutes, duration_minutes, source, created_at, updated_at
+      ) VALUES (
+        @entryId, @dayKey, @taskId, @startMinutes, @durationMinutes, @source, @createdAt, @updatedAt
+      )
+      `
+    );
+    entries.forEach((entry) => {
+      insert.run({
+        entryId: entry.entryId,
+        dayKey,
+        taskId: entry.taskId,
+        startMinutes: entry.startMinutes,
+        durationMinutes: entry.durationMinutes,
+        source: entry.source,
+        createdAt: now,
+        updatedAt: now
+      });
+    });
+  });
+  transaction();
+  return listHomeScheduleEntries(dayKey);
+}
+
+export function deleteHomeScheduleEntry(entryId: string) {
+  const row = db
+    .prepare("SELECT * FROM home_schedule_entries WHERE entry_id = ?")
+    .get(entryId) as Record<string, unknown> | undefined;
+  if (!row) return null;
+  markHomeScheduleOverrideDay(String(row.day_key));
+  db.prepare("DELETE FROM home_schedule_entries WHERE entry_id = ?").run(entryId);
+  return homeScheduleEntryRowToEntry(row);
+}
+
+export function listHiddenHomeMeetingIds(dayKey: string) {
+  return db
+    .prepare("SELECT meeting_id FROM home_meeting_overrides WHERE day_key = ? AND visibility = 'removed' ORDER BY meeting_id ASC")
+    .all(dayKey)
+    .map((row: unknown) => Number((row as { meeting_id: number }).meeting_id));
+}
+
+export function setHomeMeetingVisibility(dayKey: string, meetingId: number, visibility: "active" | "removed") {
+  const now = new Date().toISOString();
+  markHomeScheduleOverrideDay(dayKey);
+  if (visibility === "active") {
+    db.prepare("DELETE FROM home_meeting_overrides WHERE day_key = ? AND meeting_id = ?").run(dayKey, meetingId);
+    return;
+  }
+  db.prepare(
+    `
+    INSERT INTO home_meeting_overrides (day_key, meeting_id, visibility, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?)
+    ON CONFLICT(day_key, meeting_id) DO UPDATE SET
+      visibility = excluded.visibility,
+      updated_at = excluded.updated_at
+    `
+  ).run(dayKey, meetingId, visibility, now, now);
+}
+
 function mergeOverrideFlags(existing: string[], next: string[]) {
   return [...new Set([...existing, ...next])];
 }
@@ -1399,12 +1607,16 @@ function mergeOverrideFlags(existing: string[], next: string[]) {
 export function upsertTask(input: {
   title: string;
   source: TaskSource;
+  stage?: TaskStage;
+  stageOrder?: number | null;
   priority: TaskPriority;
   status?: TaskStatus;
   sourceLink?: string | null;
   sourceRef?: string | null;
   sourceThreadRef?: string | null;
   jiraStatus?: string | null;
+  estimatedEffortBucket?: TaskEffortBucket | null;
+  priorityExplanation?: string | null;
   decisionState?: TaskDecisionState | null;
   decisionConfidence?: number | null;
   decisionReason?: string | null;
@@ -1442,11 +1654,14 @@ export function upsertTask(input: {
       `
       UPDATE tasks
       SET title = @title,
+          stage = @stage,
+          stage_order = @stageOrder,
           priority = @priority,
           status = @status,
           source_link = @sourceLink,
           source_thread_ref = @sourceThreadRef,
           jira_status = @jiraStatus,
+          estimated_effort_bucket = @estimatedEffortBucket,
           jira_estimate_seconds = @jiraEstimateSeconds,
           jira_subtask_estimate_seconds = @jiraSubtaskEstimateSeconds,
           jira_planning_subtasks_json = @jiraPlanningSubtasksJson,
@@ -1456,6 +1671,7 @@ export function upsertTask(input: {
           decision_reason = @decisionReason,
           decision_reason_tags = @decisionReasonTags,
           personalization_version = @personalizationVersion,
+          priority_explanation = @priorityExplanation,
           selection_reason = @selectionReason,
           priority_reason = @priorityReason,
           score_breakdown_json = @scoreBreakdownJson,
@@ -1470,11 +1686,17 @@ export function upsertTask(input: {
       `
     ).run({
       title: input.title,
+      stage: overrideFlags.includes("stage") ? existing.stage : (input.stage ?? existing.stage ?? "Later"),
+      stageOrder:
+        overrideFlags.includes("stageOrder") || overrideFlags.includes("stage")
+          ? Number(existing.stage_order ?? 0)
+          : (input.stageOrder ?? Number(existing.stage_order ?? 0)),
       priority: overrideFlags.includes("priority") ? existing.priority : input.priority,
       status: overrideFlags.includes("status") ? existing.status : (input.status ?? existing.status),
       sourceLink: input.sourceLink ?? null,
       sourceThreadRef: input.sourceThreadRef ?? null,
       jiraStatus: input.jiraStatus ?? null,
+      estimatedEffortBucket: input.estimatedEffortBucket ?? existing.estimated_effort_bucket ?? null,
       jiraEstimateSeconds: input.jiraEstimateSeconds ?? existing.jira_estimate_seconds ?? null,
       jiraSubtaskEstimateSeconds: input.jiraSubtaskEstimateSeconds ?? existing.jira_subtask_estimate_seconds ?? null,
       jiraPlanningSubtasksJson: JSON.stringify(input.jiraPlanningSubtasks ?? (() => {
@@ -1490,6 +1712,7 @@ export function upsertTask(input: {
       decisionReason: input.decisionReason ?? existing.decision_reason ?? null,
       decisionReasonTags: JSON.stringify(input.decisionReasonTags ?? parseJsonArray(existing.decision_reason_tags)),
       personalizationVersion: input.personalizationVersion ?? existing.personalization_version ?? null,
+      priorityExplanation: input.priorityExplanation ?? existing.priority_explanation ?? null,
       selectionReason: input.selectionReason ?? existing.selection_reason ?? null,
       priorityReason: input.priorityReason ?? existing.priority_reason ?? null,
       scoreBreakdownJson: JSON.stringify(input.scoreBreakdown ?? parseJsonValue(existing.score_breakdown_json, [])),
@@ -1507,7 +1730,7 @@ export function upsertTask(input: {
     db.prepare(
       `
       INSERT INTO tasks (
-        title, source, priority, status, source_link, source_ref, source_thread_ref, jira_status,
+        title, source, stage, stage_order, priority, status, source_link, source_ref, source_thread_ref, jira_status,
         jira_estimate_seconds,
         jira_subtask_estimate_seconds, jira_planning_subtasks_json,
         ignored, deferred_until, reminder_state, last_reminded_at, estimated_effort_bucket,
@@ -1517,10 +1740,10 @@ export function upsertTask(input: {
         history_signals_json, last_changed_by, last_changed_at, was_user_overridden, restored_at, rejected_at,
         created_at, updated_at
       ) VALUES (
-        @title, @source, @priority, @status, @sourceLink, @sourceRef, @sourceThreadRef, @jiraStatus,
+        @title, @source, @stage, @stageOrder, @priority, @status, @sourceLink, @sourceRef, @sourceThreadRef, @jiraStatus,
         @jiraEstimateSeconds,
         @jiraSubtaskEstimateSeconds, @jiraPlanningSubtasksJson,
-        0, NULL, NULL, NULL, NULL, NULL, NULL, 0, 0, NULL, @lastActivityAt, '[]', @decisionState, @decisionConfidence,
+        0, NULL, NULL, NULL, @estimatedEffortBucket, NULL, @priorityExplanation, 0, 0, NULL, @lastActivityAt, '[]', @decisionState, @decisionConfidence,
         @decisionReason, @decisionReasonTags, @personalizationVersion, @selectionReason, @priorityReason, @scoreBreakdownJson,
         @historySignalsJson, @lastChangedBy, @lastChangedAt, 0, @restoredAt, @rejectedAt, @createdAt, @updatedAt
       )
@@ -1528,12 +1751,16 @@ export function upsertTask(input: {
     ).run({
       title: input.title,
       source: input.source,
+      stage: input.stage ?? "Later",
+      stageOrder: input.stageOrder ?? 0,
       priority: input.priority,
       status: input.status ?? "Not Started",
       sourceLink: input.sourceLink ?? null,
       sourceRef: input.sourceRef ?? null,
       sourceThreadRef: input.sourceThreadRef ?? null,
       jiraStatus: input.jiraStatus ?? null,
+      estimatedEffortBucket: input.estimatedEffortBucket ?? null,
+      priorityExplanation: input.priorityExplanation ?? null,
       jiraEstimateSeconds: input.jiraEstimateSeconds ?? null,
       jiraSubtaskEstimateSeconds: input.jiraSubtaskEstimateSeconds ?? null,
       jiraPlanningSubtasksJson: JSON.stringify(input.jiraPlanningSubtasks ?? []),
@@ -1559,6 +1786,8 @@ export function upsertTask(input: {
 
 export function createManualTask(input: {
   title: string;
+  stage?: TaskStage;
+  stageOrder?: number;
   priority?: TaskPriority;
   status?: TaskStatus;
 }) {
@@ -1568,12 +1797,12 @@ export function createManualTask(input: {
     .prepare(
       `
       INSERT INTO tasks (
-        title, source, priority, status, ignored, deferred_until, reminder_state, last_reminded_at,
+        title, source, stage, stage_order, priority, status, ignored, deferred_until, reminder_state, last_reminded_at,
         estimated_effort_bucket, priority_score, priority_explanation, task_age_days, carry_forward_count,
         completed_at, last_activity_at, manual_override_flags, selection_reason, priority_reason,
         score_breakdown_json, history_signals_json, last_changed_by, last_changed_at, created_at, updated_at
       ) VALUES (
-        @title, 'Manual', @priority, @status, 0, NULL, NULL, NULL,
+        @title, 'Manual', @stage, @stageOrder, @priority, @status, 0, NULL, NULL, NULL,
         NULL, NULL, NULL, 0, 0, @completedAt, @lastActivityAt, '["priority","status"]', @selectionReason, @priorityReason,
         '[]', '[]', 'user', @lastChangedAt, @createdAt, @updatedAt
       )
@@ -1581,6 +1810,8 @@ export function createManualTask(input: {
     )
     .run({
       title: input.title,
+      stage: input.stage ?? "Later",
+      stageOrder: input.stageOrder ?? 0,
       priority: input.priority ?? "Medium",
       status,
       completedAt: status === "Completed" ? now : null,
@@ -1599,7 +1830,7 @@ export function createManualTask(input: {
 
 export function updateTask(
   id: number,
-  patch: Partial<Pick<Task, "title" | "priority" | "status" | "deferredUntil" | "sourceLink" | "jiraStatus">> & {
+  patch: Partial<Pick<Task, "title" | "stage" | "stageOrder" | "priority" | "status" | "deferredUntil" | "sourceLink" | "jiraStatus">> & {
     manualOverrideFlags?: string[];
     priorityScore?: number | null;
     priorityExplanation?: string | null;
@@ -1646,6 +1877,8 @@ export function updateTask(
     `
     UPDATE tasks
     SET title = @title,
+        stage = @stage,
+        stage_order = @stageOrder,
         priority = @priority,
         status = @status,
         source_link = @sourceLink,
@@ -1684,6 +1917,8 @@ export function updateTask(
   ).run({
     id,
     title: patch.title ?? existing.title,
+    stage: patch.stage ?? existing.stage ?? "Later",
+    stageOrder: patch.stageOrder ?? Number(existing.stage_order ?? 0),
     priority: patch.priority ?? existing.priority,
     status: nextStatus,
     sourceLink: patch.sourceLink ?? existing.source_link ?? null,
@@ -1756,15 +1991,21 @@ export function deleteTask(id: number) {
 export function replaceMeetings(meetings: Omit<Meeting, "id" | "createdAt">[]) {
   const now = new Date().toISOString();
   const transaction = db.transaction(() => {
+    const existingAttendance = new Map<string, "attending" | "unattending">(
+      (db.prepare("SELECT external_id, attendance_status FROM meetings WHERE external_id IS NOT NULL").all() as Array<{
+        external_id: string;
+        attendance_status: string | null;
+      }>).map((row) => [row.external_id, row.attendance_status === "unattending" ? "unattending" : "attending"])
+    );
     db.prepare("DELETE FROM meetings").run();
     const insert = db.prepare(
       `
       INSERT INTO meetings (
         external_id, title, start_time, end_time, time_zone, duration_minutes, meeting_link,
-        meeting_link_type, is_cancelled, created_at
+        meeting_link_type, is_cancelled, attendance_status, created_at
       ) VALUES (
         @externalId, @title, @startTime, @endTime, @timeZone, @durationMinutes, @meetingLink,
-        @meetingLinkType, @isCancelled, @createdAt
+        @meetingLinkType, @isCancelled, @attendanceStatus, @createdAt
       )
       `
     );
@@ -1772,6 +2013,7 @@ export function replaceMeetings(meetings: Omit<Meeting, "id" | "createdAt">[]) {
       insert.run({
         ...meeting,
         isCancelled: meeting.isCancelled ? 1 : 0,
+        attendanceStatus: meeting.externalId ? existingAttendance.get(meeting.externalId) ?? meeting.attendanceStatus ?? "attending" : meeting.attendanceStatus ?? "attending",
         createdAt: now
       });
     }
@@ -1858,6 +2100,8 @@ export function saveAutomationSettings(
       | "scheduleEnabled"
       | "scheduleTimeLocal"
       | "scheduleTimezone"
+      | "workdayStartLocal"
+      | "workdayEndLocal"
       | "remindersEnabled"
       | "reminderCadenceHours"
       | "desktopNotificationsEnabled"
@@ -1875,6 +2119,8 @@ export function saveAutomationSettings(
     SET schedule_enabled = @scheduleEnabled,
         schedule_time_local = @scheduleTimeLocal,
         schedule_timezone = @scheduleTimezone,
+        workday_start_local = @workdayStartLocal,
+        workday_end_local = @workdayEndLocal,
         reminders_enabled = @remindersEnabled,
         reminder_cadence_hours = @reminderCadenceHours,
         desktop_notifications_enabled = @desktopNotificationsEnabled,
@@ -1888,6 +2134,8 @@ export function saveAutomationSettings(
     scheduleEnabled: Number(patch.scheduleEnabled ?? existing.scheduleEnabled),
     scheduleTimeLocal: patch.scheduleTimeLocal ?? existing.scheduleTimeLocal,
     scheduleTimezone: patch.scheduleTimezone ?? existing.scheduleTimezone,
+    workdayStartLocal: patch.workdayStartLocal ?? existing.workdayStartLocal,
+    workdayEndLocal: patch.workdayEndLocal ?? existing.workdayEndLocal,
     remindersEnabled: Number(patch.remindersEnabled ?? existing.remindersEnabled),
     reminderCadenceHours: patch.reminderCadenceHours ?? existing.reminderCadenceHours,
     desktopNotificationsEnabled: Number(
@@ -2008,7 +2256,7 @@ export function getIgnoredRejectedTaskCount() {
 
 export function clearSoftDevelopmentData() {
   const transaction = db.transaction(() => {
-    db.prepare("DELETE FROM tasks WHERE source IN ('Email', 'Jira')").run();
+    db.prepare("DELETE FROM tasks").run();
     db.prepare("DELETE FROM meetings").run();
     db.prepare("DELETE FROM reminders").run();
     db.prepare("DELETE FROM rejected_tasks").run();
@@ -2019,7 +2267,9 @@ export function clearSoftDevelopmentData() {
     db.prepare("DELETE FROM audit_events").run();
     db.prepare("DELETE FROM planner_run_details").run();
     db.prepare("DELETE FROM task_state_events").run();
-    db.prepare("DELETE FROM sync_state WHERE provider IN ('microsoft', 'jira', 'plan')").run();
+    db.prepare("DELETE FROM home_schedule_entries").run();
+    db.prepare("DELETE FROM home_meeting_overrides").run();
+    db.prepare("DELETE FROM home_schedule_days").run();
   });
 
   transaction();
@@ -2042,6 +2292,9 @@ export function clearHardDevelopmentData() {
     DELETE FROM audit_events;
     DELETE FROM planner_run_details;
     DELETE FROM task_state_events;
+    DELETE FROM home_schedule_entries;
+    DELETE FROM home_meeting_overrides;
+    DELETE FROM home_schedule_days;
   `);
 
   db.prepare(

@@ -7,8 +7,11 @@ import {
   recordTaskStateEvent,
   createManualTask,
   deleteIntegrationConnection,
+  deleteHomeScheduleEntry,
   deleteTask,
+  hasHomeScheduleOverrideDay,
   getMeetingById,
+  updateMeetingAttendanceStatus,
   listAuditEvents,
   getAutomationSettings,
   getIgnoredRejectedTaskCount,
@@ -18,23 +21,30 @@ import {
   getRejectedTaskBySource,
   getRejectedTaskBySourceThread,
   getTaskById,
+  getNextStageOrder,
   getTaskBySource,
   getTaskBySourceThread,
   getSyncState,
   getUserPriorityProfile,
   listIntegrationConnections,
+  listHiddenHomeMeetingIds,
   listIgnoredRejectedTasks,
   listMeetings,
+  listHomeScheduleEntries,
   listPlannerRunDetails,
   listReminderItems,
   listRejectedTasks,
   listTasks,
+  listTasksByStage,
   listDeferredTasks,
   logTaskDecisionEvent,
   normalizeTask,
+  reorderTasksWithinStage,
+  replaceHomeScheduleEntries,
   saveAutomationSettings,
   saveIntegrationConnection,
   saveUserPriorityProfile,
+  setHomeMeetingVisibility,
   updateTask,
   updateRejectedTask,
   updateReminder,
@@ -62,6 +72,7 @@ import {
   getMicrosoftAuthUrl
 } from "./providers/microsoft.js";
 import { sendMailWithAccessToken } from "./providers/microsoft.js";
+import type { HomeScheduleEntry, Meeting, Task, TaskPriority, TaskStage } from "./types.js";
 import {
   generatePlan,
   getDeferredTasksPayload,
@@ -76,6 +87,7 @@ import {
   getInsightsHistoryPayload,
   getInsightsOverviewPayload,
   getInsightsTodayPayload,
+  getInsightsUpdatesPayload,
   getTaskInsightsPayload
 } from "./services/insights.js";
 import { createCorrelationId, logEvent } from "./services/logger.js";
@@ -122,21 +134,53 @@ app.use((req, res, next) => {
   next();
 });
 
+const taskStageSchema = z.enum(["Now", "Next", "Later", "Review"]);
+
 const taskCreateSchema = z.object({
   title: z.string().min(1),
+  stage: taskStageSchema.optional(),
   priority: z.enum(["High", "Medium", "Low"]).optional(),
   status: z.enum(["Not Started", "In Progress", "Completed"]).optional()
 });
 
 const taskUpdateSchema = taskCreateSchema
   .partial()
-  .extend({ deferredUntil: z.string().datetime().nullable().optional() });
+  .extend({
+    deferredUntil: z.string().datetime().nullable().optional(),
+    stageOrder: z.number().int().min(0).optional()
+  });
 
 const reminderUpdateSchema = z.object({
   status: z.enum(["active", "dismissed", "resolved"]).optional(),
   reason: z.string().min(1).optional(),
   scheduledFor: z.string().datetime().nullable().optional(),
   throttleUntil: z.string().datetime().nullable().optional()
+});
+
+const meetingAttendanceSchema = z.object({
+  attendanceStatus: z.enum(["attending", "unattending"])
+});
+
+const homeScheduleEntrySchema = z.object({
+  entryId: z.string().min(1),
+  taskId: z.number().int().positive(),
+  startMinutes: z.number().int().min(0).max(24 * 60),
+  durationMinutes: z.number().int().min(15).max(24 * 60),
+  source: z.enum(["planner", "user"])
+});
+
+const homeScheduleReplaceSchema = z.object({
+  dayKey: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+  entries: z.array(homeScheduleEntrySchema)
+});
+
+const homeScheduleFillSchema = z.object({
+  dayKey: z.string().regex(/^\d{4}-\d{2}-\d{2}$/)
+});
+
+const homeMeetingOverrideSchema = z.object({
+  dayKey: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+  action: z.enum(["remove", "attending", "unattending"])
 });
 
 const automationSettingsSchema = z.object({
@@ -187,6 +231,7 @@ const taskFeedbackSchema = z.object({
   action: z.enum([
     "reject",
     "restore",
+    "stage_changed",
     "priority_changed",
     "status_changed",
     "deferred",
@@ -201,6 +246,11 @@ const taskFeedbackSchema = z.object({
 
 const rejectedTaskPatchSchema = z.object({
   action: z.enum(["always_ignore_exact", "always_ignore_similar", "should_have_been_included", "keep_rejected"])
+});
+
+const taskBoardReorderSchema = z.object({
+  stage: taskStageSchema,
+  orderedTaskIds: z.array(z.number().int().positive())
 });
 
 const clientEventSchema = z.object({
@@ -243,6 +293,7 @@ async function captureTaskFeedback(input: {
     | "system_evaluated"
     | "reject"
     | "restore"
+    | "stage_changed"
     | "priority_changed"
     | "status_changed"
     | "deferred"
@@ -315,6 +366,439 @@ function extractIssueKeys(value: string) {
   return [...new Set((value.toUpperCase().match(/\b[A-Z][A-Z0-9]+-\d+\b/g) ?? []).map((key) => key.trim()))];
 }
 
+function stripHtmlForDisplay(value: string | null | undefined) {
+  if (!value) return null;
+  return value
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&amp;/gi, "&")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/\s+/g, " ")
+    .trim() || null;
+}
+
+function localDayKey(value = new Date()) {
+  const year = value.getFullYear();
+  const month = `${value.getMonth() + 1}`.padStart(2, "0");
+  const day = `${value.getDate()}`.padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+function localMeetingDayKey(meeting: Meeting) {
+  const target = new Date(meeting.startTime);
+  return localDayKey(target);
+}
+
+function workdayWindowMinutes() {
+  const automation = getAutomationSettings();
+  const parse = (value: string, fallbackHours: number, fallbackMinutes: number) => {
+    const match = value.match(/^(\d{2}):(\d{2})$/);
+    if (!match) return fallbackHours * 60 + fallbackMinutes;
+    return Number(match[1]) * 60 + Number(match[2]);
+  };
+  return {
+    startMinutes: parse(automation.workdayStartLocal, 9, 30),
+    endMinutes: parse(automation.workdayEndLocal, 18, 0)
+  };
+}
+
+function visibleMeetingsForHome(dayKey: string) {
+  const hiddenMeetingIds = new Set(listHiddenHomeMeetingIds(dayKey));
+  return listMeetings().filter(
+    (meeting) =>
+      !meeting.isCancelled &&
+      meeting.attendanceStatus !== "unattending" &&
+      localMeetingDayKey(meeting) === dayKey &&
+      !hiddenMeetingIds.has(meeting.id)
+  );
+}
+
+function meetingIntervalsForHome(dayKey: string) {
+  return visibleMeetingsForHome(dayKey).map((meeting) => {
+    const start = new Date(meeting.startTime);
+    const end = new Date(meeting.endTime);
+    return {
+      meeting,
+      startMinutes: start.getHours() * 60 + start.getMinutes(),
+      endMinutes: end.getHours() * 60 + end.getMinutes()
+    };
+  });
+}
+
+function sortTasksForSchedule(tasks: Task[]) {
+  return [...tasks].sort((left, right) => {
+    if (left.stage !== right.stage) {
+      const stageWeight: Record<TaskStage, number> = { Now: 0, Next: 1, Later: 2, Review: 3 };
+      return stageWeight[left.stage] - stageWeight[right.stage];
+    }
+    if (left.status !== right.status) {
+      return left.status === "In Progress" ? -1 : right.status === "In Progress" ? 1 : 0;
+    }
+    const priorityWeight: Record<TaskPriority, number> = { High: 0, Medium: 1, Low: 2 };
+    if (left.priority !== right.priority) {
+      return priorityWeight[left.priority] - priorityWeight[right.priority];
+    }
+    return (right.priorityScore ?? 0) - (left.priorityScore ?? 0);
+  });
+}
+
+function durationForHomeTask(task: Task) {
+  if (task.source === "Email") return 15;
+  if (task.estimatedEffortBucket === "15 min") return 15;
+  if (task.estimatedEffortBucket === "30 min") return 30;
+  if (task.estimatedEffortBucket === "1 hour") return 60;
+  if (task.estimatedEffortBucket === "2+ hours") return 90;
+  return 30;
+}
+
+function buildDefaultHomeScheduleEntries(dayKey: string) {
+  const today = getTodaySnapshot();
+  return today.dayPlan.blocks
+    .filter((block) => block.kind === "task" && block.taskId !== null)
+    .map((block) => {
+      const start = new Date(block.startTime);
+      return {
+        entryId: `planner:${block.id}`,
+        dayKey,
+        taskId: block.taskId!,
+        startMinutes: start.getHours() * 60 + start.getMinutes(),
+        durationMinutes: block.durationMinutes,
+        source: "planner" as const,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString()
+      };
+    });
+}
+
+function homeScheduleStateForDay(dayKey: string) {
+  const storedEntries = listHomeScheduleEntries(dayKey);
+  const hasOverride = hasHomeScheduleOverrideDay(dayKey);
+  const userEntries = storedEntries.filter((entry) => entry.source === "user");
+  const plannerEntries = storedEntries.filter((entry) => entry.source === "planner");
+  const entries =
+    userEntries.length > 0
+      ? userEntries
+      : plannerEntries.length > 0
+        ? buildDefaultHomeScheduleEntries(dayKey)
+        : hasOverride
+          ? []
+          : buildDefaultHomeScheduleEntries(dayKey);
+  const meetings = meetingIntervalsForHome(dayKey);
+  const { startMinutes, endMinutes } = workdayWindowMinutes();
+  const occupied = [
+    ...meetings.map((item) => ({ startMinutes: item.startMinutes, endMinutes: item.endMinutes })),
+    ...entries.map((entry) => ({ startMinutes: entry.startMinutes, endMinutes: entry.startMinutes + entry.durationMinutes }))
+  ].sort((left, right) => left.startMinutes - right.startMinutes);
+
+  let cursor = startMinutes;
+  let hasEmptyWorkingSlots = false;
+  for (const interval of occupied) {
+    if (interval.endMinutes <= startMinutes || interval.startMinutes >= endMinutes) continue;
+    const clampedStart = Math.max(startMinutes, interval.startMinutes);
+    if (clampedStart - cursor >= 15) {
+      hasEmptyWorkingSlots = true;
+      break;
+    }
+    cursor = Math.max(cursor, Math.min(endMinutes, interval.endMinutes));
+  }
+  if (!hasEmptyWorkingSlots && endMinutes - cursor >= 15) {
+    hasEmptyWorkingSlots = true;
+  }
+
+  return {
+    dayKey,
+    entries,
+    hiddenMeetingIds: listHiddenHomeMeetingIds(dayKey),
+    hasEmptyWorkingSlots
+  };
+}
+
+function canonicalizePlannerScheduleEntries(
+  dayKey: string,
+  plannerEntries: HomeScheduleEntry[],
+  userEntries: HomeScheduleEntry[]
+) {
+  const meetingIntervals = meetingIntervalsForHome(dayKey).map((item) => ({
+    start: item.startMinutes,
+    end: item.endMinutes
+  }));
+  const { startMinutes, endMinutes } = workdayWindowMinutes();
+  const accepted: HomeScheduleEntry[] = [];
+  const occupiedByUser = userEntries.map((entry) => ({
+    start: entry.startMinutes,
+    end: entry.startMinutes + entry.durationMinutes
+  }));
+  const seen = new Set<string>();
+
+  const sorted = [...plannerEntries].sort((left, right) => {
+    if (left.startMinutes !== right.startMinutes) return left.startMinutes - right.startMinutes;
+    return left.taskId - right.taskId;
+  });
+
+  for (const entry of sorted) {
+    const start = Math.max(startMinutes, entry.startMinutes);
+    const end = Math.min(endMinutes, entry.startMinutes + entry.durationMinutes);
+    const durationMinutes = end - start;
+    if (durationMinutes < 15) continue;
+
+    const duplicateKey = `${entry.taskId}:${start}:${durationMinutes}:${entry.source}`;
+    if (seen.has(duplicateKey)) continue;
+
+    const overlapsMeeting = meetingIntervals.some((interval) => start < interval.end && end > interval.start);
+    if (overlapsMeeting) continue;
+
+    const overlapsUser = occupiedByUser.some((interval) => start < interval.end && end > interval.start);
+    if (overlapsUser) continue;
+
+    const previous = accepted[accepted.length - 1];
+    if (
+      previous &&
+      previous.taskId === entry.taskId &&
+      previous.source === entry.source &&
+      start - (previous.startMinutes + previous.durationMinutes) <= 15
+    ) {
+      previous.durationMinutes = Math.max(previous.durationMinutes, end - previous.startMinutes);
+      previous.updatedAt = entry.updatedAt;
+      seen.add(duplicateKey);
+      continue;
+    }
+
+    const overlapsAccepted = accepted.some(
+      (acceptedEntry) =>
+        start < acceptedEntry.startMinutes + acceptedEntry.durationMinutes && end > acceptedEntry.startMinutes
+    );
+    if (overlapsAccepted) continue;
+
+    accepted.push({
+      ...entry,
+      startMinutes: start,
+      durationMinutes
+    });
+    seen.add(duplicateKey);
+  }
+
+  return accepted;
+}
+
+function syncTaskStagesFromHomeSchedule(dayKey: string) {
+  const scheduledTaskIds = new Set(listHomeScheduleEntries(dayKey).map((entry) => entry.taskId));
+  const activeTasks = listTasks(undefined, { includeDeferred: true }).filter((task) => task.status !== "Completed");
+  for (const task of activeTasks) {
+    if (scheduledTaskIds.has(task.id)) {
+      if (task.stage !== "Now") {
+        updateTask(task.id, {
+          stage: "Now",
+          stageOrder: 0,
+          priority: "High",
+          lastChangedBy: "user",
+          lastChangedAt: new Date().toISOString(),
+          wasUserOverridden: true
+        });
+      }
+      continue;
+    }
+    if (task.stage === "Now") {
+      updateTask(task.id, {
+        stage: "Next",
+        stageOrder: getNextStageOrder("Next"),
+        priority: task.priority === "High" ? "Medium" : task.priority,
+        lastChangedBy: "user",
+        lastChangedAt: new Date().toISOString(),
+        wasUserOverridden: true
+      });
+    }
+  }
+}
+
+function fillHomeScheduleForDay(dayKey: string) {
+  const effectiveEntries = homeScheduleStateForDay(dayKey).entries;
+  const visibleMeetings = meetingIntervalsForHome(dayKey);
+  const tasks = sortTasksForSchedule(
+    listTasks(undefined, { includeDeferred: true }).filter((task) => task.status !== "Completed" && task.stage !== "Review")
+  );
+  const { startMinutes, endMinutes } = workdayWindowMinutes();
+  const userEntries = effectiveEntries.filter((entry) => entry.source === "user");
+  const plannerEntries = canonicalizePlannerScheduleEntries(
+    dayKey,
+    effectiveEntries.filter((entry) => entry.source === "planner"),
+    userEntries
+  );
+  const nextEntries = [...userEntries, ...plannerEntries];
+  const occupied = () =>
+    [
+      ...visibleMeetings.map((item) => ({ start: item.startMinutes, end: item.endMinutes })),
+      ...nextEntries.map((entry) => ({ start: entry.startMinutes, end: entry.startMinutes + entry.durationMinutes }))
+    ].sort((left, right) => left.start - right.start);
+
+  const scheduledMinutesByTask = new Map<number, number>();
+  nextEntries.forEach((entry) => {
+    scheduledMinutesByTask.set(entry.taskId, (scheduledMinutesByTask.get(entry.taskId) ?? 0) + entry.durationMinutes);
+  });
+
+  const candidates = tasks.filter((task) => task.stage === "Now" || task.stage === "Next" || task.stage === "Later");
+  const chooseCandidate = (preferEmail: boolean, previousTaskId: number | null) => {
+    const filtered = candidates.filter((task) => {
+      if (preferEmail) {
+        return task.source === "Email" && task.priority !== "High";
+      }
+      return true;
+    });
+    if (!filtered.length) return null;
+
+    const ranked = [...filtered].sort((left, right) => {
+      const leftScheduled = scheduledMinutesByTask.get(left.id) ?? 0;
+      const rightScheduled = scheduledMinutesByTask.get(right.id) ?? 0;
+      if (leftScheduled !== rightScheduled) return leftScheduled - rightScheduled;
+      return sortTasksForSchedule([left, right])[0]?.id === left.id ? -1 : 1;
+    });
+
+    return ranked.find((task) => task.id !== previousTaskId) ?? ranked[0] ?? null;
+  };
+  const gaps: Array<{ start: number; end: number }> = [];
+  let cursor = startMinutes;
+  for (const interval of occupied()) {
+    if (interval.end <= startMinutes || interval.start >= endMinutes) continue;
+    const gapStart = cursor;
+    const gapEnd = Math.max(gapStart, Math.min(endMinutes, interval.start));
+    if (gapEnd - gapStart >= 15) {
+      gaps.push({ start: gapStart, end: gapEnd });
+    }
+    cursor = Math.max(cursor, Math.min(endMinutes, interval.end));
+  }
+  if (endMinutes - cursor >= 15) {
+    gaps.push({ start: cursor, end: endMinutes });
+  }
+
+  let userEntryCounter = 0;
+  for (const gap of gaps) {
+    let gapCursor = gap.start;
+    let previousTaskId: number | null = null;
+    while (gap.end - gapCursor >= 15) {
+      const totalScheduled = [...scheduledMinutesByTask.values()].reduce((sum, value) => sum + value, 0);
+      const lowPriorityEmailMinutes = candidates
+        .filter((task) => task.source === "Email" && task.priority !== "High")
+        .reduce((sum, task) => sum + (scheduledMinutesByTask.get(task.id) ?? 0), 0);
+      const wantsEmail = totalScheduled >= 60 && lowPriorityEmailMinutes / Math.max(1, totalScheduled) < 0.25;
+      const candidate: Task | null =
+        chooseCandidate(wantsEmail, previousTaskId) ??
+        chooseCandidate(false, previousTaskId);
+
+      if (!candidate) break;
+
+      const desiredDuration = Math.min(gap.end - gapCursor, durationForHomeTask(candidate));
+      const durationMinutes = desiredDuration >= 45 ? desiredDuration : Math.max(15, Math.min(30, desiredDuration));
+      nextEntries.push({
+        entryId: `user-fill:${dayKey}:${candidate.id}:${gapCursor}:${userEntryCounter++}`,
+        dayKey,
+        taskId: candidate.id,
+        startMinutes: gapCursor,
+        durationMinutes,
+        source: "planner",
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString()
+      });
+      scheduledMinutesByTask.set(candidate.id, (scheduledMinutesByTask.get(candidate.id) ?? 0) + durationMinutes);
+      gapCursor += durationMinutes;
+      previousTaskId = candidate.id;
+    }
+  }
+
+  const mergedEntries = [...nextEntries]
+    .sort((left, right) => left.startMinutes - right.startMinutes)
+    .reduce<HomeScheduleEntry[]>((merged, entry) => {
+      const previous = merged[merged.length - 1];
+      if (
+        previous &&
+        previous.taskId === entry.taskId &&
+        previous.source === entry.source &&
+        entry.startMinutes - (previous.startMinutes + previous.durationMinutes) <= 15
+      ) {
+        previous.durationMinutes = Math.max(
+          previous.durationMinutes,
+          entry.startMinutes + entry.durationMinutes - previous.startMinutes
+        );
+        previous.updatedAt = entry.updatedAt;
+        return merged;
+      }
+      merged.push({ ...entry });
+      return merged;
+    }, []);
+
+  replaceHomeScheduleEntries(
+    dayKey,
+    mergedEntries.map((entry) => ({
+      entryId: entry.entryId,
+      taskId: entry.taskId,
+      startMinutes: entry.startMinutes,
+      durationMinutes: entry.durationMinutes,
+      source: entry.source
+    }))
+  );
+  syncTaskStagesFromHomeSchedule(dayKey);
+}
+
+function buildHomePayload() {
+  const today = getTodaySnapshot();
+  const dayKey = today.dayPlan.summary.dayKey;
+  const tasks = listTasks().filter((task) => task.status !== "Completed");
+  const meetings = visibleMeetingsForHome(dayKey);
+  const activeMeetings = meetings.filter((meeting) => meeting.attendanceStatus !== "unattending");
+  const deferredTasks = listTasksByStage("Next");
+  const reminders = listReminderItems();
+  const emailTaskCount = tasks.filter((task) => task.source === "Email").length;
+  const jiraTaskCount = tasks.filter((task) => task.source === "Jira").length;
+  const inProgressTaskCount = tasks.filter((task) => task.status === "In Progress").length;
+  const highPriorityTaskCount = tasks.filter((task) => task.priority === "High").length;
+  const upcomingMeeting =
+    activeMeetings.find((meeting) => new Date(meeting.endTime).getTime() >= Date.now()) ??
+    activeMeetings[0] ??
+    null;
+  const bannerTitle = (() => {
+    if (inProgressTaskCount > 0 && highPriorityTaskCount > 0) {
+      return `You have ${inProgressTaskCount} task${inProgressTaskCount === 1 ? "" : "s"} in motion and ${highPriorityTaskCount} high-priority item${highPriorityTaskCount === 1 ? "" : "s"} to protect today.`;
+    }
+    if (highPriorityTaskCount > 0) {
+      return `You have ${highPriorityTaskCount} high-priority task${highPriorityTaskCount === 1 ? "" : "s"} that deserve attention today.`;
+    }
+    if (emailTaskCount > 0 && jiraTaskCount > 0) {
+      return `Your day blends Jira execution with email follow-through; focus on what matters next.`;
+    }
+    if (emailTaskCount > 0) {
+      return `Your inbox has active work waiting, and the planner has pulled forward the tasks most likely to matter.`;
+    }
+    if (jiraTaskCount > 0) {
+      return `Your assigned Jira work is lined up so you can move from active stories into the next best tasks cleanly.`;
+    }
+    if (activeMeetings.length > 0) {
+      return `Meetings shape the day, and the planner is keeping the rest of your work around them.`;
+    }
+    return `Here’s what deserves your attention today.`;
+  })();
+
+  return {
+    banner: {
+      title: bannerTitle,
+      totalTaskCount: tasks.length,
+      emailTaskCount,
+      jiraTaskCount,
+      meetingCount: activeMeetings.length,
+      followUpCount: reminders.length + deferredTasks.length + listTasksByStage("Review").length,
+      inProgressTaskCount,
+      highPriorityTaskCount,
+      summary: `${inProgressTaskCount} in progress • ${highPriorityTaskCount} high priority • ${activeMeetings.length} meetings`,
+      upcomingMeetingLabel: upcomingMeeting ? upcomingMeeting.title : null
+    },
+    tasks,
+    meetings,
+    deferredTasks,
+    reminders,
+    schedule: homeScheduleStateForDay(dayKey)
+  };
+}
+
 async function refreshJiraTaskFromSource(taskId: number, issueKey: string) {
   const issue = await fetchJiraIssueForSync(issueKey);
   let planningContext: Awaited<ReturnType<typeof fetchJiraIssuePlanningContext>> | null = null;
@@ -354,6 +838,130 @@ app.get("/api/health", (_req, res) => {
   res.json({ ok: true });
 });
 
+app.get("/api/home", (_req, res) => {
+  res.json(buildHomePayload());
+});
+
+app.get("/api/home/schedule", (req, res) => {
+  const dayKey = typeof req.query.day === "string" && req.query.day ? req.query.day : localDayKey(new Date());
+  res.json({ schedule: homeScheduleStateForDay(dayKey) });
+});
+
+app.put("/api/home/schedule/tasks", (req, res) => {
+  const parsed = homeScheduleReplaceSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ message: "Invalid home schedule payload" });
+  }
+
+  const validTaskIds = new Set(
+    listTasks(undefined, { includeDeferred: true })
+      .filter((task) => task.status !== "Completed")
+      .map((task) => task.id)
+  );
+  const previousEntries = listHomeScheduleEntries(parsed.data.dayKey);
+  const previousEntriesById = new Map(previousEntries.map((entry) => [entry.entryId, entry] as const));
+  const entries = parsed.data.entries
+    .filter((entry) => validTaskIds.has(entry.taskId))
+    .map((entry) => ({
+      ...entry,
+      source: "user" as const
+    }))
+    .sort((left, right) => left.startMinutes - right.startMinutes);
+
+  replaceHomeScheduleEntries(parsed.data.dayKey, entries);
+  for (const entry of entries) {
+    const task = getTaskById(entry.taskId);
+    if (!task) continue;
+    const previous = previousEntriesById.get(entry.entryId);
+    if (!previous) {
+      recordUserTaskMutation({
+        taskId: task.id,
+        source: task.source,
+        sourceRef: task.sourceRef ?? null,
+        sourceThreadRef: task.sourceThreadRef ?? null,
+        eventType: "timeline_slot_added",
+        reason: `Scheduled on timeline for ${parsed.data.dayKey}.`,
+        after: entry
+      });
+      continue;
+    }
+    if (previous.startMinutes !== entry.startMinutes || previous.durationMinutes !== entry.durationMinutes) {
+      recordUserTaskMutation({
+        taskId: task.id,
+        source: task.source,
+        sourceRef: task.sourceRef ?? null,
+        sourceThreadRef: task.sourceThreadRef ?? null,
+        eventType: "timeline_slot_updated",
+        reason: `Timeline slot updated for ${parsed.data.dayKey}.`,
+        before: previous,
+        after: entry
+      });
+    }
+  }
+  syncTaskStagesFromHomeSchedule(parsed.data.dayKey);
+  return res.json({ schedule: homeScheduleStateForDay(parsed.data.dayKey) });
+});
+
+app.delete("/api/home/schedule/tasks/:entryId", (req, res) => {
+  const deleted = deleteHomeScheduleEntry(req.params.entryId);
+  if (!deleted) {
+    return res.status(404).json({ message: "Schedule entry not found" });
+  }
+  const task = getTaskById(deleted.taskId);
+  if (task) {
+    recordUserTaskMutation({
+      taskId: task.id,
+      source: task.source,
+      sourceRef: task.sourceRef ?? null,
+      sourceThreadRef: task.sourceThreadRef ?? null,
+      eventType: "timeline_slot_removed",
+      reason: `Removed timeline slot for ${deleted.dayKey}.`,
+      before: deleted
+    });
+  }
+  syncTaskStagesFromHomeSchedule(deleted.dayKey);
+  return res.json({ schedule: homeScheduleStateForDay(deleted.dayKey) });
+});
+
+app.post("/api/home/schedule/tasks/fill", (req, res) => {
+  const parsed = homeScheduleFillSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ message: "Invalid fill payload" });
+  }
+  fillHomeScheduleForDay(parsed.data.dayKey);
+  return res.json({ schedule: homeScheduleStateForDay(parsed.data.dayKey) });
+});
+
+app.patch("/api/home/schedule/meetings/:id", (req, res) => {
+  const parsed = homeMeetingOverrideSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ message: "Invalid home meeting action payload" });
+  }
+
+  const meeting = getMeetingById(Number(req.params.id));
+  if (!meeting) {
+    return res.status(404).json({ message: "Meeting not found" });
+  }
+
+  if (parsed.data.action === "remove") {
+    setHomeMeetingVisibility(parsed.data.dayKey, meeting.id, "removed");
+    return res.json({ schedule: homeScheduleStateForDay(parsed.data.dayKey) });
+  }
+
+  setHomeMeetingVisibility(parsed.data.dayKey, meeting.id, "active");
+  const updatedMeeting = updateMeetingAttendanceStatus(meeting.id, parsed.data.action);
+  if (!updatedMeeting) {
+    return res.status(404).json({ message: "Meeting not found" });
+  }
+  if (parsed.data.action === "unattending") {
+    fillHomeScheduleForDay(parsed.data.dayKey);
+  }
+  return res.json({
+    meeting: updatedMeeting,
+    schedule: homeScheduleStateForDay(parsed.data.dayKey)
+  });
+});
+
 app.get("/api/today", (_req, res) => {
   res.json(getTodaySnapshot());
 });
@@ -369,6 +977,13 @@ app.get("/api/insights/today", (_req, res) => {
 app.get("/api/insights/history", (req, res) => {
   const limit = Number(req.query.limit ?? 30);
   res.json(getInsightsHistoryPayload(Number.isFinite(limit) ? limit : 30));
+});
+
+app.get("/api/insights/updates", (req, res) => {
+  const limit = Number(req.query.limit ?? 300);
+  const startDayKey = typeof req.query.start === "string" ? req.query.start : null;
+  const endDayKey = typeof req.query.end === "string" ? req.query.end : null;
+  res.json(getInsightsUpdatesPayload(startDayKey, endDayKey, Number.isFinite(limit) ? limit : 300));
 });
 
 app.get("/api/insights/history/:dayKey", (req, res) => {
@@ -579,6 +1194,28 @@ app.get("/api/tasks", (req, res) => {
   res.json({ tasks: listTasks(status) });
 });
 
+app.get("/api/tasks/board", (_req, res) => {
+  res.json({
+    now: listTasksByStage("Now"),
+    next: listTasksByStage("Next"),
+    later: listTasksByStage("Later"),
+    review: listTasksByStage("Review"),
+    rejected: listRejectedTasks(),
+    ignoredRejected: listIgnoredRejectedTasks()
+  });
+});
+
+app.post("/api/tasks/board/reorder", (req, res) => {
+  const parsed = taskBoardReorderSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ message: "Invalid board reorder payload" });
+  }
+  reorderTasksWithinStage(parsed.data.stage, parsed.data.orderedTaskIds);
+  return res.json({
+    tasks: listTasksByStage(parsed.data.stage)
+  });
+});
+
 app.get("/api/tasks/deferred", (_req, res) => {
   res.json(getDeferredTasksPayload());
 });
@@ -655,6 +1292,100 @@ app.get("/api/tasks/:id/details", async (req, res) => {
       message: error instanceof Error ? error.message : "Failed to fetch task details"
     });
   }
+});
+
+app.get("/api/meetings/:id", async (req, res) => {
+  const meeting = getMeetingById(Number(req.params.id));
+  if (!meeting) {
+    return res.status(404).json({ message: "Meeting not found" });
+  }
+
+  const baseDetail = {
+    id: meeting.id,
+    title: meeting.title,
+    startTime: meeting.startTime,
+    endTime: meeting.endTime,
+    timeZone: meeting.timeZone,
+    durationMinutes: meeting.durationMinutes,
+    meetingLink: meeting.meetingLink,
+    meetingLinkType: meeting.meetingLinkType,
+    isCancelled: meeting.isCancelled,
+    attendanceStatus: meeting.attendanceStatus,
+    organizer: null,
+    attendees: [] as string[],
+    location: null,
+    description: null,
+    bodyPreview: null
+  };
+
+  if (!meeting.externalId) {
+    return res.json({ detail: baseDetail });
+  }
+
+  try {
+    const session = await getOptionalMicrosoftSession(req);
+    if (!session) {
+      return res.json({ detail: baseDetail });
+    }
+
+    const graphToken = await acquireGraphTokenOnBehalfOf(session);
+    const detail = await fetchMeetingDetailWithAccessToken(meeting.externalId, graphToken);
+    return res.json({
+      detail: {
+        ...baseDetail,
+        title: detail.subject ?? meeting.title,
+        startTime: detail.start?.dateTime ?? meeting.startTime,
+        endTime: detail.end?.dateTime ?? meeting.endTime,
+        timeZone: detail.start?.timeZone ?? meeting.timeZone,
+        organizer: detail.organizer?.emailAddress?.name ?? detail.organizer?.emailAddress?.address ?? null,
+        attendees: (detail.attendees ?? [])
+          .map((entry) => entry.emailAddress?.name ?? entry.emailAddress?.address ?? "")
+          .filter(Boolean),
+        location: detail.location?.displayName ?? null,
+        description: stripHtmlForDisplay(detail.body?.content) ?? stripHtmlForDisplay(detail.bodyPreview),
+        bodyPreview: stripHtmlForDisplay(detail.bodyPreview),
+        meetingLink:
+          meeting.meetingLink ??
+          (detail.onlineMeeting?.joinUrl || detail.onlineMeetingUrl || detail.webLink || null),
+        meetingLinkType:
+          detail.onlineMeeting?.joinUrl || detail.onlineMeetingUrl
+            ? "join"
+            : meeting.meetingLinkType ?? (detail.webLink ? "calendar" : null),
+        isCancelled: Boolean(detail.isCancelled ?? meeting.isCancelled),
+        attendanceStatus: meeting.attendanceStatus
+      }
+    });
+  } catch (error) {
+    return res.json({ detail: baseDetail });
+  }
+});
+
+app.patch("/api/meetings/:id", (req, res) => {
+  const parsed = meetingAttendanceSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ message: "Invalid meeting payload" });
+  }
+
+  const meeting = updateMeetingAttendanceStatus(Number(req.params.id), parsed.data.attendanceStatus);
+  if (!meeting) {
+    return res.status(404).json({ message: "Meeting not found" });
+  }
+
+  logEvent({
+    eventType: "meeting.update",
+    requestId: getRequestId(res),
+    entityType: "meeting",
+    entityId: String(meeting.id),
+    status: "updated",
+    message: "Meeting attendance updated.",
+    metadata: {
+      meetingId: meeting.id,
+      title: meeting.title,
+      attendanceStatus: meeting.attendanceStatus
+    }
+  });
+
+  return res.json({ meeting });
 });
 
 app.post("/api/tasks/:id/email-reply/draft", async (req, res) => {
@@ -774,7 +1505,11 @@ app.post("/api/tasks", (req, res) => {
   if (!parsed.success) {
     return res.status(400).json({ message: "Invalid task payload" });
   }
-  const row = createManualTask(parsed.data);
+  const row = createManualTask({
+    ...parsed.data,
+    stage: parsed.data.stage ?? "Later",
+    stageOrder: getNextStageOrder(parsed.data.stage ?? "Later")
+  });
   const task = normalizeTask(row as Record<string, unknown>);
   recordUserTaskMutation({
     taskId: task.id,
@@ -855,6 +1590,10 @@ app.patch("/api/tasks/:id", (req, res) => {
   }
   const row = updateTask(Number(req.params.id), {
     ...parsed.data,
+    manualOverrideFlags: [
+      ...(parsed.data.stage ? ["stage"] : []),
+      ...(parsed.data.stageOrder !== undefined ? ["stageOrder"] : [])
+    ],
     lastChangedBy: "user",
     lastChangedAt: new Date().toISOString(),
     wasUserOverridden: true
@@ -888,6 +1627,21 @@ app.patch("/api/tasks/:id", (req, res) => {
         decisionReasonTags: task.decisionReasonTags
       });
     }
+    if (parsed.data.stage && parsed.data.stage !== existingTask.stage) {
+      void captureTaskFeedback({
+        taskId: task.id,
+        source: task.source,
+        sourceRef: task.sourceRef ?? null,
+        sourceThreadRef: task.sourceThreadRef ?? null,
+        action: "stage_changed",
+        title: task.title,
+        beforePriority: existingTask.priority,
+        afterPriority: task.priority,
+        decisionReason: task.decisionReason,
+        decisionReasonTags: task.decisionReasonTags,
+        context: `${existingTask.stage} -> ${task.stage}`
+      });
+    }
     if (parsed.data.status && parsed.data.status !== existingTask.status) {
       void captureTaskFeedback({
         taskId: task.id,
@@ -909,12 +1663,13 @@ app.patch("/api/tasks/:id", (req, res) => {
     entityType: "task",
     entityId: String(task.id),
     status: "updated",
-    message: "Task updated.",
-    metadata: {
-      taskId: task.id,
-      changedPriority: parsed.data.priority ?? null,
-      changedStatus: parsed.data.status ?? null
-    }
+      message: "Task updated.",
+      metadata: {
+        taskId: task.id,
+        changedStage: parsed.data.stage ?? null,
+        changedPriority: parsed.data.priority ?? null,
+        changedStatus: parsed.data.status ?? null
+      }
   });
   return res.json({ task });
 });

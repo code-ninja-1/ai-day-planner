@@ -15,27 +15,37 @@ import type {
   DiagnosticsPayload,
   EmailTaskDetail,
   EmailReplyDraft,
+  HomeListSection,
+  HomePayload,
   InsightsOverview,
   InsightsTodayPayload,
+  InsightsUpdatesPayload,
   IntegrationStatus,
   JiraTaskDetail,
   Meeting,
+  MeetingDetail,
   MeetingPrep,
   PersonalizationInsight,
   PlannerRunDetail,
   RejectedTask,
   Reminder,
   Task,
+  TaskBoardPayload,
   TaskDetail,
   TaskInsightsPayload,
   TaskPriority,
+  TaskStage,
+  TaskStateEvent,
   TaskStatus,
   TodayResponse,
   UserPriorityProfile
 } from "./types";
 
-type View = "today" | "tasks" | "deferred" | "rejected" | "reminders" | "insights" | "settings";
+type View = "home" | "today" | "tasks" | "deferred" | "rejected" | "reminders" | "insights" | "settings";
 type TaskFilter = TaskStatus | "All";
+type TaskSectionName = "Now" | "Next" | "Later" | "Review";
+type AppShellMode = "home" | "classic";
+type BoardColumn = TaskStage | "Reject";
 
 const priorityOrder: TaskPriority[] = ["High", "Medium", "Low"];
 const statusOptions: TaskStatus[] = ["In Progress", "Not Started", "Completed"];
@@ -109,17 +119,21 @@ function meetingActionLabel(meeting: TodayResponse["meetings"][number]) {
   return null;
 }
 
+function isActiveMeeting(meeting: TodayResponse["meetings"][number]) {
+  return !meeting.isCancelled && meeting.attendanceStatus !== "unattending";
+}
+
 function getUpcomingMeetingId(meetings: TodayResponse["meetings"]) {
   const now = Date.now();
-  const next = meetings.find((meeting) => !meeting.isCancelled && meetingInstant(meeting, "end").getTime() >= now);
-  return next?.id ?? meetings.find((meeting) => !meeting.isCancelled)?.id ?? meetings[0]?.id ?? null;
+  const next = meetings.find((meeting) => isActiveMeeting(meeting) && meetingInstant(meeting, "end").getTime() >= now);
+  return next?.id ?? meetings.find((meeting) => isActiveMeeting(meeting))?.id ?? meetings[0]?.id ?? null;
 }
 
 function getUpcomingJoinableMeetingId(meetings: TodayResponse["meetings"]) {
   const now = Date.now();
   const nextJoinable = meetings.find(
     (meeting) =>
-      !meeting.isCancelled &&
+      isActiveMeeting(meeting) &&
       meeting.meetingLinkType === "join" &&
       Boolean(meeting.meetingLink) &&
       meetingInstant(meeting, "end").getTime() >= now
@@ -223,6 +237,10 @@ function sourceLabel(task: Task) {
   return null;
 }
 
+function taskSection(task: Task): TaskSectionName {
+  return task.stage;
+}
+
 function nextJiraSubtask(task: Task) {
   return (
     task.jiraPlanningSubtasks.find((subtask) =>
@@ -255,6 +273,20 @@ function jiraStorySummary(task: Task) {
 }
 
 function compareTasks(left: Task, right: Task) {
+  const stageRank = (stage: TaskStage) => {
+    switch (stage) {
+      case "Now":
+        return 0;
+      case "Next":
+        return 1;
+      case "Later":
+        return 2;
+      case "Review":
+        return 3;
+      default:
+        return 4;
+    }
+  };
   const statusRank = (status: TaskStatus) => {
     switch (status) {
       case "In Progress":
@@ -280,6 +312,9 @@ function compareTasks(left: Task, right: Task) {
     }
   };
 
+  const stageDiff = stageRank(left.stage) - stageRank(right.stage);
+  if (stageDiff !== 0) return stageDiff;
+
   const statusDiff = statusRank(left.status) - statusRank(right.status);
   if (statusDiff !== 0) return statusDiff;
 
@@ -287,6 +322,10 @@ function compareTasks(left: Task, right: Task) {
   if (priorityDiff !== 0) return priorityDiff;
 
   return new Date(right.updatedAt ?? 0).getTime() - new Date(left.updatedAt ?? 0).getTime();
+}
+
+function isActiveTask(task: Task) {
+  return task.status !== "Completed";
 }
 
 function taskStatusClassName(status: TaskStatus) {
@@ -304,6 +343,26 @@ function taskStatusLabel(status: TaskStatus) {
     default:
       return status;
   }
+}
+
+function taskEstimatedTimeLabel(task: Task) {
+  const jiraSeconds = task.jiraSubtaskEstimateSeconds ?? task.jiraEstimateSeconds;
+  if (jiraSeconds && jiraSeconds > 0) {
+    const hours = jiraSeconds / 3600;
+    return hours >= 1 ? `${hours % 1 === 0 ? hours.toFixed(0) : hours.toFixed(1)}h` : `${Math.max(15, Math.round(jiraSeconds / 60))} min`;
+  }
+  return task.estimatedEffortBucket ?? "15 min";
+}
+
+function sortMeetingsForHome(meetings: Meeting[]) {
+  const now = Date.now();
+  return [...meetings].sort((left, right) => {
+    const leftFuture = isActiveMeeting(left) && meetingInstant(left, "end").getTime() >= now ? 0 : 1;
+    const rightFuture = isActiveMeeting(right) && meetingInstant(right, "end").getTime() >= now ? 0 : 1;
+    if (leftFuture !== rightFuture) return leftFuture - rightFuture;
+    const timeDiff = meetingInstant(left).getTime() - meetingInstant(right).getTime();
+    return leftFuture === 0 ? timeDiff : -timeDiff;
+  });
 }
 
 function simplifyEmailTaskTitle(title: string) {
@@ -412,6 +471,104 @@ function EmailMetaField(props: { label: string; value?: string | null; values?: 
   );
 }
 
+function HomeShellTopBar(props: {
+  active: "home" | "tasks" | "insights" | "settings";
+  onChange: (view: "home" | "tasks" | "insights" | "settings") => void;
+}) {
+  const items: Array<{ view: "home" | "tasks" | "insights" | "settings"; label: string; icon: string }> = [
+    { view: "home", label: "Home", icon: "⌂" },
+    { view: "tasks", label: "Tasks", icon: "☰" },
+    { view: "insights", label: "Metrics", icon: "◫" },
+    { view: "settings", label: "Settings", icon: "⚙" }
+  ];
+
+  return (
+    <div className="home-topbar panel">
+      <div className="home-topbar-left">
+        {items.map((item) => (
+          <button
+            key={item.view}
+            className={props.active === item.view ? "home-icon-button active" : "home-icon-button"}
+            type="button"
+            onClick={() => props.onChange(item.view)}
+          >
+            <span>{item.icon}</span>
+            <span>{item.label}</span>
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function parseTaskStateSnapshot(value: string | null) {
+  if (!value) return null;
+  try {
+    const parsed = JSON.parse(value) as Record<string, unknown>;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+function snapshotStringValue(snapshot: Record<string, unknown> | null, key: string) {
+  const value = snapshot?.[key];
+  if (typeof value === "string" && value.trim()) return value;
+  if (typeof value === "number") return String(value);
+  return null;
+}
+
+function taskStateEventTitle(event: TaskStateEvent) {
+  const before = parseTaskStateSnapshot(event.beforeJson);
+  const after = parseTaskStateSnapshot(event.afterJson);
+  return (
+    snapshotStringValue(after, "title") ??
+    snapshotStringValue(before, "title") ??
+    event.sourceRef ??
+    `Task update #${event.id}`
+  );
+}
+
+function taskStateEventSource(event: TaskStateEvent) {
+  const before = parseTaskStateSnapshot(event.beforeJson);
+  const after = parseTaskStateSnapshot(event.afterJson);
+  return (
+    snapshotStringValue(after, "source") ??
+    snapshotStringValue(before, "source") ??
+    event.source
+  );
+}
+
+function taskStateEventChanges(event: TaskStateEvent) {
+  const before = parseTaskStateSnapshot(event.beforeJson);
+  const after = parseTaskStateSnapshot(event.afterJson);
+  const keys: Array<{ key: string; label: string }> = [
+    { key: "stage", label: "Stage" },
+    { key: "status", label: "Status" },
+    { key: "priority", label: "Priority" },
+    { key: "title", label: "Title" }
+  ];
+
+  const changes = keys
+    .map((entry) => {
+      const from = snapshotStringValue(before, entry.key);
+      const to = snapshotStringValue(after, entry.key);
+      if (from === to || (!from && !to)) return null;
+      return { label: entry.label, from: from ?? "—", to: to ?? "—" };
+    })
+    .filter((entry): entry is { label: string; from: string; to: string } => Boolean(entry));
+
+  if (changes.length) return changes;
+
+  if (event.eventType === "reject" || event.eventType === "remove_manual") {
+    return [{ label: "State", from: "Active", to: "Removed" }];
+  }
+  if (event.eventType === "restore") {
+    return [{ label: "State", from: "Hidden", to: "Restored" }];
+  }
+  return [];
+}
+
 function AppHeader(props: { active: View; onChange: (view: View) => void }) {
   return (
     <aside className="sidebar">
@@ -424,9 +581,10 @@ function AppHeader(props: { active: View; onChange: (view: View) => void }) {
       </div>
       <nav className="nav">
         {[
+          ["home", "Home"],
           ["today", "Today"],
           ["tasks", "Tasks"],
-          ["deferred", "Deferred"],
+          ["deferred", "Next"],
           ["rejected", "Rejected"],
           ["reminders", "Reminders"],
           ["insights", "Insights"],
@@ -442,6 +600,1455 @@ function AppHeader(props: { active: View; onChange: (view: View) => void }) {
         ))}
       </nav>
     </aside>
+  );
+}
+
+function HomeSkeleton() {
+  return (
+    <section className="home-workspace">
+      <div className="panel skeleton-panel">
+        <div className="skeleton-line wide" />
+        <div className="skeleton-line medium" />
+      </div>
+      <div className="home-workspace-grid">
+        <div className="panel skeleton-panel">
+          <div className="skeleton-stack">
+            <div className="skeleton-line short" />
+            <div className="skeleton-line short" />
+            <div className="skeleton-line short" />
+            <div className="skeleton-line short" />
+            <div className="skeleton-line short" />
+          </div>
+        </div>
+        <div className="panel skeleton-panel">
+          <div className="skeleton-stack">
+            <div className="skeleton-card" />
+            <div className="skeleton-card" />
+            <div className="skeleton-card" />
+          </div>
+        </div>
+        <div className="home-right-stack">
+          <div className="panel skeleton-panel">
+            <div className="skeleton-card" />
+            <div className="skeleton-card" />
+          </div>
+          <div className="panel skeleton-panel">
+            <div className="skeleton-card" />
+            <div className="skeleton-card" />
+          </div>
+        </div>
+      </div>
+    </section>
+  );
+}
+
+type HomeListItem =
+  | { kind: "task"; key: string; task: Task }
+  | { kind: "meeting"; key: string; meeting: Meeting }
+  | { kind: "follow_up_task"; key: string; task: Task }
+  | { kind: "follow_up_reminder"; key: string; reminder: Reminder };
+
+function HomeView(props: {
+  data: HomePayload;
+  todayData: TodayResponse | null;
+  syncTasksLoading: boolean;
+  onSyncTasks: () => Promise<void>;
+  onFillTimelineTasks: (dayKey: string) => Promise<void>;
+  onPrepareMeeting: (meeting: Meeting) => void;
+  onUpdateMeetingAttendance: (meeting: Meeting, attendanceStatus: "attending" | "unattending") => Promise<void>;
+  onUpdateHomeMeetingAction: (meeting: Meeting, action: "remove" | "attending" | "unattending") => Promise<void>;
+  onMoveTaskToStage: (task: Task, stage: TaskStage) => Promise<void>;
+  onSaveTimelineEntries: (
+    dayKey: string,
+    entries: Array<{
+      entryId: string;
+      taskId: number;
+      startMinutes: number;
+      durationMinutes: number;
+      source: "planner" | "user";
+    }>
+  ) => Promise<void>;
+  onDeleteTimelineEntry: (entryId: string) => Promise<void>;
+  onCreateTask: (title: string, stage: TaskStage) => Promise<void>;
+  onLoadTaskDetail: (task: Task) => Promise<TaskDetail | null>;
+  onLoadMeetingDetail: (meeting: Meeting) => Promise<MeetingDetail | null>;
+}) {
+  type ScheduledTimelineTask = {
+    entryId: string;
+    taskId: number;
+    startMinutes: number;
+    durationMinutes: number;
+    source: "planner" | "user";
+  };
+  type DragInteraction =
+    | {
+        mode: "move";
+        entryId: string;
+        pointerStartY: number;
+        originStartMinutes: number;
+        originScrollTop: number;
+      }
+    | {
+        mode: "resize-bottom";
+        entryId: string;
+        pointerStartY: number;
+        originDurationMinutes: number;
+        originScrollTop: number;
+      }
+    | {
+        mode: "resize-top";
+        entryId: string;
+        pointerStartY: number;
+        originStartMinutes: number;
+        originDurationMinutes: number;
+        originScrollTop: number;
+      };
+
+  const pixelsPerMinute = 2.5;
+  const snapMinutes = 15;
+  const [section, setSection] = useState<HomeListSection>("tasks");
+  const [taskSectionFilter, setTaskSectionFilter] = useState<TaskSectionName | "All">("All");
+  const [expandedKey, setExpandedKey] = useState<string | null>(null);
+  const [homeTaskTitle, setHomeTaskTitle] = useState("");
+  const [homeTaskStage, setHomeTaskStage] = useState<TaskStage>("Later");
+  const [selectedTaskDetail, setSelectedTaskDetail] = useState<TaskDetail | null>(null);
+  const [selectedMeetingDetail, setSelectedMeetingDetail] = useState<MeetingDetail | null>(null);
+  const [detailLoading, setDetailLoading] = useState(false);
+  const [detailError, setDetailError] = useState<string | null>(null);
+  const [scheduledTasks, setScheduledTasks] = useState<ScheduledTimelineTask[]>([]);
+  const [timelinePopup, setTimelinePopup] = useState<
+    | { kind: "task"; task: Task; entryId: string; top: number; left: number }
+    | { kind: "meeting"; meeting: Meeting; top: number; left: number }
+    | null
+  >(null);
+  const [timelinePopupTaskDetail, setTimelinePopupTaskDetail] = useState<TaskDetail | null>(null);
+  const [timelinePopupMeetingDetail, setTimelinePopupMeetingDetail] = useState<MeetingDetail | null>(null);
+  const [timelinePopupLoading, setTimelinePopupLoading] = useState(false);
+  const [timelinePopupError, setTimelinePopupError] = useState<string | null>(null);
+  const [dragInteraction, setDragInteraction] = useState<DragInteraction | null>(null);
+  const boardRef = useRef<HTMLDivElement | null>(null);
+  const timelinePopupRef = useRef<HTMLDivElement | null>(null);
+  const hasAutoScrolledTimelineRef = useRef(false);
+
+  const sortedTasks = useMemo(() => [...props.data.tasks].filter(isActiveTask).sort(compareTasks), [props.data.tasks]);
+  const sortedMeetings = useMemo(() => sortMeetingsForHome(props.data.meetings.filter((meeting) => !meeting.isCancelled)), [props.data.meetings]);
+  const todayKey = props.data.schedule.dayKey;
+  const todayMeetings = useMemo(
+    () => sortMeetingsForHome(props.data.meetings.filter((meeting) => !meeting.isCancelled && getMeetingDayKey(meeting) === todayKey)),
+    [props.data.meetings, todayKey]
+  );
+  const timelineTaskLookup = useMemo(() => new Map(props.data.tasks.filter(isActiveTask).map((task) => [task.id, task])), [props.data.tasks]);
+
+  const boardRange = useMemo(() => {
+    const baseDate = new Date();
+    const start = new Date(baseDate.getFullYear(), baseDate.getMonth(), baseDate.getDate(), 0, 0, 0, 0);
+    const durationMinutes = 24 * 60;
+    return {
+      start,
+      end: new Date(start.getTime() + durationMinutes * 60_000),
+      durationMinutes
+    };
+  }, []);
+
+  const meetingBlocks = useMemo(
+    () =>
+      todayMeetings.filter((meeting) => isActiveMeeting(meeting)).map((meeting) => {
+        const startMinutes = Math.max(0, Math.round((meetingInstant(meeting).getTime() - boardRange.start.getTime()) / 60000));
+        const durationMinutes = Math.max(15, Math.round((meetingInstant(meeting, "end").getTime() - meetingInstant(meeting).getTime()) / 60000));
+        return {
+          meeting,
+          startMinutes,
+          durationMinutes
+        };
+      }),
+    [boardRange.start, todayMeetings]
+  );
+
+  const followUps = useMemo<HomeListItem[]>(() => {
+    const reminderItems = [...props.data.reminders]
+      .sort((left, right) => {
+        const leftDue = left.scheduledFor ? new Date(left.scheduledFor).getTime() : Number.MAX_SAFE_INTEGER;
+        const rightDue = right.scheduledFor ? new Date(right.scheduledFor).getTime() : Number.MAX_SAFE_INTEGER;
+        return leftDue - rightDue;
+      })
+      .map((reminder) => ({ kind: "follow_up_reminder", key: `follow-up-reminder:${reminder.id}`, reminder }) as const);
+
+    const deferredItems = [...props.data.deferredTasks]
+      .sort((left, right) => new Date(left.updatedAt).getTime() - new Date(right.updatedAt).getTime())
+      .map((task) => ({ kind: "follow_up_task", key: `follow-up-task:${task.id}`, task }) as const);
+
+    return [...reminderItems, ...deferredItems];
+  }, [props.data.deferredTasks, props.data.reminders]);
+
+  const listItems = useMemo<HomeListItem[]>(() => {
+    if (section === "email") {
+      return sortedTasks
+        .filter((task) => task.source === "Email")
+        .map((task) => ({ kind: "task", key: `task:${task.id}`, task }));
+    }
+    if (section === "jira") {
+      return sortedTasks
+        .filter((task) => task.source === "Jira")
+        .map((task) => ({ kind: "task", key: `task:${task.id}`, task }));
+    }
+    if (section === "meetings") {
+      return sortedMeetings.map((meeting) => ({ kind: "meeting", key: `meeting:${meeting.id}`, meeting }));
+    }
+    if (section === "followups") {
+      return followUps;
+    }
+    return sortedTasks.map((task) => ({ kind: "task", key: `task:${task.id}`, task }));
+  }, [followUps, section, sortedMeetings, sortedTasks]);
+
+  const metrics = useMemo(() => {
+    const activeTasks = sortedTasks.filter((task) => task.status !== "Completed");
+    return {
+      tasks: activeTasks.length,
+      followups: followUps.length,
+      emails: activeTasks.filter((task) => task.source === "Email").length,
+      meetings: todayMeetings.filter((meeting) => isActiveMeeting(meeting) && meetingInstant(meeting, "end").getTime() >= Date.now()).length,
+      jira: activeTasks.filter((task) => task.source === "Jira" && (task.status === "In Progress" || /in progress/i.test(task.jiraStatus ?? ""))).length
+    };
+  }, [followUps.length, sortedTasks, todayMeetings]);
+
+  const filteredListItems = useMemo(() => {
+    if (section === "meetings" || section === "followups") {
+      return listItems;
+    }
+    return listItems.filter((item) => {
+      if (item.kind !== "task") return true;
+      return taskSectionFilter === "All" ? true : taskSection(item.task) === taskSectionFilter;
+    });
+  }, [listItems, section, taskSectionFilter]);
+
+  const expandedItem = useMemo(() => {
+    if (!expandedKey) return null;
+    return filteredListItems.find((item) => item.key === expandedKey) ?? null;
+  }, [expandedKey, filteredListItems]);
+  const scheduledTaskIds = useMemo(() => new Set(scheduledTasks.map((entry) => entry.taskId)), [scheduledTasks]);
+  const boardHeight = Math.max(780, boardRange.durationMinutes * pixelsPerMinute);
+  const activeDraggedEntryId = dragInteraction?.entryId ?? null;
+  const hourMarkers = useMemo(() => {
+    const count = Math.ceil(boardRange.durationMinutes / 60) + 1;
+    return Array.from({ length: count }, (_, index) => {
+      const time = new Date(boardRange.start.getTime() + index * 60 * 60_000);
+      return {
+        key: index,
+        label: new Intl.DateTimeFormat(undefined, { hour: "numeric" }).format(time),
+        top: index * 60 * pixelsPerMinute
+      };
+    });
+  }, [boardRange.durationMinutes, boardRange.start]);
+  const currentTimeTop = useMemo(() => {
+    const now = new Date();
+    if (now.getTime() < boardRange.start.getTime() || now.getTime() > boardRange.end.getTime()) {
+      return null;
+    }
+    return ((now.getTime() - boardRange.start.getTime()) / 60000) * pixelsPerMinute;
+  }, [boardRange.end, boardRange.start]);
+
+  useEffect(() => {
+    const scrollContainer = boardRef.current?.parentElement;
+    if (!scrollContainer || hasAutoScrolledTimelineRef.current) return;
+    const focusTop =
+      currentTimeTop ??
+      (meetingBlocks[0] ? meetingBlocks[0].startMinutes * pixelsPerMinute : scheduledTasks[0]?.startMinutes ? scheduledTasks[0].startMinutes * pixelsPerMinute : 0);
+    scrollContainer.scrollTop = Math.max(0, focusTop - 180);
+    hasAutoScrolledTimelineRef.current = true;
+  }, [currentTimeTop, meetingBlocks, pixelsPerMinute, scheduledTasks]);
+
+  useEffect(() => {
+    if (!filteredListItems.length) {
+      setExpandedKey(null);
+      return;
+    }
+    if (expandedKey && !filteredListItems.some((item) => item.key === expandedKey)) {
+      setExpandedKey(null);
+    }
+  }, [expandedKey, filteredListItems]);
+
+  useEffect(() => {
+    const nextEntries = props.data.schedule.entries.map((entry) => ({
+      entryId: entry.entryId,
+      taskId: entry.taskId,
+      startMinutes: entry.startMinutes,
+      durationMinutes: entry.durationMinutes,
+      source: entry.source
+    }));
+    setScheduledTasks((current) => {
+      if (
+        current.length === nextEntries.length &&
+        current.every(
+          (entry, index) =>
+            entry.entryId === nextEntries[index]?.entryId &&
+            entry.taskId === nextEntries[index]?.taskId &&
+            entry.startMinutes === nextEntries[index]?.startMinutes &&
+            entry.durationMinutes === nextEntries[index]?.durationMinutes &&
+            entry.source === nextEntries[index]?.source
+        )
+      ) {
+        return current;
+      }
+      return nextEntries;
+    });
+  }, [props.data.schedule.entries]);
+
+  useEffect(() => {
+    let active = true;
+    async function run() {
+      setDetailError(null);
+      setSelectedTaskDetail(null);
+      setSelectedMeetingDetail(null);
+
+      if (!expandedItem) {
+        return;
+      }
+
+      if (expandedItem.kind === "task" || expandedItem.kind === "follow_up_task") {
+        if (expandedItem.task.source === "Manual") {
+          return;
+        }
+        setDetailLoading(true);
+        try {
+          const detail = await props.onLoadTaskDetail(expandedItem.task);
+          if (active) setSelectedTaskDetail(detail);
+        } catch (error) {
+          if (active) setDetailError(error instanceof Error ? error.message : "Failed to load task detail");
+        } finally {
+          if (active) setDetailLoading(false);
+        }
+        return;
+      }
+
+      if (expandedItem.kind === "meeting") {
+        setDetailLoading(true);
+        try {
+          const detail = await props.onLoadMeetingDetail(expandedItem.meeting);
+          if (active) setSelectedMeetingDetail(detail);
+        } catch (error) {
+          if (active) setDetailError(error instanceof Error ? error.message : "Failed to load meeting detail");
+        } finally {
+          if (active) setDetailLoading(false);
+        }
+      }
+    }
+
+    void run();
+    return () => {
+      active = false;
+    };
+  }, [expandedItem?.key]);
+
+  useEffect(() => {
+    let active = true;
+    async function run() {
+      setTimelinePopupTaskDetail(null);
+      setTimelinePopupMeetingDetail(null);
+      setTimelinePopupError(null);
+      if (!timelinePopup) return;
+      setTimelinePopupLoading(true);
+      try {
+        if (timelinePopup.kind === "task" && timelinePopup.task.source !== "Manual") {
+          const detail = await props.onLoadTaskDetail(timelinePopup.task);
+          if (active) setTimelinePopupTaskDetail(detail);
+        } else if (timelinePopup.kind === "meeting") {
+          const detail = await props.onLoadMeetingDetail(timelinePopup.meeting);
+          if (active) setTimelinePopupMeetingDetail(detail);
+        }
+      } catch (error) {
+        if (active) setTimelinePopupError(error instanceof Error ? error.message : "Failed to load timeline details");
+      } finally {
+        if (active) setTimelinePopupLoading(false);
+      }
+    }
+    void run();
+    return () => {
+      active = false;
+    };
+  }, [timelinePopup]);
+
+  useEffect(() => {
+    if (!timelinePopup) return;
+    function handlePointerDown(event: MouseEvent) {
+      const target = event.target as HTMLElement | null;
+      if (!target) return;
+      if (timelinePopupRef.current?.contains(target)) return;
+      if (target.closest(".home-playground-block")) return;
+      setTimelinePopup(null);
+    }
+    document.addEventListener("mousedown", handlePointerDown);
+    return () => document.removeEventListener("mousedown", handlePointerDown);
+  }, [timelinePopup]);
+
+  function taskHomeSection(task: Task): HomeListSection {
+    if (task.source === "Email") return "email";
+    if (task.source === "Jira") return "jira";
+    return "tasks";
+  }
+
+  function toggleItem(key: string) {
+    setExpandedKey((current) => (current === key ? null : key));
+  }
+
+  function formatLocalTimelineTime(date: Date) {
+    return new Intl.DateTimeFormat(undefined, {
+      hour: "numeric",
+      minute: "2-digit"
+    }).format(date);
+  }
+
+  function mergePlannerTimelineEntries(entries: ScheduledTimelineTask[]) {
+    const sorted = [...entries].sort((left, right) => left.startMinutes - right.startMinutes);
+    const merged: ScheduledTimelineTask[] = [];
+
+    for (const entry of sorted) {
+      const previous = merged[merged.length - 1];
+      if (
+        previous &&
+        previous.taskId === entry.taskId &&
+        previous.source === "planner" &&
+        entry.source === "planner" &&
+        entry.startMinutes - (previous.startMinutes + previous.durationMinutes) <= snapMinutes
+      ) {
+        previous.durationMinutes = Math.max(
+          previous.durationMinutes,
+          entry.startMinutes + entry.durationMinutes - previous.startMinutes
+        );
+        continue;
+      }
+      merged.push({ ...entry });
+    }
+
+    return merged;
+  }
+
+  function defaultDurationForTask(task: Task) {
+    if (task.estimatedEffortBucket === "1 hour" || task.estimatedEffortBucket === "2+ hours") return 30;
+    if (task.source === "Email") return 15;
+    return 30;
+  }
+
+  async function persistTimelineEntries(entries: ScheduledTimelineTask[]) {
+    await props.onSaveTimelineEntries(
+      todayKey,
+      entries.map((entry) => ({
+        entryId: entry.entryId,
+        taskId: entry.taskId,
+        startMinutes: entry.startMinutes,
+        durationMinutes: entry.durationMinutes,
+        source: entry.source
+      }))
+    );
+  }
+
+  function snapMinutesValue(value: number) {
+    return Math.round(value / snapMinutes) * snapMinutes;
+  }
+
+  function collectOccupiedIntervals(currentTasks: ScheduledTimelineTask[], excludeEntryId?: string) {
+    const intervals = [
+      ...meetingBlocks.map((block) => ({
+        start: block.startMinutes,
+        end: block.startMinutes + block.durationMinutes
+      })),
+      ...currentTasks
+        .filter((entry) => entry.entryId !== excludeEntryId)
+        .map((entry) => ({
+          start: entry.startMinutes,
+          end: entry.startMinutes + entry.durationMinutes
+        }))
+    ].sort((left, right) => left.start - right.start);
+    return intervals;
+  }
+
+  function normalizePlacement(
+    currentTasks: ScheduledTimelineTask[],
+    desiredStart: number,
+    durationMinutes: number,
+    excludeEntryId?: string
+  ) {
+    const maxStart = Math.max(0, boardRange.durationMinutes - durationMinutes);
+    let start = Math.min(Math.max(0, snapMinutesValue(desiredStart)), maxStart);
+    const occupied = collectOccupiedIntervals(currentTasks, excludeEntryId);
+    const fits = (candidate: number) =>
+      !occupied.some((interval) => candidate < interval.end && candidate + durationMinutes > interval.start);
+
+    if (fits(start)) return start;
+
+    let forward = start;
+    while (forward <= maxStart) {
+      const overlap = occupied.find((interval) => forward < interval.end && forward + durationMinutes > interval.start);
+      if (!overlap) return forward;
+      forward = Math.min(maxStart, snapMinutesValue(overlap.end));
+      if (fits(forward)) return forward;
+      if (forward === maxStart) break;
+    }
+
+    let backward = start;
+    while (backward >= 0) {
+      backward = Math.max(0, snapMinutesValue(backward - snapMinutes));
+      if (fits(backward)) return backward;
+      if (backward === 0) break;
+    }
+
+    return start;
+  }
+
+  function normalizeDuration(
+    currentTasks: ScheduledTimelineTask[],
+    entryId: string,
+    startMinutes: number,
+    desiredDuration: number
+  ) {
+    const minDuration = snapMinutes;
+    const maxDuration = Math.max(minDuration, boardRange.durationMinutes - startMinutes);
+    const occupied = collectOccupiedIntervals(currentTasks, entryId)
+      .filter((interval) => interval.start >= startMinutes)
+      .sort((left, right) => left.start - right.start);
+    const nextOccupied = occupied.find((interval) => interval.start > startMinutes);
+    const freeUntil = nextOccupied ? nextOccupied.start - startMinutes : maxDuration;
+    return Math.max(minDuration, Math.min(snapMinutesValue(desiredDuration), freeUntil, maxDuration));
+  }
+
+  function normalizeResizeFromTop(
+    currentTasks: ScheduledTimelineTask[],
+    entryId: string,
+    desiredStartMinutes: number,
+    endMinutes: number
+  ) {
+    const occupied = collectOccupiedIntervals(currentTasks, entryId);
+    const blockingEnd = occupied
+      .filter((interval) => interval.start < endMinutes)
+      .reduce((maxEnd, interval) => Math.max(maxEnd, interval.end), 0);
+    const maxStart = Math.max(0, endMinutes - snapMinutes);
+    const startMinutes = Math.min(maxStart, Math.max(blockingEnd, snapMinutesValue(desiredStartMinutes)));
+    return {
+      startMinutes,
+      durationMinutes: Math.max(snapMinutes, endMinutes - startMinutes)
+    };
+  }
+
+  function scheduleTask(task: Task, desiredStartMinutes: number) {
+    let nextEntries: ScheduledTimelineTask[] = [];
+    setScheduledTasks((current) => {
+      const existing =
+        current.find((entry) => entry.taskId === task.id && entry.source === "user") ??
+        current.find((entry) => entry.taskId === task.id);
+      const durationMinutes = existing?.durationMinutes ?? defaultDurationForTask(task);
+      const startMinutes = normalizePlacement(current, desiredStartMinutes, durationMinutes, existing?.entryId);
+      if (existing) {
+        nextEntries = current.map((entry) =>
+          entry.entryId === existing.entryId ? { ...entry, startMinutes, source: "user" as const } : entry
+        );
+      } else {
+        nextEntries = [
+          ...current,
+          {
+            entryId: `user:${task.id}:${Date.now()}`,
+            taskId: task.id,
+            startMinutes,
+            durationMinutes,
+            source: "user" as const
+          }
+        ];
+      }
+      return nextEntries;
+    });
+    if (nextEntries.length) {
+      void persistTimelineEntries(nextEntries);
+    }
+    if (task.stage !== "Now") {
+      void props.onMoveTaskToStage(task, "Now");
+    }
+  }
+
+  function addTimelineEntry(task: Task, desiredStartMinutes: number) {
+    let nextEntries: ScheduledTimelineTask[] = [];
+    setScheduledTasks((current) => {
+      const durationMinutes = defaultDurationForTask(task);
+      const startMinutes = normalizePlacement(current, desiredStartMinutes, durationMinutes);
+      nextEntries = [
+        ...current,
+        {
+          entryId: `user:${task.id}:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`,
+          taskId: task.id,
+          startMinutes,
+          durationMinutes,
+          source: "user" as const
+        }
+      ];
+      return nextEntries;
+    });
+    if (nextEntries.length) {
+      void persistTimelineEntries(nextEntries);
+    }
+    if (task.stage !== "Now") {
+      void props.onMoveTaskToStage(task, "Now");
+    }
+  }
+
+  async function removeScheduledTaskEntry(task: Task, entryId: string) {
+    const nextEntries = scheduledTasks.filter((entry) => entry.entryId !== entryId);
+    setScheduledTasks(nextEntries);
+    await props.onDeleteTimelineEntry(entryId);
+    if (!nextEntries.some((entry) => entry.taskId === task.id)) {
+      await props.onMoveTaskToStage(task, "Next");
+    }
+  }
+
+  useEffect(() => {
+    if (!dragInteraction) return;
+    const interaction = dragInteraction;
+
+    function handlePointerMove(event: MouseEvent) {
+      const scrollContainer = boardRef.current?.parentElement;
+      if (scrollContainer) {
+        const bounds = scrollContainer.getBoundingClientRect();
+        const visibleTop = Math.max(bounds.top, 0);
+        const visibleBottom = Math.min(bounds.bottom, window.innerHeight);
+        const edgeThreshold = 180;
+        const maxScrollTop = Math.max(0, scrollContainer.scrollHeight - scrollContainer.clientHeight);
+        if (event.clientY < visibleTop + edgeThreshold) {
+          scrollContainer.scrollTop = Math.max(0, scrollContainer.scrollTop - 72);
+        } else if (event.clientY > visibleBottom - edgeThreshold) {
+          scrollContainer.scrollTop = Math.min(maxScrollTop, scrollContainer.scrollTop + 72);
+        }
+      }
+
+      const scrollDelta = (scrollContainer?.scrollTop ?? interaction.originScrollTop) - interaction.originScrollTop;
+      const deltaMinutes = snapMinutesValue((event.clientY - interaction.pointerStartY + scrollDelta) / pixelsPerMinute);
+      setScheduledTasks((current) => {
+        const entry = current.find((item) => item.entryId === interaction.entryId);
+        if (!entry) return current;
+
+        if (interaction.mode === "move") {
+          const nextStart = normalizePlacement(
+            current,
+            interaction.originStartMinutes + deltaMinutes,
+            entry.durationMinutes,
+            interaction.entryId
+          );
+          return current.map((item) => (item.entryId === interaction.entryId ? { ...item, startMinutes: nextStart } : item));
+        }
+
+        if (interaction.mode === "resize-top") {
+          const endMinutes = interaction.originStartMinutes + interaction.originDurationMinutes;
+          const next = normalizeResizeFromTop(current, interaction.entryId, interaction.originStartMinutes + deltaMinutes, endMinutes);
+          return current.map((item) =>
+            item.entryId === interaction.entryId
+              ? { ...item, startMinutes: next.startMinutes, durationMinutes: next.durationMinutes }
+              : item
+          );
+        }
+
+        const nextDuration = normalizeDuration(current, interaction.entryId, entry.startMinutes, interaction.originDurationMinutes + deltaMinutes);
+        return current.map((item) => (item.entryId === interaction.entryId ? { ...item, durationMinutes: nextDuration } : item));
+      });
+    }
+
+    function handlePointerUp() {
+      if (dragInteraction) {
+        void persistTimelineEntries(scheduledTasks);
+      }
+      setDragInteraction(null);
+    }
+
+    window.addEventListener("mousemove", handlePointerMove);
+    window.addEventListener("mouseup", handlePointerUp);
+    return () => {
+      window.removeEventListener("mousemove", handlePointerMove);
+      window.removeEventListener("mouseup", handlePointerUp);
+    };
+  }, [boardRange.durationMinutes, dragInteraction, scheduledTasks]);
+
+  function startDragTask(entryId: string, mode: DragInteraction["mode"], pointerStartY: number) {
+    const current = scheduledTasks.find((entry) => entry.entryId === entryId);
+    if (!current) return;
+    const scrollTop = boardRef.current?.parentElement?.scrollTop ?? 0;
+    if (mode === "move") {
+      setDragInteraction({
+        mode,
+        entryId,
+        pointerStartY,
+        originStartMinutes: current.startMinutes,
+        originScrollTop: scrollTop
+      });
+    } else if (mode === "resize-bottom") {
+      setDragInteraction({
+        mode,
+        entryId,
+        pointerStartY,
+        originDurationMinutes: current.durationMinutes,
+        originScrollTop: scrollTop
+      });
+    } else {
+      setDragInteraction({
+        mode,
+        entryId,
+        pointerStartY,
+        originStartMinutes: current.startMinutes,
+        originDurationMinutes: current.durationMinutes,
+        originScrollTop: scrollTop
+      });
+    }
+  }
+
+  function dropTaskFromList(event: React.DragEvent<HTMLDivElement>) {
+    event.preventDefault();
+    const taskId = Number(event.dataTransfer.getData("text/plain"));
+    const task = timelineTaskLookup.get(taskId);
+    if (!task || !boardRef.current) return;
+    const rect = boardRef.current.getBoundingClientRect();
+    const relativeY = event.clientY - rect.top + boardRef.current.scrollTop;
+    const desiredStart = snapMinutesValue(relativeY / pixelsPerMinute);
+    addTimelineEntry(task, desiredStart);
+  }
+
+  function openTimelinePopupForTask(event: React.MouseEvent, task: Task, entryId: string) {
+    if (!boardRef.current) return;
+    const rect = boardRef.current.getBoundingClientRect();
+    const scrollContainer = boardRef.current.parentElement;
+    const popupWidth = Math.min(420, rect.width - 32);
+    const maxLeft = Math.max(16, rect.width - popupWidth - 16);
+    const estimatedPopupHeight = 520;
+    const scrollTop = scrollContainer?.scrollTop ?? boardRef.current.scrollTop;
+    const visibleTop = scrollTop + 16;
+    const visibleBottom = scrollTop + (scrollContainer?.clientHeight ?? rect.height) - estimatedPopupHeight - 16;
+    const desiredTop = event.clientY - rect.top - 20 + scrollTop;
+    setTimelinePopup({
+      kind: "task",
+      task,
+      entryId,
+      top: Math.max(visibleTop, Math.min(desiredTop, Math.max(visibleTop, visibleBottom))),
+      left: Math.min(maxLeft, Math.max(16, event.clientX - rect.left + 12))
+    });
+  }
+
+  function openTimelinePopupForMeeting(event: React.MouseEvent, meeting: Meeting) {
+    if (!boardRef.current) return;
+    const rect = boardRef.current.getBoundingClientRect();
+    const scrollContainer = boardRef.current.parentElement;
+    const popupWidth = Math.min(420, rect.width - 32);
+    const maxLeft = Math.max(16, rect.width - popupWidth - 16);
+    const estimatedPopupHeight = 520;
+    const scrollTop = scrollContainer?.scrollTop ?? boardRef.current.scrollTop;
+    const visibleTop = scrollTop + 16;
+    const visibleBottom = scrollTop + (scrollContainer?.clientHeight ?? rect.height) - estimatedPopupHeight - 16;
+    const desiredTop = event.clientY - rect.top - 20 + scrollTop;
+    setTimelinePopup({
+      kind: "meeting",
+      meeting,
+      top: Math.max(visibleTop, Math.min(desiredTop, Math.max(visibleTop, visibleBottom))),
+      left: Math.min(maxLeft, Math.max(16, event.clientX - rect.left + 12))
+    });
+  }
+
+  return (
+    <section className="home-workspace">
+      <div className="panel home-banner">
+        <div className="home-banner-copy">
+          <p className="eyebrow">Home</p>
+          <h2>{props.data.banner.title}</h2>
+          <p>{props.data.banner.summary}</p>
+        </div>
+      </div>
+
+      <div className="home-metric-strip">
+        {[
+          { key: "tasks", label: "tasks remaining", value: metrics.tasks, target: "tasks" as HomeListSection },
+          { key: "followups", label: "Follow-ups waiting", value: metrics.followups, target: "followups" as HomeListSection },
+          { key: "email", label: "emails to respond to", value: metrics.emails, target: "email" as HomeListSection },
+          { key: "meetings", label: "Meetings to attend", value: metrics.meetings, target: "meetings" as HomeListSection },
+          { key: "jira", label: "Jira items in motion", value: metrics.jira, target: "jira" as HomeListSection }
+        ].map((item) => (
+          <button
+            key={item.key}
+            className={section === item.target ? "panel home-metric-card active" : "panel home-metric-card"}
+            type="button"
+            onClick={() => setSection(item.target)}
+          >
+            <strong>{item.value}</strong>
+            <span>{item.label}</span>
+          </button>
+        ))}
+      </div>
+
+      <div className="home-workspace-grid">
+        <div className="panel home-list-panel">
+          <div className="tasks-header">
+            <div>
+              <h3>
+                {section === "tasks"
+                  ? "Prioritized Tasks"
+                  : section === "email"
+                    ? "Email Tasks"
+                    : section === "jira"
+                      ? "Jira Tasks"
+                      : section === "meetings"
+                        ? "Meetings"
+                        : "Follow-ups"}
+              </h3>
+              <p className="muted">
+                {section === "meetings"
+                  ? "Meetings in time order, with the next upcoming meeting surfaced first."
+                  : section === "followups"
+                    ? "Reminders, review items, and queued follow-through."
+                    : "Select an item to inspect details, reasoning, and actions."}
+              </p>
+            </div>
+            <div className="home-filter-toolbar">
+              {section !== "meetings" ? (
+                <button className="ghost-button subtle-action" type="button" onClick={() => void props.onSyncTasks()} disabled={props.syncTasksLoading}>
+                  {props.syncTasksLoading ? "Syncing…" : "Sync tasks"}
+                </button>
+              ) : null}
+              <label className="status-select compact">
+                <span>Source</span>
+                <select value={section} onChange={(event) => setSection(event.target.value as HomeListSection)}>
+                  <option value="tasks">Tasks</option>
+                  <option value="email">Email</option>
+                  <option value="jira">Jira</option>
+                  <option value="meetings">Meetings</option>
+                  <option value="followups">Follow-ups</option>
+                </select>
+              </label>
+              {section !== "meetings" && section !== "followups" ? (
+                <label className="status-select compact">
+                  <span>Priority</span>
+                  <select value={taskSectionFilter} onChange={(event) => setTaskSectionFilter(event.target.value as TaskSectionName | "All")}>
+                    <option value="All">All</option>
+                    <option value="Now">Now</option>
+                    <option value="Next">Next</option>
+                    <option value="Later">Later</option>
+                    <option value="Review">Review</option>
+                  </select>
+                </label>
+              ) : null}
+            </div>
+          </div>
+
+          <form
+            className="create-task-bar home-create-task-bar"
+            onSubmit={async (event) => {
+              event.preventDefault();
+              if (!homeTaskTitle.trim()) return;
+              await props.onCreateTask(homeTaskTitle.trim(), homeTaskStage);
+              setHomeTaskTitle("");
+            }}
+          >
+            <input value={homeTaskTitle} onChange={(event) => setHomeTaskTitle(event.target.value)} placeholder="Add a task from Home" />
+            <label className="status-select compact">
+              <span>Stage</span>
+              <select value={homeTaskStage} onChange={(event) => setHomeTaskStage(event.target.value as TaskStage)}>
+                <option value="Now">Now</option>
+                <option value="Next">Next</option>
+                <option value="Later">Later</option>
+                <option value="Review">Review</option>
+              </select>
+            </label>
+            <button className="primary-button" type="submit">Add task</button>
+          </form>
+
+          <div className="home-item-list">
+            {filteredListItems.map((item) => (
+              <article
+                key={item.key}
+                className={expandedItem?.key === item.key ? "home-item-card active expandable" : "home-item-card expandable"}
+                draggable={item.kind === "task" || item.kind === "follow_up_task"}
+                onDragStart={(event) => {
+                  if (item.kind === "task" || item.kind === "follow_up_task") {
+                    event.dataTransfer.setData("text/plain", String(item.task.id));
+                    event.dataTransfer.effectAllowed = "move";
+                  }
+                }}
+              >
+                <button className="home-item-card-header" onClick={() => toggleItem(item.key)} type="button">
+                  <div className="home-item-card-header-copy">
+                    {item.kind === "meeting" ? (
+                      <>
+                        <div className="task-meta">
+                          <span className="pill pill-meeting">Meeting</span>
+                          <span className="subtle-pill">{formatMeetingDayLabel(item.meeting.startTime, item.meeting.timeZone)}</span>
+                        </div>
+                        <strong>{item.meeting.title}</strong>
+                        <p className="muted">
+                          {formatMeetingTime(item.meeting.startTime, item.meeting.timeZone)} to{" "}
+                          {formatMeetingTime(item.meeting.endTime, item.meeting.timeZone)}
+                        </p>
+                      </>
+                    ) : item.kind === "follow_up_reminder" ? (
+                      <>
+                        <div className="task-meta">
+                          <span className="pill pill-email">Reminder</span>
+                          <span className="subtle-pill">{item.reminder.kind.replace(/_/g, " ")}</span>
+                        </div>
+                        <strong>{item.reminder.title}</strong>
+                        <p className="muted">{item.reminder.reason}</p>
+                      </>
+                    ) : (
+                      <>
+                        <div className="task-meta">
+                          <span className={`pill pill-${item.task.source.toLowerCase()}`}>{item.task.source}</span>
+                          <span className={`priority-pill priority-pill-${item.task.priority.toLowerCase()}`}>{taskSection(item.task)}</span>
+                          <span className={`status-badge task-status-badge status-${taskStatusClassName(item.task.status)}`}>
+                            {item.task.status}
+                          </span>
+                          {scheduledTaskIds.has(item.task.id) ? <span className="subtle-pill">Scheduled</span> : null}
+                        </div>
+                        <strong>{item.task.title}</strong>
+                        <p className="muted">
+                          {item.kind === "follow_up_task"
+                            ? `${item.task.stage} queue item`
+                            : item.task.source === "Jira" && jiraStorySummary(item.task)
+                              ? jiraStorySummary(item.task)
+                              : item.task.priorityExplanation ?? item.task.selectionReason ?? "No summary yet."}
+                        </p>
+                      </>
+                    )}
+                  </div>
+                  <span className="home-item-expand-indicator">{expandedItem?.key === item.key ? "Hide" : "Show"}</span>
+                </button>
+
+                {expandedItem?.key === item.key ? (
+                  <div className="home-item-expanded">
+                    {item.kind === "meeting" ? (
+                      <>
+                        {detailLoading ? <p className="muted">Loading meeting details…</p> : null}
+                        {detailError ? <p className="empty-state">{detailError}</p> : null}
+                        <div className="detail-grid compact">
+                          <div className="detail-stat">
+                            <span>Organizer</span>
+                            <strong>{selectedMeetingDetail?.organizer ?? "Unavailable"}</strong>
+                          </div>
+                          <div className="detail-stat">
+                            <span>Attendees</span>
+                            <strong>{selectedMeetingDetail?.attendees.length ?? 0}</strong>
+                          </div>
+                          <div className="detail-stat">
+                            <span>Location</span>
+                            <strong>{selectedMeetingDetail?.location ?? "Unspecified"}</strong>
+                          </div>
+                          <div className="detail-stat">
+                            <span>Duration</span>
+                            <strong>{item.meeting.durationMinutes} min</strong>
+                          </div>
+                          <div className="detail-stat">
+                            <span>Attendance</span>
+                            <strong>{item.meeting.attendanceStatus === "unattending" ? "Not attending" : "Attending"}</strong>
+                          </div>
+                        </div>
+                        <section className="detail-section">
+                          <h4>Description</h4>
+                          <pre className="detail-content">
+                            {selectedMeetingDetail?.description ?? selectedMeetingDetail?.bodyPreview ?? "No meeting description available."}
+                          </pre>
+                        </section>
+                        <div className="integration-actions">
+                          {selectedMeetingDetail?.meetingLink ?? item.meeting.meetingLink ? (
+                            <a
+                              className="primary-button"
+                              href={selectedMeetingDetail?.meetingLink ?? item.meeting.meetingLink ?? "#"}
+                              target="_blank"
+                              rel="noreferrer"
+                            >
+                              {selectedMeetingDetail?.meetingLinkType === "join" || item.meeting.meetingLinkType === "join"
+                                ? "Join meeting"
+                                : "Open in Calendar"}
+                            </a>
+                          ) : null}
+                          <button
+                            className="ghost-button subtle-action"
+                            type="button"
+                            onClick={() =>
+                              void props.onUpdateMeetingAttendance(
+                                item.meeting,
+                                item.meeting.attendanceStatus === "unattending" ? "attending" : "unattending"
+                              )
+                            }
+                          >
+                            {item.meeting.attendanceStatus === "unattending" ? "Mark attending" : "Mark not attending"}
+                          </button>
+                          <button className="ghost-button subtle-action" type="button" onClick={() => props.onPrepareMeeting(item.meeting)}>
+                            Prepare for meeting
+                          </button>
+                        </div>
+                      </>
+                    ) : item.kind === "follow_up_reminder" ? (
+                      (() => {
+                        const linkedTask =
+                          item.reminder.taskId
+                            ? [...props.data.tasks, ...props.data.deferredTasks].find((task) => task.id === item.reminder.taskId) ?? null
+                            : null;
+                        return (
+                          <>
+                            <div className="detail-grid compact">
+                              <div className="detail-stat">
+                                <span>Kind</span>
+                                <strong>{item.reminder.kind.replace(/_/g, " ")}</strong>
+                              </div>
+                              <div className="detail-stat">
+                                <span>Scheduled</span>
+                                <strong>{item.reminder.scheduledFor ? formatDateTime(item.reminder.scheduledFor) : "Not scheduled"}</strong>
+                              </div>
+                            </div>
+                            {linkedTask ? (
+                              <section className="detail-section">
+                                <h4>Linked task</h4>
+                                <div className="field-card compact-card">
+                                  <span>{linkedTask.source}</span>
+                                  <p>{linkedTask.title}</p>
+                                </div>
+                              </section>
+                            ) : null}
+                            <div className="integration-actions">
+                              {item.reminder.sourceLink ? (
+                                <a className="ghost-button subtle-action" href={item.reminder.sourceLink} target="_blank" rel="noreferrer">
+                                  Open source
+                                </a>
+                              ) : null}
+                              {linkedTask ? (
+                                <button
+                                  className="ghost-button subtle-action"
+                                  type="button"
+                                  onClick={() => {
+                                    setSection(taskHomeSection(linkedTask));
+                                    setExpandedKey(`task:${linkedTask.id}`);
+                                  }}
+                                >
+                                  Reveal linked task
+                                </button>
+                              ) : null}
+                            </div>
+                          </>
+                        );
+                      })()
+                    ) : (
+                      (() => {
+                        const task = item.task;
+                        const description =
+                          selectedTaskDetail?.type === "jira"
+                            ? selectedTaskDetail.description
+                            : selectedTaskDetail?.type === "email"
+                              ? selectedTaskDetail.body
+                              : null;
+                        return (
+                          <>
+                            {detailLoading ? <p className="muted">Loading source details…</p> : null}
+                            {detailError ? <p className="empty-state">{detailError}</p> : null}
+                            <div className="detail-grid compact">
+                              <div className="detail-stat">
+                                <span>Estimated time</span>
+                                <strong>{taskEstimatedTimeLabel(task)}</strong>
+                              </div>
+                              <div className="detail-stat">
+                                <span>Priority</span>
+                                <strong>{task.priority}</strong>
+                              </div>
+                              <div className="detail-stat">
+                                <span>Status</span>
+                                <strong>{task.status}</strong>
+                              </div>
+                              <div className="detail-stat">
+                                <span>Updated</span>
+                                <strong>{formatDateTime(task.updatedAt)}</strong>
+                              </div>
+                            </div>
+                            {task.source === "Jira" && jiraStorySummary(task) ? (
+                              <section className="detail-section">
+                                <h4>Jira context</h4>
+                                <div className="field-card compact-card">
+                                  <span>Story context</span>
+                                  <p>{jiraStorySummary(task)}</p>
+                                </div>
+                              </section>
+                            ) : null}
+                            <section className="detail-section">
+                              <h4>Description</h4>
+                              <pre className="detail-content">{description ?? task.priorityExplanation ?? "No description available yet."}</pre>
+                            </section>
+                            <section className="detail-section">
+                              <h4>Planner reasoning</h4>
+                              <pre className="detail-content">
+                                {task.selectionReason ?? task.priorityReason ?? task.priorityExplanation ?? "No detailed reasoning recorded yet."}
+                              </pre>
+                            </section>
+                            <div className="integration-actions">
+                              <button
+                                className="ghost-button subtle-action"
+                                type="button"
+                                onClick={() =>
+                                  scheduleTask(task, currentTimeTop !== null ? Math.max(0, Math.round(currentTimeTop / pixelsPerMinute)) : 0)
+                                }
+                              >
+                                {scheduledTaskIds.has(task.id) ? "Reschedule in timeline" : "Add to timeline"}
+                              </button>
+                              {task.sourceLink ? (
+                                <a className="ghost-button subtle-action" href={task.sourceLink} target="_blank" rel="noreferrer">
+                                  Open source
+                                </a>
+                              ) : null}
+                            </div>
+                          </>
+                        );
+                      })()
+                    )}
+                  </div>
+                ) : null}
+              </article>
+            ))}
+            {!filteredListItems.length ? <p className="empty-state">Nothing is available in this section yet.</p> : null}
+          </div>
+        </div>
+
+        <div className="panel home-timeline-panel">
+            <div className="panel-header">
+              <div>
+                <h3>Today&apos;s Timeline</h3>
+                <span>Playground mode. Meetings stay fixed while tasks can be dragged, stretched, shortened, or moved across stages.</span>
+              </div>
+            </div>
+            <div className="home-playground">
+              <div className="home-playground-times" style={{ height: boardHeight }}>
+                {hourMarkers.map((marker) => (
+                  <div className="home-playground-time-label" key={marker.key} style={{ top: marker.top }}>
+                    {marker.label}
+                  </div>
+                ))}
+              </div>
+              <div
+                className="home-playground-surface"
+                ref={boardRef}
+                style={{ height: boardHeight }}
+                onDragOver={(event) => event.preventDefault()}
+                onDrop={dropTaskFromList}
+              >
+                {currentTimeTop !== null ? (
+                  <div className="home-playground-now-line" style={{ top: currentTimeTop }}>
+                    <span>Now</span>
+                  </div>
+                ) : null}
+
+                {Array.from({ length: Math.ceil(boardRange.durationMinutes / 15) + 1 }, (_, index) => (
+                  <div
+                    className={
+                      index % 4 === 0
+                        ? "home-playground-line hour"
+                        : index % 2 === 0
+                          ? "home-playground-line half"
+                          : "home-playground-line quarter"
+                    }
+                    key={`line-${index}`}
+                    style={{ top: index * 15 * pixelsPerMinute }}
+                  />
+                ))}
+
+                {!scheduledTasks.length ? (
+                  <div className="home-playground-empty-hint">
+                    Drag a task from the list into the board to start shaping today&apos;s work.
+                  </div>
+                ) : null}
+
+                {meetingBlocks.map((block) => (
+                  <button
+                    className="home-playground-block meeting"
+                    key={`meeting-block-${block.meeting.id}`}
+                    style={{
+                      top: block.startMinutes * pixelsPerMinute,
+                      height: Math.max(72, block.durationMinutes * pixelsPerMinute)
+                    }}
+                    onClick={(event) => {
+                      openTimelinePopupForMeeting(event, block.meeting);
+                    }}
+                    type="button"
+                    >
+                      <div className="home-playground-block-stripe" />
+                      <div className="home-playground-block-content">
+                        <div className="home-playground-block-topline">
+                          <span className="subtle-pill">Meeting</span>
+                          <span>
+                            {formatMeetingTime(block.meeting.startTime, block.meeting.timeZone)} -{" "}
+                            {formatMeetingTime(block.meeting.endTime, block.meeting.timeZone)}
+                          </span>
+                        </div>
+                        <strong>{block.meeting.title}</strong>
+                        <span>{block.meeting.durationMinutes} min</span>
+                        {block.meeting.isCancelled ? <span className="home-playground-cancelled">Cancelled</span> : null}
+                      </div>
+                  </button>
+                ))}
+
+                {scheduledTasks.map((entry) => {
+                  const task = timelineTaskLookup.get(entry.taskId);
+                  if (!task) return null;
+                  const compactTimelineTask = entry.durationMinutes <= 45;
+                  const startTime = new Date(boardRange.start.getTime() + entry.startMinutes * 60_000);
+                  const endTime = new Date(startTime.getTime() + entry.durationMinutes * 60_000);
+                  return (
+                    <article
+                      className={
+                        activeDraggedEntryId === entry.entryId
+                          ? compactTimelineTask
+                            ? "home-playground-block task compact dragging"
+                            : "home-playground-block task dragging"
+                          : compactTimelineTask
+                            ? "home-playground-block task compact"
+                            : "home-playground-block task"
+                      }
+                      key={entry.entryId}
+                      style={{
+                        top: entry.startMinutes * pixelsPerMinute,
+                        height: Math.max(compactTimelineTask ? 52 : 92, entry.durationMinutes * pixelsPerMinute)
+                      }}
+                      onClick={(event) => {
+                        openTimelinePopupForTask(event, task, entry.entryId);
+                      }}
+                    >
+                      <button
+                        className="home-playground-resize-handle top"
+                        type="button"
+                        aria-label="Resize task block from top"
+                        onMouseDown={(event) => {
+                          event.preventDefault();
+                          event.stopPropagation();
+                          startDragTask(entry.entryId, "resize-top", event.clientY);
+                        }}
+                      />
+                      <div className="home-playground-block-stripe task" />
+                      <div
+                        className="home-playground-block-content task"
+                        onMouseDown={(event) => {
+                          if ((event.target as HTMLElement).closest("button")) return;
+                          event.preventDefault();
+                          startDragTask(entry.entryId, "move", event.clientY);
+                        }}
+                      >
+                        {compactTimelineTask ? (
+                          <div className="home-playground-task-inline">
+                            <span className={`pill pill-${task.source.toLowerCase()}`}>{task.source}</span>
+                            <strong>{task.title}</strong>
+                            <span className="subtle-pill compact-time">
+                              {formatLocalTimelineTime(startTime)} - {formatLocalTimelineTime(endTime)}
+                            </span>
+                            <button
+                              className="ghost-button subtle-action"
+                              type="button"
+                              onClick={(event) => {
+                                event.stopPropagation();
+                                void removeScheduledTaskEntry(task, entry.entryId);
+                              }}
+                            >
+                              Remove
+                            </button>
+                          </div>
+                        ) : (
+                          <>
+                            <div className="home-playground-block-topline">
+                              <span className={`pill pill-${task.source.toLowerCase()}`}>{task.source}</span>
+                              <span className={`status-badge task-status-badge status-${taskStatusClassName(task.status)}`}>
+                                {task.status}
+                              </span>
+                            </div>
+                            <div className="home-playground-task-top">
+                              <span className="subtle-pill">
+                                {formatLocalTimelineTime(startTime)} - {formatLocalTimelineTime(endTime)}
+                              </span>
+                              <span className="subtle-pill">{entry.durationMinutes} min</span>
+                            </div>
+                            <strong>{task.title}</strong>
+                            <p className="muted">
+                              {task.source === "Jira" && jiraStorySummary(task)
+                                ? jiraStorySummary(task)
+                                : task.priorityExplanation ?? "Scheduled focus block"}
+                            </p>
+                          </>
+                        )}
+                        {!compactTimelineTask ? (
+                          <div className="home-playground-task-actions">
+                            <button
+                              className="ghost-button subtle-action"
+                              type="button"
+                              onClick={(event) => {
+                                event.stopPropagation();
+                                void removeScheduledTaskEntry(task, entry.entryId);
+                              }}
+                            >
+                              Remove
+                            </button>
+                          </div>
+                        ) : null}
+                      </div>
+                      <button
+                        className="home-playground-resize-handle bottom"
+                        type="button"
+                        aria-label="Resize task block from bottom"
+                        onMouseDown={(event) => {
+                          event.preventDefault();
+                          event.stopPropagation();
+                          startDragTask(entry.entryId, "resize-bottom", event.clientY);
+                        }}
+                      />
+                    </article>
+                  );
+                })}
+
+                {timelinePopup ? (
+                  <div
+                    ref={timelinePopupRef}
+                    className="home-timeline-popup"
+                    style={{ top: timelinePopup.top, left: timelinePopup.left }}
+                  >
+                    <button className="home-timeline-popup-close" type="button" onClick={() => setTimelinePopup(null)}>
+                      Close
+                    </button>
+                    {timelinePopup.kind === "meeting" ? (
+                      <div className="detail-stack">
+                        <div className="task-meta">
+                          <span className="pill pill-meeting">Meeting</span>
+                          <span className="subtle-pill">
+                            {timelinePopupMeetingDetail?.meetingLinkType === "join" || timelinePopup.meeting.meetingLinkType === "join"
+                              ? "Join link"
+                              : "Calendar link"}
+                          </span>
+                          <span className="subtle-pill">
+                            {timelinePopup.meeting.attendanceStatus === "unattending" ? "Not attending" : "Attending"}
+                          </span>
+                        </div>
+                        <div>
+                          <h3>{timelinePopupMeetingDetail?.title ?? timelinePopup.meeting.title}</h3>
+                          <p className="muted">
+                            {formatMeetingDayLabel(timelinePopup.meeting.startTime, timelinePopup.meeting.timeZone)} •{" "}
+                            {formatMeetingTime(timelinePopup.meeting.startTime, timelinePopup.meeting.timeZone)} to{" "}
+                            {formatMeetingTime(timelinePopup.meeting.endTime, timelinePopup.meeting.timeZone)}
+                          </p>
+                        </div>
+                        {timelinePopupLoading ? <p className="muted">Loading…</p> : null}
+                        {timelinePopupError ? <p className="empty-state">{timelinePopupError}</p> : null}
+                        <section className="detail-section">
+                          <h4>Description</h4>
+                          <pre className="detail-content">
+                            {timelinePopupMeetingDetail?.description ?? timelinePopupMeetingDetail?.bodyPreview ?? "No meeting description available."}
+                          </pre>
+                        </section>
+                          <div className="integration-actions">
+                            {timelinePopupMeetingDetail?.meetingLink ?? timelinePopup.meeting.meetingLink ? (
+                              <a
+                              className="primary-button"
+                              href={timelinePopupMeetingDetail?.meetingLink ?? timelinePopup.meeting.meetingLink ?? "#"}
+                              target="_blank"
+                              rel="noreferrer"
+                            >
+                              {timelinePopupMeetingDetail?.meetingLinkType === "join" || timelinePopup.meeting.meetingLinkType === "join"
+                                ? "Join"
+                                : "Open"}
+                            </a>
+                            ) : null}
+                            <button
+                              className="ghost-button subtle-action"
+                              type="button"
+                              onClick={async () => {
+                                setTimelinePopup(null);
+                                await props.onUpdateHomeMeetingAction(timelinePopup.meeting, "unattending");
+                              }}
+                            >
+                              Not attending
+                            </button>
+                            <button
+                              className="ghost-button subtle-action"
+                              type="button"
+                              onClick={async () => {
+                                setTimelinePopup(null);
+                                await props.onUpdateHomeMeetingAction(timelinePopup.meeting, "remove");
+                              }}
+                            >
+                              Remove
+                            </button>
+                            <button className="ghost-button subtle-action" type="button" onClick={() => props.onPrepareMeeting(timelinePopup.meeting)}>
+                              Prepare
+                            </button>
+                          </div>
+                      </div>
+                    ) : (
+                      <div className="detail-stack">
+                        <div className="task-meta">
+                          <span className={`pill pill-${timelinePopup.task.source.toLowerCase()}`}>{timelinePopup.task.source}</span>
+                          <span className={`status-badge task-status-badge status-${taskStatusClassName(timelinePopup.task.status)}`}>
+                            {timelinePopup.task.status}
+                          </span>
+                          <span className="subtle-pill">{timelinePopup.task.stage}</span>
+                        </div>
+                        <div>
+                          <h3>{timelinePopup.task.title}</h3>
+                          <p className="muted">{timelinePopup.task.priorityExplanation ?? timelinePopup.task.selectionReason ?? "Scheduled in your timeline."}</p>
+                        </div>
+                        {timelinePopupLoading ? <p className="muted">Loading…</p> : null}
+                        {timelinePopupError ? <p className="empty-state">{timelinePopupError}</p> : null}
+                        <div className="detail-grid compact">
+                          <div className="detail-stat">
+                            <span>Estimated time</span>
+                            <strong>{taskEstimatedTimeLabel(timelinePopup.task)}</strong>
+                          </div>
+                          <div className="detail-stat">
+                            <span>Updated</span>
+                            <strong>{formatDateTime(timelinePopup.task.updatedAt)}</strong>
+                          </div>
+                        </div>
+                        <section className="detail-section">
+                          <h4>Description</h4>
+                          <pre className="detail-content">
+                            {timelinePopupTaskDetail?.type === "jira"
+                              ? timelinePopupTaskDetail.description
+                              : timelinePopupTaskDetail?.type === "email"
+                                ? timelinePopupTaskDetail.body
+                                : timelinePopup.task.priorityExplanation ?? "No description available yet."}
+                          </pre>
+                        </section>
+                        <div className="integration-actions">
+                          <button
+                            className="ghost-button subtle-action"
+                            type="button"
+                            onClick={() => void removeScheduledTaskEntry(timelinePopup.task, timelinePopup.entryId)}
+                          >
+                            Remove from timeline
+                          </button>
+                          {(["Now", "Next", "Later", "Review"] as TaskStage[]).map((stageOption) => (
+                            <button
+                              key={stageOption}
+                              className="ghost-button subtle-action"
+                              type="button"
+                              onClick={() => {
+                                void props.onMoveTaskToStage(timelinePopup.task, stageOption);
+                                setTimelinePopup(null);
+                              }}
+                            >
+                              Move to {stageOption}
+                            </button>
+                          ))}
+                          {timelinePopup.task.sourceLink ? (
+                            <a className="ghost-button subtle-action" href={timelinePopup.task.sourceLink} target="_blank" rel="noreferrer">
+                              Open source
+                            </a>
+                          ) : null}
+                          <button
+                            className="ghost-button subtle-action"
+                            type="button"
+                            onClick={() => {
+                              setSection(taskHomeSection(timelinePopup.task));
+                              setExpandedKey(`task:${timelinePopup.task.id}`);
+                              setTimelinePopup(null);
+                            }}
+                          >
+                            Reveal in list
+                          </button>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                ) : null}
+              </div>
+            </div>
+          </div>
+      </div>
+    </section>
   );
 }
 
@@ -1683,50 +3290,71 @@ function TodayView(props: {
 }
 
 function TasksView(props: {
-  tasks: Task[];
+  board: TaskBoardPayload | null;
   loading: boolean;
-  filter: TaskFilter;
-  onFilterChange: (filter: TaskFilter) => void;
-  onCreate: (title: string) => Promise<void>;
+  syncTasksLoading: boolean;
+  onSyncTasks: () => Promise<void>;
+  onCreate: (title: string, stage: TaskStage) => Promise<void>;
   onUpdateStatus: (task: Task, status: TaskStatus) => Promise<void>;
-  onUpdatePriority: (task: Task, priority: TaskPriority) => Promise<void>;
-  onDelete: (task: Task) => Promise<void>;
+  onMoveTask: (task: Task, stage: TaskStage, index: number) => Promise<void>;
+  onRejectTask: (task: Task) => Promise<void>;
+  onRestoreRejectedToStage: (task: RejectedTask, stage: TaskStage, index: number) => Promise<void>;
+  onIgnoreThis: (task: RejectedTask) => Promise<void>;
+  onAlwaysIgnore: (task: RejectedTask) => Promise<void>;
   onOpenDetails: (task: Task) => Promise<void>;
-  onDeferUntilTomorrow: (task: Task) => Promise<void>;
 }) {
   const [title, setTitle] = useState("");
-  const sections = useMemo(() => {
-    const order: TaskStatus[] =
-      props.filter === "All" ? ["In Progress", "Not Started", "Completed"] : [props.filter];
+  const [stage, setStage] = useState<TaskStage>("Later");
+  const columns: Array<{ key: BoardColumn; title: string; description: string; tasks: Task[]; rejected?: RejectedTask[] }> = [
+    { key: "Now", title: "Now", description: "Today’s committed work only.", tasks: props.board?.now ?? [] },
+    { key: "Next", title: "Next", description: "Important work queued for the next available slot.", tasks: props.board?.next ?? [] },
+    { key: "Later", title: "Later", description: "Lower-pressure backlog and general work.", tasks: props.board?.later ?? [] },
+    { key: "Review", title: "Review", description: "Needs human judgment before being fully planned.", tasks: props.board?.review ?? [] },
+    { key: "Reject", title: "Reject", description: "Hidden items and hard rejects.", tasks: [], rejected: props.board?.rejected ?? [] }
+  ];
 
-    return order
-      .map((status) => ({
-        status,
-        items: buildTaskPresentationItems(props.tasks.filter((task) => task.status === status))
-      }))
-      .filter((section) => section.items.length > 0);
-  }, [props.tasks, props.filter]);
+  function dragTaskPayload(event: React.DragEvent, payload: { kind: "task"; taskId: number } | { kind: "rejected"; rejectedTaskId: number }) {
+    event.dataTransfer.setData("application/json", JSON.stringify(payload));
+    event.dataTransfer.effectAllowed = "move";
+  }
+
+  async function handleDrop(event: React.DragEvent, target: BoardColumn, index: number) {
+    event.preventDefault();
+    const raw = event.dataTransfer.getData("application/json");
+    if (!raw) return;
+    try {
+      const parsed = JSON.parse(raw) as { kind: "task"; taskId: number } | { kind: "rejected"; rejectedTaskId: number };
+      if (parsed.kind === "task") {
+        const task = [...(props.board?.now ?? []), ...(props.board?.next ?? []), ...(props.board?.later ?? []), ...(props.board?.review ?? [])]
+          .find((entry) => entry.id === parsed.taskId);
+        if (!task) return;
+        if (target === "Reject") {
+          await props.onRejectTask(task);
+          return;
+        }
+        await props.onMoveTask(task, target, index);
+        return;
+      }
+      const rejected = (props.board?.rejected ?? []).find((entry) => entry.id === parsed.rejectedTaskId);
+      if (!rejected || target === "Reject") return;
+      await props.onRestoreRejectedToStage(rejected, target, index);
+    } catch {
+      // ignore malformed drag payloads
+    }
+  }
 
   return (
     <section className="panel-stack">
       <div className="panel">
         <div className="tasks-header">
           <div>
-            <h3>Task List</h3>
-            <p className="muted">Manage manual items and source-backed tasks without leaving the planner.</p>
+            <h3>Planning Board</h3>
+            <p className="muted">Move work between Now, Next, Later, Review, and Reject without breaking the classic flow.</p>
           </div>
-          <div className="filter-shell">
-            <label className="status-select compact">
-              <span>Filter</span>
-              <select value={props.filter} onChange={(e) => props.onFilterChange(e.target.value as TaskFilter)}>
-                <option value="All">All statuses</option>
-                {statusOptions.map((status) => (
-                  <option key={status} value={status}>
-                    {status}
-                  </option>
-                ))}
-              </select>
-            </label>
+          <div className="integration-actions">
+            <button className="ghost-button subtle-action" type="button" onClick={() => void props.onSyncTasks()} disabled={props.syncTasksLoading}>
+              {props.syncTasksLoading ? "Syncing…" : "Sync tasks"}
+            </button>
           </div>
         </div>
 
@@ -1735,69 +3363,107 @@ function TasksView(props: {
           onSubmit={async (event) => {
             event.preventDefault();
             if (!title.trim()) return;
-            await props.onCreate(title.trim());
+            await props.onCreate(title.trim(), stage);
             setTitle("");
           }}
         >
-          <input
-            value={title}
-            onChange={(event) => setTitle(event.target.value)}
-            placeholder="Capture a manual task quickly"
-          />
-          <button className="primary-button" type="submit">
-            Add Task
-          </button>
+          <input value={title} onChange={(event) => setTitle(event.target.value)} placeholder="Add a manual task" />
+          <label className="status-select compact">
+            <span>Stage</span>
+            <select value={stage} onChange={(event) => setStage(event.target.value as TaskStage)}>
+              <option value="Now">Now</option>
+              <option value="Next">Next</option>
+              <option value="Later">Later</option>
+              <option value="Review">Review</option>
+            </select>
+          </label>
+          <button className="primary-button" type="submit">Add Task</button>
         </form>
 
-        <div className="task-table">
-          {props.loading ? <p className="muted">Loading tasks…</p> : null}
-          {sections.map((section) => (
-            <section className={`task-status-section status-${taskStatusClassName(section.status)}`} key={section.status}>
-              <div className="task-status-section-header">
+        <div className="task-board-grid">
+          {props.loading ? <p className="muted">Loading board…</p> : null}
+          {columns.map((column) => (
+            <section
+              key={column.key}
+              className={`task-board-column task-board-column-${column.key.toLowerCase()}`}
+              onDragOver={(event) => event.preventDefault()}
+              onDrop={(event) =>
+                void handleDrop(
+                  event,
+                  column.key,
+                  column.key === "Reject" ? 0 : (column.tasks?.length ?? 0)
+                )
+              }
+            >
+              <div className="task-board-column-header">
                 <div>
-                  <h4>{taskStatusLabel(section.status)}</h4>
-                  <p>
-                    {section.status === "In Progress"
-                      ? "Current work, kept at the top."
-                      : section.status === "Not Started"
-                        ? "Ready to pick up next."
-                        : "Finished work, separated for clarity."}
-                  </p>
+                  <h4>{column.title}</h4>
+                  <p>{column.description}</p>
                 </div>
-                <span className={`status-badge task-status-badge status-${taskStatusClassName(section.status)}`}>
-                  {section.items.length}
-                </span>
+                <span className="status-badge">{column.key === "Reject" ? column.rejected?.length ?? 0 : column.tasks.length}</span>
               </div>
-              <div className="task-status-section-list">
-                {section.items.map((item) =>
-                  item.kind === "cluster" ? (
-                    <TaskClusterCard
-                      key={item.key}
-                      title={item.title}
-                      tasks={item.tasks}
-                      onStatusChange={(currentTask, status) => props.onUpdateStatus(currentTask, status)}
-                      onPriorityChange={(currentTask, priority) => props.onUpdatePriority(currentTask, priority)}
-                      onDelete={(currentTask) => props.onDelete(currentTask)}
-                      onOpenDetails={props.onOpenDetails}
-                      onDeferUntilTomorrow={props.onDeferUntilTomorrow}
-                    />
-                  ) : (
-                    <TaskCard
-                      key={item.key}
-                      task={item.task}
-                      dense
-                      onStatusChange={(currentTask, status) => props.onUpdateStatus(currentTask, status)}
-                      onPriorityChange={(currentTask, priority) => props.onUpdatePriority(currentTask, priority)}
-                      onDelete={(currentTask) => props.onDelete(currentTask)}
-                      onOpenDetails={props.onOpenDetails}
-                      onDeferUntilTomorrow={props.onDeferUntilTomorrow}
-                    />
-                  )
-                )}
+
+              <div className="task-board-column-list">
+            {column.key !== "Reject"
+                  ? column.tasks.map((task, index) => (
+                      <article
+                        key={task.id}
+                        className="task-board-card"
+                        draggable
+                        onDragStart={(event) => dragTaskPayload(event, { kind: "task", taskId: task.id })}
+                        onDragOver={(event) => event.preventDefault()}
+                        onDrop={(event) => void handleDrop(event, column.key, index)}
+                        onClick={() => {
+                          if (task.source !== "Manual") {
+                            void props.onOpenDetails(task);
+                          }
+                        }}
+                      >
+                        <div className="task-meta">
+                          <span className={`pill pill-${task.source.toLowerCase()}`}>{task.source}</span>
+                          <span className={`status-badge task-status-badge status-${taskStatusClassName(task.status)}`}>{task.status}</span>
+                        </div>
+                        <strong>{task.title}</strong>
+                        <div className="task-board-card-actions">
+                          <label className="status-select compact">
+                            <span>Status</span>
+                            <select value={task.status} onChange={(event) => void props.onUpdateStatus(task, event.target.value as TaskStatus)}>
+                              {statusOptions.map((statusOption) => (
+                                <option key={statusOption} value={statusOption}>{statusOption}</option>
+                              ))}
+                            </select>
+                          </label>
+                        </div>
+                      </article>
+                    ))
+                  : (column.rejected ?? []).map((task) => (
+                      <article
+                        key={task.id}
+                        className="task-board-card rejected"
+                        draggable
+                        onDragStart={(event) => dragTaskPayload(event, { kind: "rejected", rejectedTaskId: task.id })}
+                      >
+                        <div className="task-meta">
+                          <span className={`pill pill-${task.source.toLowerCase()}`}>{task.source}</span>
+                          <span className="subtle-pill">Hidden</span>
+                        </div>
+                        <strong>{task.title}</strong>
+                        <p className="muted">{task.decisionReason ?? "Hidden by planner."}</p>
+                        <div className="task-board-card-actions">
+                          <button className="ghost-button subtle-action" type="button" onClick={() => void props.onIgnoreThis(task)}>
+                            Ignore this
+                          </button>
+                          <button className="ghost-button subtle-action" type="button" onClick={() => void props.onAlwaysIgnore(task)}>
+                            Ignore similar
+                          </button>
+                        </div>
+                      </article>
+                    ))}
+                {column.key === "Reject" && !(column.rejected ?? []).length ? <p className="empty-state">Nothing rejected right now.</p> : null}
+                {column.key !== "Reject" && !column.tasks.length ? <p className="empty-state">Drop tasks here.</p> : null}
               </div>
             </section>
           ))}
-          {!props.tasks.length ? <p className="empty-state">No tasks match this filter yet.</p> : null}
         </div>
       </div>
     </section>
@@ -1817,12 +3483,12 @@ function DeferredView(props: {
       <div className="panel">
         <div className="tasks-header">
           <div>
-            <h3>Deferred Tasks</h3>
-            <p className="muted">Tasks you intentionally moved out of the active plan until later.</p>
+            <h3>Next Queue</h3>
+            <p className="muted">Tasks queued for the next planning window.</p>
           </div>
         </div>
         <div className="task-table">
-          {props.loading ? <p className="muted">Loading deferred tasks…</p> : null}
+          {props.loading ? <p className="muted">Loading next tasks…</p> : null}
           {items.map((item) =>
             item.kind === "cluster" ? (
               <TaskClusterCard
@@ -1848,7 +3514,7 @@ function DeferredView(props: {
               />
             )
           )}
-          {!props.tasks.length ? <p className="empty-state">No deferred tasks right now.</p> : null}
+          {!props.tasks.length ? <p className="empty-state">No queued next tasks right now.</p> : null}
         </div>
       </div>
     </section>
@@ -2511,13 +4177,13 @@ function SettingsView(props: {
               placeholder="Anything subtle the planner should know, like how you balance coding, reviews, meetings, or follow-ups."
             />
           </label>
-          <div className="field-card">
+          {/* <div className="field-card">
             <span>Teach with examples</span>
             <p className="muted small-text">
               These examples help the planner tune filtering and ranking without hiding work permanently.
             </p>
-          </div>
-          <div className="calibration-list">
+          </div> */}
+          {/* <div className="calibration-list">
             {exampleRankings.map((item, index) => (
               <div className="field-card" key={`${item.title}-${index}`}>
                 <span>
@@ -2544,7 +4210,7 @@ function SettingsView(props: {
                 </select>
               </div>
             ))}
-          </div>
+          </div> */}
           <div className="integration-actions">
             <button className="primary-button" type="submit">
               Refresh preferences
@@ -2593,10 +4259,289 @@ function SettingsView(props: {
   );
 }
 
+function HomeMetricsView(props: {
+  loading: boolean;
+  historyDays: DayHistorySummary[];
+  selectedDay: string | null;
+  historyDetail: DayHistoryDetail | null;
+  updates: InsightsUpdatesPayload | null;
+  onSelectDay: (dayKey: string) => Promise<void>;
+  onRangeChange: (start: string, end: string) => Promise<void>;
+}) {
+  const todayKey = new Intl.DateTimeFormat("en-CA", {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit"
+  }).format(new Date());
+  const [activeTab, setActiveTab] = useState<"details" | "updates">("details");
+  const [rangeStart, setRangeStart] = useState(todayKey);
+  const [rangeEnd, setRangeEnd] = useState(todayKey);
+
+  useEffect(() => {
+    void props.onRangeChange(rangeStart, rangeEnd);
+  }, [rangeEnd, rangeStart]);
+
+  const filteredHistoryDays = useMemo(() => {
+    return props.historyDays.filter((day) => day.dayKey >= rangeStart && day.dayKey <= rangeEnd);
+  }, [props.historyDays, rangeEnd, rangeStart]);
+
+  useEffect(() => {
+    if (!filteredHistoryDays.length) return;
+    if (!props.selectedDay || !filteredHistoryDays.some((day) => day.dayKey === props.selectedDay)) {
+      void props.onSelectDay(filteredHistoryDays[0].dayKey);
+    }
+  }, [filteredHistoryDays, props.selectedDay]);
+
+  const aggregate = useMemo(() => {
+    const days = filteredHistoryDays;
+    const total = <T extends number | null | undefined>(values: T[]) =>
+      values.reduce((sum, value) => sum + (value ?? 0), 0);
+    const average = (values: Array<number | null | undefined>) => {
+      const valid = values.filter((value): value is number => value !== null && value !== undefined);
+      return valid.length ? Math.round(valid.reduce((sum, value) => sum + value, 0) / valid.length) : null;
+    };
+
+    return {
+      plannedTaskCount: total(days.map((day) => day.plannedTaskCount)),
+      completedTaskCount: total(days.map((day) => day.completedTaskCount)),
+      removedTaskCount: total(days.map((day) => day.removedTaskCount)),
+      plannedTaskMinutes: total(days.map((day) => day.plannedTaskMinutes)),
+      completedTaskMinutes: total(days.map((day) => day.completedTaskMinutes)),
+      spilloverTaskCount: total(days.map((day) => day.spilloverTaskCount)),
+      scheduledMeetingCount: total(days.map((day) => day.scheduledMeetingCount)),
+      jiraTaskCount: total(days.map((day) => day.jiraTaskCount)),
+      emailTaskCount: total(days.map((day) => day.emailTaskCount)),
+      manualTaskCount: total(days.map((day) => day.manualTaskCount)),
+      acceptancePercent: average(days.map((day) => day.acceptancePercent)),
+      spilloverPercent: average(days.map((day) => day.spilloverPercent)),
+      agreementPercent: average(days.map((day) => day.agreementPercent))
+    };
+  }, [filteredHistoryDays]);
+
+  const removedEvents = useMemo(
+    () => props.historyDetail?.changeEvents.filter((event) => ["remove_manual", "reject"].includes(event.eventType)) ?? [],
+    [props.historyDetail]
+  );
+
+  return (
+    <section className="panel-stack home-shell-page">
+      <div className="panel home-metrics-header">
+        <div className="home-banner-copy">
+          <p className="eyebrow">Metrics</p>
+          <h2>Track plan quality, completions, removals, and every user update.</h2>
+          <p>Use the new workspace metrics to inspect how much was planned, what was completed, what spilled over, and how the user corrected the plan.</p>
+        </div>
+      </div>
+
+      <div className="panel home-metrics-toolbar">
+        <div className="insights-tab-bar home-metrics-tabs">
+          <button
+            className={activeTab === "details" ? "insights-tab-button active" : "insights-tab-button"}
+            onClick={() => setActiveTab("details")}
+          >
+            Metrics details
+          </button>
+          <button
+            className={activeTab === "updates" ? "insights-tab-button active" : "insights-tab-button"}
+            onClick={() => setActiveTab("updates")}
+          >
+            User updates
+          </button>
+        </div>
+        <div className="metrics-range-bar">
+          <label className="field-card compact-card">
+            <span>From</span>
+            <input type="date" value={rangeStart} max={rangeEnd} onChange={(event) => setRangeStart(event.target.value)} />
+          </label>
+          <label className="field-card compact-card">
+            <span>To</span>
+            <input type="date" value={rangeEnd} min={rangeStart} onChange={(event) => setRangeEnd(event.target.value)} />
+          </label>
+          <div className="integration-actions">
+            <button className="ghost-button subtle-action" onClick={() => { setRangeStart(todayKey); setRangeEnd(todayKey); }}>
+              Today
+            </button>
+            <button
+              className="ghost-button subtle-action"
+              onClick={() => {
+                const sevenDays = props.historyDays.slice(0, 7);
+                if (!sevenDays.length) return;
+                setRangeStart(sevenDays[sevenDays.length - 1].dayKey);
+                setRangeEnd(sevenDays[0].dayKey);
+              }}
+            >
+              Last 7 days
+            </button>
+            <button
+              className="ghost-button subtle-action"
+              onClick={() => {
+                if (!props.historyDays.length) return;
+                setRangeStart(props.historyDays[props.historyDays.length - 1].dayKey);
+                setRangeEnd(props.historyDays[0].dayKey);
+              }}
+            >
+              All history
+            </button>
+          </div>
+        </div>
+      </div>
+
+      {activeTab === "details" ? (
+        <>
+          {props.loading ? <p className="muted">Loading metrics…</p> : null}
+          <div className="overview-strip home-metrics-strip">
+            <div className="overview-card">
+              <span>Planned vs completed</span>
+              <strong>{aggregate.completedTaskCount} / {aggregate.plannedTaskCount}</strong>
+              <p>{formatMinutesAsHours(aggregate.completedTaskMinutes)} completed from {formatMinutesAsHours(aggregate.plannedTaskMinutes)} planned</p>
+            </div>
+            <div className="overview-card">
+              <span>Planning acceptance</span>
+              <strong>{formatPercentValue(aggregate.acceptancePercent)}</strong>
+              <p>{formatPercentValue(aggregate.agreementPercent)} agreement across the selected range</p>
+            </div>
+            <div className="overview-card">
+              <span>Spillover</span>
+              <strong>{aggregate.spilloverTaskCount}</strong>
+              <p>{formatPercentValue(aggregate.spilloverPercent)} average spillover rate</p>
+            </div>
+            <div className="overview-card">
+              <span>Completed & removed</span>
+              <strong>{aggregate.completedTaskCount + aggregate.removedTaskCount}</strong>
+              <p>{aggregate.completedTaskCount} completed • {aggregate.removedTaskCount} removed</p>
+            </div>
+            <div className="overview-card">
+              <span>Sources</span>
+              <strong>{aggregate.jiraTaskCount + aggregate.emailTaskCount + aggregate.manualTaskCount}</strong>
+              <p>{aggregate.jiraTaskCount} Jira • {aggregate.emailTaskCount} Email • {aggregate.manualTaskCount} Manual</p>
+            </div>
+            <div className="overview-card">
+              <span>Meetings</span>
+              <strong>{aggregate.scheduledMeetingCount}</strong>
+              <p>Scheduled meetings within the selected range</p>
+            </div>
+          </div>
+
+          <div className="dashboard-grid insights-grid">
+            <div className="panel">
+              <div className="panel-header">
+                <div>
+                  <h3>Daily ledger</h3>
+                  <p className="timeline-header-note">Every day’s planned versus completed work, acceptance, spillover, and source mix.</p>
+                </div>
+              </div>
+              <div className="history-day-list history-day-list-wide">
+                {filteredHistoryDays.map((day) => (
+                  <button
+                    key={day.dayKey}
+                    className={props.selectedDay === day.dayKey ? "history-day-card active" : "history-day-card"}
+                    onClick={() => void props.onSelectDay(day.dayKey)}
+                  >
+                    <strong>{formatDate(day.dayKey)}</strong>
+                    <span>{day.plannedTaskCount} planned • {day.completedTaskCount} completed • {day.removedTaskCount} removed</span>
+                    <span>{formatPercentValue(day.acceptancePercent)} acceptance • {formatPercentValue(day.spilloverPercent)} spillover</span>
+                    <span>{day.jiraTaskCount} Jira • {day.emailTaskCount} Email • {day.manualTaskCount} Manual • {day.scheduledMeetingCount} meetings</span>
+                  </button>
+                ))}
+                {!filteredHistoryDays.length ? <p className="empty-state">No history exists for the selected range yet.</p> : null}
+              </div>
+            </div>
+
+            <div className="panel">
+              <div className="panel-header">
+                <div>
+                  <h3>Selected day detail</h3>
+                  <p className="timeline-header-note">Completed tasks, removed tasks, and detailed plan outcomes for the chosen day.</p>
+                </div>
+              </div>
+              {props.historyDetail ? (
+                <div className="detail-list">
+                  <article className="detail-row home-metric-summary-row">
+                    <div>
+                      <strong>{formatDate(props.historyDetail.summary.dayKey)}</strong>
+                      <p className="muted small-text">{props.historyDetail.summary.guidance}</p>
+                    </div>
+                    <span>{formatPercentValue(props.historyDetail.summary.completionPercent)} success</span>
+                  </article>
+                  <article className="field-card compact-card">
+                    <span>Completed tasks</span>
+                    <div className="detail-list compact-detail-list">
+                      {props.historyDetail.completedTasks.length ? props.historyDetail.completedTasks.map((task) => (
+                        <article className="detail-row" key={`completed-${task.id}`}>
+                          <div>
+                            <strong>{task.title}</strong>
+                            <p className="muted small-text">{task.source} • {task.priority}</p>
+                          </div>
+                          <span>{formatDateTime(task.completedAt)}</span>
+                        </article>
+                      )) : <p className="empty-state">No completed tasks recorded for this day.</p>}
+                    </div>
+                  </article>
+                  <article className="field-card compact-card">
+                    <span>Completely removed tasks</span>
+                    <div className="detail-list compact-detail-list">
+                      {removedEvents.length ? removedEvents.map((event) => (
+                        <article className="detail-row" key={`removed-${event.id}`}>
+                          <div>
+                            <strong>{taskStateEventTitle(event)}</strong>
+                            <p className="muted small-text">{taskStateEventSource(event)} • {event.eventType.replace(/_/g, " ")}</p>
+                          </div>
+                          <span>{formatDateTime(event.createdAt)}</span>
+                        </article>
+                      )) : <p className="empty-state">No tasks were completely removed on this day.</p>}
+                    </div>
+                  </article>
+                </div>
+              ) : (
+                <p className="empty-state">Select a day to inspect its completed and removed tasks.</p>
+              )}
+            </div>
+          </div>
+        </>
+      ) : (
+        <div className="panel">
+          {props.loading ? <p className="muted">Loading updates…</p> : null}
+          <div className="panel-header">
+            <div>
+              <h3>User update tracking</h3>
+              <p className="timeline-header-note">Detailed user actions with task name, source, and before/after changes.</p>
+            </div>
+            <span>{props.updates?.totalEvents ?? 0} events</span>
+          </div>
+          <div className="detail-list home-updates-list">
+            {(props.updates?.events ?? []).map((event) => (
+              <article className="detail-row home-update-row" key={`update-${event.id}`}>
+                <div className="home-update-main">
+                  <div className="task-meta">
+                    <span className="subtle-pill">{taskStateEventSource(event)}</span>
+                    <span className="subtle-pill">{event.eventType.replace(/_/g, " ")}</span>
+                  </div>
+                  <strong>{taskStateEventTitle(event)}</strong>
+                  {event.reason ? <p className="muted small-text">{event.reason}</p> : null}
+                  <div className="task-link-row">
+                    {taskStateEventChanges(event).length ? taskStateEventChanges(event).map((change) => (
+                      <span className="subtle-pill" key={`${event.id}-${change.label}`}>
+                        {change.label}: {change.from} to {change.to}
+                      </span>
+                    )) : <span className="subtle-pill">No field diff captured</span>}
+                  </div>
+                </div>
+                <span>{formatDateTime(event.createdAt)}</span>
+              </article>
+            ))}
+            {!(props.updates?.events ?? []).length ? <p className="empty-state">No recorded user updates for the selected range yet.</p> : null}
+          </div>
+        </div>
+      )}
+    </section>
+  );
+}
+
 function InsightsView(props: {
   loading: boolean;
   overview: InsightsOverview | null;
   todayInsights: InsightsTodayPayload | null;
+  updates: InsightsUpdatesPayload | null;
   profile: UserPriorityProfile | null;
   personalizationInsights: PersonalizationInsight[];
   historyDays: DayHistorySummary[];
@@ -2614,7 +4559,7 @@ function InsightsView(props: {
     month: "2-digit",
     day: "2-digit"
   }).format(new Date());
-  const [activeTab, setActiveTab] = useState<"reasoning" | "metrics">("reasoning");
+  const [activeTab, setActiveTab] = useState<"reasoning" | "metrics" | "updates">("reasoning");
   const [rangeStart, setRangeStart] = useState(todayKey);
   const [rangeEnd, setRangeEnd] = useState(todayKey);
 
@@ -2688,7 +4633,13 @@ function InsightsView(props: {
           className={activeTab === "metrics" ? "insights-tab-button active" : "insights-tab-button"}
           onClick={() => setActiveTab("metrics")}
         >
-          Metrics & User Updates
+          Metrics
+        </button>
+        <button
+          className={activeTab === "updates" ? "insights-tab-button active" : "insights-tab-button"}
+          onClick={() => setActiveTab("updates")}
+        >
+          User Updates
         </button>
       </div>
 
@@ -2859,7 +4810,7 @@ function InsightsView(props: {
             ) : null}
           </div>
         </div>
-      ) : (
+      ) : activeTab === "metrics" ? (
         <div className="panel-stack">
           <div className="panel">
             <div className="panel-header">
@@ -2934,6 +4885,11 @@ function InsightsView(props: {
                 <p>{rangeMetrics.deferredCount} deferred • {rangeMetrics.rejectedCount} rejected • {rangeMetrics.restoredCount} restored</p>
               </div>
               <div className="overview-card">
+                <span>Removed tasks</span>
+                <strong>{filteredHistoryDays.reduce((sum, day) => sum + day.removedTaskCount, 0)}</strong>
+                <p>Completely removed or rejected tasks in the selected range</p>
+              </div>
+              <div className="overview-card">
                 <span>Meetings scheduled</span>
                 <strong>{rangeMetrics.scheduledMeetingCount}</strong>
                 <p>{formatMinutesAsHours(rangeMetrics.scheduledMeetingMinutes)} scheduled meeting time</p>
@@ -2941,7 +4897,39 @@ function InsightsView(props: {
               <div className="overview-card">
                 <span>Spillovers</span>
                 <strong>{rangeMetrics.spilloverCount}</strong>
-                <p>Tasks that could not fit cleanly into the selected plans</p>
+                <p>
+                  {formatPercentValue(
+                    filteredHistoryDays.length
+                      ? Math.round(
+                          filteredHistoryDays.reduce((sum, day) => sum + (day.spilloverPercent ?? 0), 0) / filteredHistoryDays.length
+                        )
+                      : null
+                  )} average spillover rate
+                </p>
+              </div>
+              <div className="overview-card">
+                <span>Planning acceptance</span>
+                <strong>
+                  {formatPercentValue(
+                    filteredHistoryDays.length
+                      ? Math.round(
+                          filteredHistoryDays.reduce((sum, day) => sum + (day.acceptancePercent ?? 0), 0) / filteredHistoryDays.length
+                        )
+                      : null
+                  )}
+                </strong>
+                <p>How often the user kept planner-proposed tasks in place</p>
+              </div>
+              <div className="overview-card">
+                <span>Planned sources</span>
+                <strong>
+                  {filteredHistoryDays.reduce((sum, day) => sum + day.jiraTaskCount + day.emailTaskCount + day.manualTaskCount, 0)}
+                </strong>
+                <p>
+                  {filteredHistoryDays.reduce((sum, day) => sum + day.jiraTaskCount, 0)} Jira •{" "}
+                  {filteredHistoryDays.reduce((sum, day) => sum + day.emailTaskCount, 0)} Email •{" "}
+                  {filteredHistoryDays.reduce((sum, day) => sum + day.manualTaskCount, 0)} Manual
+                </p>
               </div>
             </div>
           </div>
@@ -2989,13 +4977,20 @@ function InsightsView(props: {
                     </div>
                     <div className="overview-card">
                       <span>Agreement</span>
-                      <strong>{formatPercentValue(props.historyDetail.summary.agreementPercent)}</strong>
-                      <p>{props.historyDetail.summary.rejectedTaskCount} rejected • {props.historyDetail.summary.restoredTaskCount} restored</p>
+                    <strong>{formatPercentValue(props.historyDetail.summary.agreementPercent)}</strong>
+                     <p>{props.historyDetail.summary.rejectedTaskCount} rejected • {props.historyDetail.summary.restoredTaskCount} restored</p>
                     </div>
                     <div className="overview-card">
                       <span>Meetings</span>
                       <strong>{props.historyDetail.summary.scheduledMeetingCount}</strong>
                       <p>{formatMinutesAsHours(props.historyDetail.summary.scheduledMeetingMinutes)} scheduled</p>
+                    </div>
+                    <div className="overview-card">
+                      <span>Sources</span>
+                      <strong>{props.historyDetail.summary.jiraTaskCount + props.historyDetail.summary.emailTaskCount + props.historyDetail.summary.manualTaskCount}</strong>
+                      <p>
+                        {props.historyDetail.summary.jiraTaskCount} Jira • {props.historyDetail.summary.emailTaskCount} Email • {props.historyDetail.summary.manualTaskCount} Manual
+                      </p>
                     </div>
                   </div>
                   <div className="field-card compact-card">
@@ -3013,6 +5008,15 @@ function InsightsView(props: {
                     ))}
                   </div>
                   <div className="detail-list">
+                    {props.historyDetail.completedTasks.map((task) => (
+                      <article className="detail-row" key={`completed-${task.id}`}>
+                        <strong>{task.title}</strong>
+                        <span>Completed {formatDateTime(task.completedAt)}</span>
+                      </article>
+                    ))}
+                    {!props.historyDetail.completedTasks.length ? <p className="empty-state">No completed tasks recorded for this day.</p> : null}
+                  </div>
+                  <div className="detail-list">
                     {props.historyDetail.changeEvents.slice(0, 12).map((event) => (
                       <article className="detail-row" key={event.id}>
                         <strong>{event.eventType.replace(/_/g, " ")}</strong>
@@ -3024,6 +5028,32 @@ function InsightsView(props: {
               ) : (
                 <p className="empty-state">Select a day to inspect its detailed planning and user updates.</p>
               )}
+            </div>
+          </div>
+        </div>
+      ) : (
+        <div className="panel-stack">
+          <div className="panel">
+            <div className="panel-header">
+              <div>
+                <h3>User Update Tracking</h3>
+                <p className="timeline-header-note">Every recorded user action, including stage moves, rejects, restores, removals, and status changes.</p>
+              </div>
+              <span>{props.updates?.totalEvents ?? props.historyDetail?.changeEvents.length ?? 0} events</span>
+            </div>
+            <div className="detail-list">
+              {(props.updates?.events ?? props.historyDetail?.changeEvents ?? []).map((event) => (
+                <article className="detail-row" key={`update-${event.id}`}>
+                  <div>
+                    <strong>{event.eventType.replace(/_/g, " ")}</strong>
+                    <p className="muted small-text">{event.reason ?? "No explicit reason recorded."}</p>
+                  </div>
+                  <span>{formatDateTime(event.createdAt)}</span>
+                </article>
+              ))}
+              {!(props.updates?.events ?? props.historyDetail?.changeEvents ?? []).length ? (
+                <p className="empty-state">No recorded user updates for the current selection yet.</p>
+              ) : null}
             </div>
           </div>
         </div>
@@ -3074,9 +5104,12 @@ function applyTodayResponseState(
 }
 
 export function App() {
-  const [view, setView] = useState<View>("today");
+  const [view, setView] = useState<View>("home");
+  const [shellMode, setShellMode] = useState<AppShellMode>("home");
+  const [homeData, setHomeData] = useState<HomePayload | null>(null);
   const [today, setToday] = useState<TodayResponse | null>(null);
   const [allTasks, setAllTasks] = useState<Task[]>([]);
+  const [taskBoard, setTaskBoard] = useState<TaskBoardPayload | null>(null);
   const [deferredTasks, setDeferredTasks] = useState<Task[]>([]);
   const [rejectedTasks, setRejectedTasks] = useState<RejectedTask[]>([]);
   const [ignoredRejectedTasks, setIgnoredRejectedTasks] = useState<RejectedTask[]>([]);
@@ -3086,6 +5119,7 @@ export function App() {
   const [insights, setInsights] = useState<PersonalizationInsight[]>([]);
   const [insightsOverview, setInsightsOverview] = useState<InsightsOverview | null>(null);
   const [insightsToday, setInsightsToday] = useState<InsightsTodayPayload | null>(null);
+  const [insightsUpdates, setInsightsUpdates] = useState<InsightsUpdatesPayload | null>(null);
   const [historyDays, setHistoryDays] = useState<DayHistorySummary[]>([]);
   const [selectedHistoryDay, setSelectedHistoryDay] = useState<string | null>(null);
   const [historyDetail, setHistoryDetail] = useState<DayHistoryDetail | null>(null);
@@ -3097,6 +5131,7 @@ export function App() {
     null
   );
   const [pageLoading, setPageLoading] = useState<Record<View, boolean>>({
+    home: false,
     today: true,
     tasks: false,
     deferred: false,
@@ -3106,6 +5141,7 @@ export function App() {
     settings: false
   });
   const [loadedViews, setLoadedViews] = useState<Record<View, boolean>>({
+    home: false,
     today: false,
     tasks: false,
     deferred: false,
@@ -3136,6 +5172,8 @@ export function App() {
   const [meetingPrep, setMeetingPrep] = useState<MeetingPrep | null>(null);
   const [meetingPrepLoading, setMeetingPrepLoading] = useState(false);
   const [meetingPrepStatus, setMeetingPrepStatus] = useState<string | null>(null);
+  const notificationTimeoutsRef = useRef<Map<string, number>>(new Map());
+  const shownReminderNotificationsRef = useRef<Set<string>>(new Set());
 
   async function getMicrosoftSessionToken() {
     const account = getMicrosoftAccount();
@@ -3179,11 +5217,28 @@ export function App() {
     }
   }
 
+  async function loadHomePage() {
+    setPageLoading((current) => ({ ...current, home: true }));
+    try {
+      const data = await api.getHome();
+      setHomeData(data);
+      setAllTasks(data.tasks);
+      setDeferredTasks(data.deferredTasks);
+      setReminders(data.reminders);
+      setLoadedViews((current) => ({ ...current, home: true }));
+    } finally {
+      setPageLoading((current) => ({ ...current, home: false }));
+    }
+  }
+
   async function loadTasksPage() {
     setPageLoading((current) => ({ ...current, tasks: true }));
     try {
-      const taskData = await api.getTasks();
-      setAllTasks(taskData.tasks);
+      const boardData = await api.getTaskBoard();
+      setTaskBoard(boardData);
+      setAllTasks([...boardData.now, ...boardData.next, ...boardData.later, ...boardData.review]);
+      setRejectedTasks(boardData.rejected);
+      setIgnoredRejectedTasks(boardData.ignoredRejected);
       setLoadedViews((current) => ({ ...current, tasks: true }));
     } finally {
       setPageLoading((current) => ({ ...current, tasks: false }));
@@ -3262,6 +5317,7 @@ export function App() {
       setHistoryDays(historyData.days);
       setDiagnostics(runsData);
       setDebugLogs(logsData.logs);
+      setInsightsUpdates(await api.getInsightsUpdates(preferredDayKey ?? selectedHistoryDay ?? null, preferredDayKey ?? selectedHistoryDay ?? null));
       const nextSelectedDay = preferredDayKey ?? selectedHistoryDay ?? historyData.days[0]?.dayKey ?? null;
       setSelectedHistoryDay(nextSelectedDay);
       if (nextSelectedDay) {
@@ -3324,6 +5380,77 @@ export function App() {
   }, []);
 
   useEffect(() => {
+    if (!automation?.desktopNotificationsEnabled || typeof Notification === "undefined") return;
+    if (Notification.permission === "default") {
+      void Notification.requestPermission();
+    }
+  }, [automation?.desktopNotificationsEnabled]);
+
+  useEffect(() => {
+    const timeouts = notificationTimeoutsRef.current;
+    for (const timeoutId of timeouts.values()) {
+      window.clearTimeout(timeoutId);
+    }
+    timeouts.clear();
+
+    if (!automation?.desktopNotificationsEnabled || !automation.remindersEnabled || typeof Notification === "undefined") {
+      return;
+    }
+    if (Notification.permission !== "granted") {
+      return;
+    }
+
+    const now = Date.now();
+    const showReminderNotification = (reminder: Reminder) => {
+      const dedupeKey = `${reminder.id}:${reminder.updatedAt}`;
+      if (shownReminderNotificationsRef.current.has(dedupeKey)) return;
+      shownReminderNotificationsRef.current.add(dedupeKey);
+      const notification = new Notification(reminder.title, {
+        body: reminder.reason,
+        tag: `planner-reminder:${reminder.id}`,
+        requireInteraction: false
+      });
+      notification.onclick = () => {
+        window.focus();
+        setView("reminders");
+        notification.close();
+      };
+    };
+
+    for (const reminder of reminders) {
+      if (reminder.status !== "active") continue;
+      const scheduledAt = reminder.scheduledFor ? new Date(reminder.scheduledFor).getTime() : now;
+      const dueAt = Number.isNaN(scheduledAt)
+        ? now
+        : reminder.kind === "meeting_prep"
+          ? scheduledAt - 15 * 60_000
+          : scheduledAt;
+      const delay = Math.max(0, dueAt - now);
+
+      if (delay === 0) {
+        showReminderNotification(reminder);
+        continue;
+      }
+
+      const timeoutId = window.setTimeout(() => {
+        showReminderNotification(reminder);
+        timeouts.delete(String(reminder.id));
+      }, delay);
+      timeouts.set(String(reminder.id), timeoutId);
+    }
+
+    return () => {
+      for (const timeoutId of timeouts.values()) {
+        window.clearTimeout(timeoutId);
+      }
+      timeouts.clear();
+    };
+  }, [automation?.desktopNotificationsEnabled, automation?.remindersEnabled, reminders]);
+
+  useEffect(() => {
+    if (view === "home" && !loadedViews.home && !pageLoading.home) {
+      void loadHomePage();
+    }
     if (view === "today" && !loadedViews.today && !pageLoading.today) {
       void loadTodayPage();
     }
@@ -3354,7 +5481,7 @@ export function App() {
 
   async function refreshTodayAndIntegrations() {
     const microsoftAccessToken = await getMicrosoftSessionToken();
-    const [todayData, integrationsData, deferredData, reminderData, automationData, profileData, insightsData, rejectedData] = await Promise.all([
+    const [todayData, integrationsData, deferredData, reminderData, automationData, profileData, insightsData, rejectedData, nextHomeData] = await Promise.all([
       api.getToday(),
       microsoftAccessToken
         ? api.getIntegrationsWithMicrosoftSession(microsoftAccessToken)
@@ -3364,7 +5491,8 @@ export function App() {
       api.getAutomationSettings(),
       api.getPersonalizationProfile(),
       api.getPersonalizationInsights(),
-      api.getRejectedTasks()
+      api.getRejectedTasks(),
+      api.getHome()
     ]);
     setToday(todayData);
     setIntegrations(integrationsData.integrations);
@@ -3375,14 +5503,26 @@ export function App() {
     setInsights(insightsData.insights);
     setRejectedTasks(rejectedData.tasks);
     setIgnoredRejectedTasks(rejectedData.ignoredTasks);
+    setHomeData(nextHomeData);
+    if (loadedViews.tasks || view === "tasks") {
+      await refreshTasksPage();
+    }
     if (loadedViews.insights) {
       await loadInsightsPage(selectedHistoryDay);
     }
   }
 
   async function refreshTasksPage() {
-    const taskData = await api.getTasks();
-    setAllTasks(taskData.tasks);
+    const boardData = await api.getTaskBoard();
+    setTaskBoard(boardData);
+    setAllTasks([...boardData.now, ...boardData.next, ...boardData.later, ...boardData.review]);
+    setRejectedTasks(boardData.rejected);
+    setIgnoredRejectedTasks(boardData.ignoredRejected);
+  }
+
+  async function refreshHomePage() {
+    const data = await api.getHome();
+    setHomeData(data);
   }
 
   async function handleTaskStatusChange(task: Task, status: TaskStatus) {
@@ -3401,6 +5541,9 @@ export function App() {
       const response = await api.updateTask(task.id, { status });
       setAllTasks((current) => current.map((item) => (item.id === task.id ? response.task : item)));
       setToday((current) => replaceTaskInGroups(current, task.id, () => response.task));
+      if (loadedViews.home || view === "home") {
+        await refreshHomePage();
+      }
     } catch (error) {
       console.error(error);
       void logClientEventSafe({
@@ -3464,6 +5607,9 @@ export function App() {
             }
           : current
       );
+      if (loadedViews.home || view === "home") {
+        await refreshHomePage();
+      }
     } catch (error) {
       console.error(error);
       void logClientEventSafe({
@@ -3492,6 +5638,33 @@ export function App() {
           : current
       );
     }
+  }
+
+  async function handleTaskStageMove(task: Task, stage: TaskStage, index: number) {
+    const response = await api.updateTask(task.id, { stage, stageOrder: index });
+    setAllTasks((current) => replaceTaskInList(current, task.id, () => response.task));
+    await api.reorderTaskBoardStage(
+      stage,
+      [
+        ...(taskBoard?.[stage.toLowerCase() as "now" | "next" | "later" | "review"] ?? [])
+          .filter((entry) => entry.id !== task.id)
+          .slice(0, index)
+          .map((entry) => entry.id),
+        response.task.id,
+        ...(taskBoard?.[stage.toLowerCase() as "now" | "next" | "later" | "review"] ?? [])
+          .filter((entry) => entry.id !== task.id)
+          .slice(index)
+          .map((entry) => entry.id)
+      ]
+    );
+    await refreshTodayAndIntegrations();
+  }
+
+  async function handleRestoreRejectedToStage(task: RejectedTask, stage: TaskStage, index: number) {
+    const response = await api.restoreRejectedTask(task.id);
+    if (!response.task) return;
+    await api.updateTask(response.task.id, { stage, stageOrder: index });
+    await refreshTodayAndIntegrations();
   }
 
   async function openTaskDetails(task: Task) {
@@ -3530,6 +5703,26 @@ export function App() {
     } finally {
       setDetailLoading(false);
     }
+  }
+
+  async function loadTaskDetailForHome(task: Task) {
+    if (task.source === "Manual") {
+      return null;
+    }
+    const microsoftAccessToken = task.source === "Email" ? await getMicrosoftSessionToken() : null;
+    const response =
+      task.source === "Email" && microsoftAccessToken
+        ? await api.getTaskDetailsWithMicrosoftSession(task.id, microsoftAccessToken)
+        : await api.getTaskDetails(task.id);
+    return response.detail;
+  }
+
+  async function loadMeetingDetailForHome(meeting: Meeting) {
+    const microsoftAccessToken = await getMicrosoftSessionToken();
+    const response = microsoftAccessToken
+      ? await api.getMeetingDetailWithMicrosoftSession(meeting.id, microsoftAccessToken)
+      : await api.getMeetingDetail(meeting.id);
+    return response.detail;
   }
 
   async function handleGenerateEmailDraft() {
@@ -3676,6 +5869,9 @@ export function App() {
       await loadDeferredPage();
       await loadRemindersPage();
       await loadSettingsPage();
+      if (loadedViews.home || view === "home") {
+        await refreshHomePage();
+      }
       if (loadedViews.insights) {
         await loadInsightsPage(selectedHistoryDay);
       }
@@ -3699,6 +5895,9 @@ export function App() {
         ? await api.syncMeetingsWithMicrosoftSession(microsoftAccessToken, browserTimeZone)
         : await api.syncMeetings(browserTimeZone);
       applyTodayResponseState(nextToday, { setToday, setAllTasks, setReminders, setAutomation });
+      if (loadedViews.home || view === "home") {
+        await refreshHomePage();
+      }
     } finally {
       setSyncMeetingsLoading(false);
     }
@@ -3723,12 +5922,50 @@ export function App() {
       await loadDeferredPage();
       await loadRemindersPage();
       await loadSettingsPage();
+      if (loadedViews.home || view === "home") {
+        await refreshHomePage();
+      }
       if (loadedViews.insights) {
         await loadInsightsPage(selectedHistoryDay);
       }
     } finally {
       setSyncTasksLoading(false);
     }
+  }
+
+  async function handleMeetingAttendanceUpdate(meeting: Meeting, attendanceStatus: "attending" | "unattending") {
+    await api.updateMeeting(meeting.id, { attendanceStatus });
+    await refreshTodayAndIntegrations();
+  }
+
+  async function handleSaveHomeTimelineEntries(
+    dayKey: string,
+    entries: Array<{
+      entryId: string;
+      taskId: number;
+      startMinutes: number;
+      durationMinutes: number;
+      source: "planner" | "user";
+    }>
+  ) {
+    await api.saveHomeSchedule(dayKey, entries);
+    await refreshTodayAndIntegrations();
+  }
+
+  async function handleDeleteHomeTimelineEntry(entryId: string) {
+    await api.deleteHomeScheduleEntry(entryId);
+    await refreshTodayAndIntegrations();
+  }
+
+  async function handleFillHomeTimelineTasks(dayKey: string) {
+    await api.fillHomeSchedule(dayKey);
+    await refreshTodayAndIntegrations();
+  }
+
+  async function handleHomeMeetingScheduleAction(meeting: Meeting, action: "remove" | "attending" | "unattending") {
+    const dayKey = getMeetingDayKey(meeting);
+    await api.updateHomeMeetingSchedule(meeting.id, dayKey, action);
+    await refreshTodayAndIntegrations();
   }
 
   async function handleSelectHistoryDay(dayKey: string) {
@@ -3756,9 +5993,53 @@ export function App() {
 
   return (
     <>
-      <main className="app-shell">
-        <AppHeader active={view} onChange={setView} />
-        <div className="content-shell">
+      <main className={shellMode === "home" ? "app-shell app-shell-home" : "app-shell"}>
+        {shellMode === "home" ? null : <AppHeader active={view} onChange={(nextView) => { setShellMode(nextView === "home" ? "home" : "classic"); setView(nextView); }} />}
+        <div className={shellMode === "home" ? "content-shell home-content-shell" : "content-shell"}>
+          {shellMode === "home" ? (
+            <HomeShellTopBar
+              active={view === "insights" ? "insights" : view === "settings" ? "settings" : view === "tasks" ? "tasks" : "home"}
+              onChange={(nextView) => {
+                setShellMode("home");
+                setView(nextView);
+              }}
+            />
+          ) : null}
+
+          {view === "home" ? (
+            !loadedViews.home || !homeData ? (
+              <HomeSkeleton />
+            ) : (
+              <HomeView
+                data={homeData}
+                todayData={today}
+                syncTasksLoading={syncTasksLoading}
+                onSyncTasks={handleSyncTasks}
+                onFillTimelineTasks={handleFillHomeTimelineTasks}
+                onPrepareMeeting={(meeting) => {
+                  setMeetingPrepMeeting(meeting);
+                  setMeetingPrepInput("");
+                  setMeetingPrep(null);
+                  setMeetingPrepStatus(null);
+                }}
+                onUpdateMeetingAttendance={handleMeetingAttendanceUpdate}
+                onUpdateHomeMeetingAction={handleHomeMeetingScheduleAction}
+                onMoveTaskToStage={async (task, stage) => {
+                  await api.updateTask(task.id, { stage });
+                  await refreshTodayAndIntegrations();
+                }}
+                onSaveTimelineEntries={handleSaveHomeTimelineEntries}
+                onDeleteTimelineEntry={handleDeleteHomeTimelineEntry}
+                onCreateTask={async (title, stage) => {
+                  await api.createTask({ title, stage });
+                  await refreshTodayAndIntegrations();
+                }}
+                onLoadTaskDetail={loadTaskDetailForHome}
+                onLoadMeetingDetail={loadMeetingDetailForHome}
+              />
+            )
+          ) : null}
+
           {view === "today" ? (
             !loadedViews.today ? (
               <TodaySkeleton />
@@ -3788,51 +6069,35 @@ export function App() {
             !loadedViews.tasks ? (
               <TasksSkeleton />
             ) : (
-              <TasksView
-                tasks={visibleTasks}
-                loading={pageLoading.tasks}
-                filter={taskFilter}
-                onFilterChange={setTaskFilter}
-                onCreate={async (title) => {
-                  const response = await api.createTask({ title });
-                  setAllTasks((current) => [response.task, ...current]);
-                }}
-                onUpdateStatus={handleTaskStatusChange}
-                onUpdatePriority={handleTaskPriorityChange}
-                onDelete={async (task) => {
-                  const previousTasks = allTasks;
-                  setAllTasks((current) => current.filter((item) => item.id !== task.id));
-                  setToday((current) => {
-                    if (!current) return current;
-                    return {
-                      ...current,
-                      tasks: {
-                        High: current.tasks.High.filter((item) => item.id !== task.id),
-                        Medium: current.tasks.Medium.filter((item) => item.id !== task.id),
-                        Low: current.tasks.Low.filter((item) => item.id !== task.id)
-                      }
-                    };
-                  });
-                  try {
+              <div className={shellMode === "home" ? "home-shell-page" : undefined}>
+                <TasksView
+                  board={taskBoard}
+                  loading={pageLoading.tasks}
+                  syncTasksLoading={syncTasksLoading}
+                  onSyncTasks={handleSyncTasks}
+                  onCreate={async (title, stage) => {
+                    const response = await api.createTask({ title, stage });
+                    setAllTasks((current) => [response.task, ...current]);
+                    await refreshTodayAndIntegrations();
+                  }}
+                  onUpdateStatus={handleTaskStatusChange}
+                  onMoveTask={handleTaskStageMove}
+                  onRejectTask={async (task) => {
                     await api.deleteTask(task.id);
                     await refreshTodayAndIntegrations();
-                  } catch (error) {
-                    console.error(error);
-                    setAllTasks(previousTasks);
+                  }}
+                  onRestoreRejectedToStage={handleRestoreRejectedToStage}
+                  onIgnoreThis={async (task) => {
+                    await api.updateRejectedTask(task.id, { action: "always_ignore_exact" });
                     await refreshTodayAndIntegrations();
-                  }
-                }}
-                onOpenDetails={openTaskDetails}
-                onDeferUntilTomorrow={async (task) => {
-                  const tomorrow = new Date();
-                  tomorrow.setDate(tomorrow.getDate() + 1);
-                  tomorrow.setHours(9, 0, 0, 0);
-                  const response = await api.deferTask(task.id, tomorrow.toISOString());
-                  setAllTasks((current) => current.filter((item) => item.id !== task.id));
-                  setDeferredTasks((current) => [response.task, ...current.filter((item) => item.id !== task.id)]);
-                  await refreshTodayAndIntegrations();
-                }}
-              />
+                  }}
+                  onAlwaysIgnore={async (task) => {
+                    await api.updateRejectedTask(task.id, { action: "always_ignore_similar" });
+                    await refreshTodayAndIntegrations();
+                  }}
+                  onOpenDetails={openTaskDetails}
+                />
+              </div>
             )
           ) : null}
 
@@ -3920,22 +6185,37 @@ export function App() {
             !loadedViews.insights ? (
               <InsightsSkeleton />
             ) : (
-              <InsightsView
-                loading={pageLoading.insights}
-                overview={insightsOverview}
-                todayInsights={insightsToday}
-                profile={profile}
-                personalizationInsights={insights}
-                historyDays={historyDays}
-                selectedDay={selectedHistoryDay}
-                historyDetail={historyDetail}
-                diagnostics={diagnostics}
-                debugLogs={debugLogs}
-                selectedTaskInsights={taskInsights}
-                onSelectDay={handleSelectHistoryDay}
-                onInspectTask={openTaskInsights}
-                onOpenTaskDetails={openTaskDetails}
-              />
+              shellMode === "home" ? (
+                <HomeMetricsView
+                  loading={pageLoading.insights}
+                  historyDays={historyDays}
+                  selectedDay={selectedHistoryDay}
+                  historyDetail={historyDetail}
+                  updates={insightsUpdates}
+                  onSelectDay={handleSelectHistoryDay}
+                  onRangeChange={async (start, end) => {
+                    setInsightsUpdates(await api.getInsightsUpdates(start, end));
+                  }}
+                />
+              ) : (
+                <InsightsView
+                  loading={pageLoading.insights}
+                  overview={insightsOverview}
+                  todayInsights={insightsToday}
+                  updates={insightsUpdates}
+                  profile={profile}
+                  personalizationInsights={insights}
+                  historyDays={historyDays}
+                  selectedDay={selectedHistoryDay}
+                  historyDetail={historyDetail}
+                  diagnostics={diagnostics}
+                  debugLogs={debugLogs}
+                  selectedTaskInsights={taskInsights}
+                  onSelectDay={handleSelectHistoryDay}
+                  onInspectTask={openTaskInsights}
+                  onOpenTaskDetails={openTaskDetails}
+                />
+              )
             )
           ) : null}
 
@@ -3943,40 +6223,41 @@ export function App() {
             !loadedViews.settings ? (
               <SettingsSkeleton />
             ) : (
-              <SettingsView
-                integrations={integrations}
-                loading={pageLoading.settings}
-                automation={automation}
-                profile={profile}
-                insights={insights}
-                microsoftAccount={microsoftAccount}
-                microsoftStatusText={microsoftStatusText}
-                jiraStatusText={jiraStatusText}
-                savingMicrosoft={savingMicrosoft}
-                savingJira={savingJira}
-                onUpdateSchedule={async (input) => {
-                  const response = await api.updateScheduleSettings(input);
-                  setAutomation(response.automation);
-                }}
-                onUpdateReminderSettings={async (input) => {
-                  const response = await api.updateReminderSettings(input);
-                  setAutomation(response.automation);
-                }}
-                onUpdateProfile={async (input) => {
-                  const response = await api.updatePersonalizationProfile(input);
-                  setProfile(response.profile);
-                  await refreshTodayAndIntegrations();
-                }}
-                onRunCalibration={async (input) => {
-                  const response = await api.calibratePersonalization(input);
-                  setProfile(response.profile);
-                  await refreshTodayAndIntegrations();
-                }}
-                onConnectMicrosoft={async () => {
-                  setSavingMicrosoft(true);
-                  setMicrosoftStatusText("Connecting Microsoft…");
-                  try {
-                    await loginWithMicrosoft();
+              <div className={shellMode === "home" ? "home-shell-page home-settings-page" : undefined}>
+                <SettingsView
+                  integrations={integrations}
+                  loading={pageLoading.settings}
+                  automation={automation}
+                  profile={profile}
+                  insights={insights}
+                  microsoftAccount={microsoftAccount}
+                  microsoftStatusText={microsoftStatusText}
+                  jiraStatusText={jiraStatusText}
+                  savingMicrosoft={savingMicrosoft}
+                  savingJira={savingJira}
+                  onUpdateSchedule={async (input) => {
+                    const response = await api.updateScheduleSettings(input);
+                    setAutomation(response.automation);
+                  }}
+                  onUpdateReminderSettings={async (input) => {
+                    const response = await api.updateReminderSettings(input);
+                    setAutomation(response.automation);
+                  }}
+                  onUpdateProfile={async (input) => {
+                    const response = await api.updatePersonalizationProfile(input);
+                    setProfile(response.profile);
+                    await refreshTodayAndIntegrations();
+                  }}
+                  onRunCalibration={async (input) => {
+                    const response = await api.calibratePersonalization(input);
+                    setProfile(response.profile);
+                    await refreshTodayAndIntegrations();
+                  }}
+                  onConnectMicrosoft={async () => {
+                    setSavingMicrosoft(true);
+                    setMicrosoftStatusText("Connecting Microsoft…");
+                    try {
+                      await loginWithMicrosoft();
                     setMicrosoftStatusText("Microsoft connection flow started.");
                   } catch (error) {
                     setMicrosoftStatusText(error instanceof Error ? error.message : "Failed to connect Microsoft");
@@ -4049,8 +6330,9 @@ export function App() {
                   } finally {
                     setSavingJira(false);
                   }
-                }}
-              />
+                  }}
+                />
+              </div>
             )
           ) : null}
         </div>

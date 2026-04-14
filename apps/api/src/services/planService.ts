@@ -1,5 +1,6 @@
 import {
   clearRejectedTasksBySourceThread,
+  deleteTask,
   getDecisionEventCount,
   getAutomationSettings,
   getIntegrationConnection,
@@ -11,6 +12,8 @@ import {
   getSyncState,
   getUserPriorityProfile,
   groupTasksByPriority,
+  listRejectedTasks,
+  listTaskStateEvents,
   listDeferredTasks,
   listRecentDailyPlanSnapshots,
   listMeetings,
@@ -32,6 +35,7 @@ import {
   upsertReminder,
   upsertTask
 } from "../db.js";
+import { env } from "../env.js";
 import {
   buildJiraIssueBrowseUrl,
   fetchJiraIssuePlanningContext,
@@ -41,6 +45,8 @@ import {
 } from "../providers/jira.js";
 import {
   fetchRecentEmails,
+  fetchRecentSentEmails,
+  fetchRecentSentEmailsWithAccessToken,
   fetchRecentEmailsWithAccessToken,
   fetchTodaysMeetings,
   fetchTodaysMeetingsWithAccessToken
@@ -63,11 +69,21 @@ import type {
   Task,
   TaskEffortBucket,
   TaskPriority,
+  TaskStage,
   TaskSource,
   TaskStatus,
   TodayPayload,
   WorkloadSummary
 } from "../types.js";
+
+const DEFAULT_WORKDAY_START_LOCAL = "09:30";
+const DEFAULT_WORKDAY_END_LOCAL = "18:00";
+
+type PlanningRole = "starter" | "major" | "ender" | "review";
+
+function isPlannableMeeting(meeting: { isCancelled: boolean; attendanceStatus?: "attending" | "unattending" }) {
+  return !meeting.isCancelled && (meeting.attendanceStatus ?? "attending") !== "unattending";
+}
 
 function startAndEndOfAgendaWindow() {
   const start = new Date();
@@ -99,6 +115,17 @@ function isRecentlyUpdated(isoValue?: string | null, windowDays = 2) {
   const updatedAt = new Date(isoValue).getTime();
   if (Number.isNaN(updatedAt)) return false;
   return Date.now() - updatedAt <= windowDays * 86_400_000;
+}
+
+function isLegacyDailyWrapUpTask(task: Task) {
+  return task.source === "Manual" && task.sourceRef?.startsWith("daily-wrap-up:");
+}
+
+function cleanupLegacyDailyWrapUpTasks() {
+  for (const task of listTasks(undefined, { includeDeferred: true })) {
+    if (!isLegacyDailyWrapUpTask(task)) continue;
+    deleteTask(task.id);
+  }
 }
 
 async function getPersonalizationContext() {
@@ -137,7 +164,15 @@ async function getPersonalizationContext() {
       reason: (row.decision_reason as string | null) ?? null
     };
   });
-  return { profile, memory, recentExamples };
+  const recentRejectedExamples = listRejectedTasks()
+    .slice(0, 15)
+    .map((task) => ({
+      title: task.title,
+      source: task.source,
+      outcome: task.decisionState,
+      reason: task.decisionReason
+    }));
+  return { profile, memory, recentExamples, recentRejectedExamples };
 }
 
 function buildFeedbackPayload(candidate: {
@@ -164,12 +199,62 @@ function normalizeEmailText(value?: string | null) {
   return (value ?? "").toLowerCase().replace(/\s+/g, " ").trim();
 }
 
+function emailContentForDecision(email: GraphMail) {
+  return `${email.bodyPreview ?? ""} ${(email.body?.content ?? "").replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim()}`
+    .trim()
+    .slice(0, 6000);
+}
+
+async function callOpenAIJson<T>(input: unknown, schema: object, name: string, systemPrompt: string): Promise<T | null> {
+  if (!env.openAiApiKey) {
+    return null;
+  }
+
+  try {
+    const response = await fetch(`${env.openAiApiBaseUrl}/v1/responses`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${env.openAiApiKey}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        model: env.openAiModel,
+        input: [
+          {
+            role: "system",
+            content: [{ type: "input_text", text: systemPrompt }]
+          },
+          {
+            role: "user",
+            content: [{ type: "input_text", text: JSON.stringify(input) }]
+          }
+        ],
+        text: {
+          format: {
+            type: "json_schema",
+            name,
+            schema
+          }
+        }
+      })
+    });
+
+    if (!response.ok) return null;
+    const json = (await response.json()) as { output_text?: string };
+    if (!json.output_text) return null;
+    return JSON.parse(json.output_text) as T;
+  } catch {
+    return null;
+  }
+}
+
 function extractIssueKeys(text: string) {
   return [...new Set((text.toUpperCase().match(/\b[A-Z][A-Z0-9]+-\d+\b/g) ?? []).map((key) => key.trim()))];
 }
 
 function buildMeetingTitleIndex(meetings: ReturnType<typeof listMeetings>) {
   return meetings
+    .filter((meeting) => isPlannableMeeting(meeting))
     .map((meeting) => normalizeEmailText(meeting.title))
     .filter((title) => title.length >= 10);
 }
@@ -197,31 +282,10 @@ function triageEmailForWork(input: {
     /(calendar|meeting invite|invitation|accepted:|declined:|tentative:|rescheduled|reschedule|join microsoft teams|zoom meeting|webex|google meet)/.test(
       fullText
     ) || input.meetingTitles.some((title) => subject.includes(title));
-  const isOrgNoise =
-    /(release highlights|release showcase|showcase|what'?s new|monthly deep dive|getting started with chatgpt|part \d+ of \d+|newsletter|optional|thank you and best wishes|scam of the week|badminton|hackathon|transport requests)/.test(
-      fullText
-    );
-  const isDevWorkflow =
-    /(pull request|merge request|review requested|opened a pull request|github|gitlab)/.test(fullText);
-  const isSecurityOrAccountAction =
-    /(password is about to expire|password.*expire|credential.*expire|certificate.*expire|token.*expire|security alert|mfa)/.test(
-      fullText
-    );
-  const isCommentOrMention =
-    /(mentioned you|comment(ed)?|comment added|requested review|requested changes|tagged you|needs your review|your input|reply needed)/.test(
-      fullText
-    );
-  const isGenericAction =
-    /(action required|approval required|please review|approve|follow up|required from you|your input needed|missing lifecycle rules)/.test(
-      fullText
-    );
   const isLikelyJiraNotification =
     issueKeys.length > 0 &&
-    !isDevWorkflow &&
+    !/(pull request|merge request|review requested|opened a pull request|github|gitlab)/.test(fullText) &&
     /(\[jira\]|jira|comment(ed)?|comment added|mentioned you|status|open|reopened|resolved|updated)/.test(fullText);
-  const explicitHumanRequest =
-    !/(noreply|notification|service-now|automated)/.test(sender) &&
-    /(please|can you|need you|follow up|reply needed|your input|please review|approve)/.test(fullText);
 
   if (isMeetingRelated) {
     return {
@@ -241,55 +305,66 @@ function triageEmailForWork(input: {
     };
   }
 
-  if (isOrgNoise) {
-    return {
-      route: "drop" as const,
-      priority: "Low" as TaskPriority,
-      reason: "Newsletter, announcement, optional, or social email with no clear task.",
-      reasonTags: ["newsletter_like"] as ReasonTag[]
-    };
-  }
-
-  if (isSecurityOrAccountAction) {
+  if (input.classification.actionable && input.classification.priority === "High") {
     return {
       route: "accept" as const,
-      priority: "Medium" as TaskPriority,
-      reason: "Security or account maintenance email requires action.",
-      reasonTags: ["direct_request"] as ReasonTag[]
-    };
-  }
-
-  if (isDevWorkflow || explicitHumanRequest) {
-    return {
-      route: "accept" as const,
-      priority: /(urgent|asap|today|immediately|by eod)/.test(fullText) ? "High" : "Medium",
-      reason: isDevWorkflow
-        ? "Code workflow email likely needs review or follow-up."
-        : "Direct request likely needs action.",
-      reasonTags: ["direct_request"] as ReasonTag[]
-    };
-  }
-
-  if (isCommentOrMention || isGenericAction || input.classification.actionable) {
-    return {
-      route: "review" as const,
       priority: input.classification.priority,
-      reason:
-        isCommentOrMention
-          ? "Comment, mention, or review activity may matter and should stay reviewable."
-          : "Potential work item is not confirmed enough for the active task list.",
-      reasonTags: isCommentOrMention
-        ? (["historically_accepted"] as ReasonTag[])
-        : (["fyi_only"] as ReasonTag[])
+      reason: input.classification.why,
+      reasonTags: input.classification.reasonTags
     };
   }
 
   return {
-    route: "drop" as const,
-    priority: "Low" as TaskPriority,
-    reason: "No clear work signal found.",
-    reasonTags: ["fyi_only"] as ReasonTag[]
+    route: "review" as const,
+    priority: input.classification.priority,
+    reason: input.classification.why,
+    reasonTags: input.classification.reasonTags
   };
+}
+
+function emailBodyText(email: GraphMail) {
+  return normalizeEmailText(`${email.bodyPreview ?? ""} ${email.body?.content ?? ""}`);
+}
+
+function isAnnouncementLikeEmail(email: GraphMail) {
+  const text = normalizeEmailText(`${email.subject ?? ""} ${email.bodyPreview ?? ""} ${email.body?.content ?? ""}`);
+  const sender = normalizeEmailText(email.from?.emailAddress?.address ?? "");
+  return (
+    /(release highlights|release showcase|newsletter|announcement|digest|what'?s new|monthly deep dive|hackathon|optional|town hall|all hands|showcase|scam of the week|thank you and best wishes|org update|company update|release notes|webinar|event reminder|social)/.test(
+      text
+    ) ||
+    /(newsletter|announce|communications|events|marketing)/.test(sender)
+  );
+}
+
+function needsSentEmailFollowUp(sentEmail: GraphMail, inboxEmails: GraphMail[]) {
+  const sentAt = sentEmail.sentDateTime ? new Date(sentEmail.sentDateTime).getTime() : 0;
+  if (!sentAt || Number.isNaN(sentAt)) return false;
+  const hoursSinceSent = (Date.now() - sentAt) / 3_600_000;
+  if (hoursSinceSent < 18 || hoursSinceSent > 7 * 24) return false;
+  if (isAnnouncementLikeEmail(sentEmail)) return false;
+
+  const body = emailBodyText(sentEmail);
+  const subject = normalizeEmailText(sentEmail.subject);
+  const text = `${subject} ${body}`;
+  const toCount = sentEmail.toRecipients?.length ?? 0;
+  const hasActionSignal =
+    /(please|can you|could you|let me know|review|approve|confirm|reply|respond|follow up|share|send|need|action required|waiting on|blocker|update me)/.test(
+      text
+    ) || /\?$/.test((sentEmail.bodyPreview ?? sentEmail.subject ?? "").trim());
+  if (!hasActionSignal) return false;
+  if (toCount === 0) return false;
+
+  const hasReply = inboxEmails.some((mail) => {
+    const sameThread =
+      sentEmail.conversationId && mail.conversationId
+        ? sentEmail.conversationId === mail.conversationId
+        : normalizeEmailText(mail.subject).includes(subject) || subject.includes(normalizeEmailText(mail.subject));
+    const receivedAt = mail.receivedDateTime ? new Date(mail.receivedDateTime).getTime() : 0;
+    return sameThread && receivedAt > sentAt;
+  });
+
+  return !hasReply;
 }
 
 function persistRejectedCandidate(input: {
@@ -367,13 +442,14 @@ async function applyMicrosoftResults(
   const meetingTitles = buildMeetingTitleIndex(listMeetings());
 
   for (const email of emails) {
-    const classification = await classifyEmail(email);
+    const classification = await classifyEmail(email, {
+      profile: personalization.profile,
+      recentExamples: personalization.recentExamples,
+      recentRejectedExamples: personalization.recentRejectedExamples
+    });
     const now = new Date().toISOString();
-    const emailText = `${email.subject ?? ""} ${email.bodyPreview ?? ""}`;
-    const hasCommentSignal = /(comment(ed)?|mentioned you|requested review|requested changes|assigned to you|reply needed|your input|needs your review|tagged you)/i.test(
-      emailText
-    );
-    const hasUserRelevantSignal = /(you|your|assigned|review|approve|follow up|reply|blocker|due|owner)/i.test(emailText);
+    const emailContent = emailContentForDecision(email);
+    const reasonTagSet = new Set(classification.reasonTags);
     const candidatePayload = {
       title: classification.title,
       source: "Email" as const,
@@ -381,25 +457,24 @@ async function applyMicrosoftResults(
       sourceRef: email.id,
       sourceThreadRef: email.conversationId ?? null,
       sender: email.from?.emailAddress?.address ?? null,
-      bodyPreview: email.bodyPreview ?? null,
-      isDirectRequest: /(please|can you|need you|action required|review|approve)/i.test(
-        `${email.subject ?? ""} ${email.bodyPreview ?? ""}`
-      ),
-      dueSoon: /(today|asap|urgent|eod|tomorrow)/i.test(`${email.subject ?? ""} ${email.bodyPreview ?? ""}`),
+      bodyPreview: emailContent || null,
+      isAssignedToUser: reasonTagSet.has("assigned_work"),
+      isDirectRequest: reasonTagSet.has("direct_request"),
+      dueSoon: reasonTagSet.has("due_soon"),
       isBotLike:
+        reasonTagSet.has("bot_generated") ||
         /(noreply|notification|service-now|automated)/i.test(
           `${email.from?.emailAddress?.address ?? ""} ${email.subject ?? ""}`
-        ) && !(hasCommentSignal && hasUserRelevantSignal),
+        ),
       isDuplicate: false,
-      meetingRelevant: /(meeting|agenda|prep)/i.test(`${email.subject ?? ""} ${email.bodyPreview ?? ""}`)
+      meetingRelevant: reasonTagSet.has("meeting_related")
     };
 
     const strongSignal =
-      candidatePayload.isDirectRequest ||
-      candidatePayload.dueSoon ||
-      candidatePayload.meetingRelevant ||
-      (hasCommentSignal && hasUserRelevantSignal) ||
-      !candidatePayload.isBotLike;
+      classification.actionable ||
+      reasonTagSet.has("review_request") ||
+      reasonTagSet.has("blocking_work") ||
+      reasonTagSet.has("historically_accepted");
     const triage = triageEmailForWork({
       email,
       classification,
@@ -426,11 +501,15 @@ async function applyMicrosoftResults(
         updateTask(threadTask.id, {
           title: classification.title,
           priority: threadTask.manualOverrideFlags.includes("priority") ? undefined : input.priority,
+          estimatedEffortBucket: classification.estimatedEffortBucket,
           lastActivityAt: now,
           decisionState: threadTask.decisionState === "restored" ? "restored" : input.decisionState,
           decisionConfidence: input.decisionConfidence,
           decisionReason: input.decisionReason,
           decisionReasonTags: input.decisionReasonTags,
+          priorityExplanation: classification.why,
+          selectionReason: `Included because the email likely needs action: ${classification.why}`,
+          priorityReason: `Model-estimated priority ${input.priority.toLowerCase()} and effort ${classification.estimatedEffortBucket.toLowerCase()} based on the email and your preferences.`,
           personalizationVersion: personalization.memory.version ?? 1,
           rejectedAt: null
         });
@@ -499,15 +578,29 @@ async function applyMicrosoftResults(
             reasonTags: [...new Set([...triage.reasonTags, ...evaluation.reasonTags])] as ReasonTag[]
           }
         : evaluation;
+    const gatedEmailEvaluation =
+      finalEvaluation.priority === "High"
+        ? finalEvaluation
+        : {
+            ...finalEvaluation,
+            relevance: "uncertain" as const,
+            why:
+              finalEvaluation.why ||
+              "Email may matter, but it was not strong enough to become a high-priority task.",
+            reasonTags: [...new Set([...finalEvaluation.reasonTags, "fyi_only"])] as ReasonTag[]
+          };
 
-    if (finalEvaluation.relevance === "reject" || (finalEvaluation.relevance === "uncertain" && finalEvaluation.confidence < 0.6)) {
+    if (
+      gatedEmailEvaluation.relevance === "reject" ||
+      (gatedEmailEvaluation.relevance === "uncertain" && gatedEmailEvaluation.confidence < 0.6)
+    ) {
       if (threadTask) {
         preserveVisibleEmailThread({
           priority: threadTask.priority,
           decisionState: threadTask.decisionState ?? "restored",
-          decisionConfidence: finalEvaluation.confidence,
-          decisionReason: threadTask.decisionReason ?? finalEvaluation.why,
-          decisionReasonTags: finalEvaluation.reasonTags
+          decisionConfidence: gatedEmailEvaluation.confidence,
+          decisionReason: threadTask.decisionReason ?? gatedEmailEvaluation.why,
+          decisionReasonTags: gatedEmailEvaluation.reasonTags
         });
         if (exactTask) {
           upsertTask({
@@ -518,10 +611,14 @@ async function applyMicrosoftResults(
             sourceLink: email.webLink ?? exactTask.sourceLink ?? null,
             sourceRef: email.id,
             sourceThreadRef: email.conversationId ?? null,
+            estimatedEffortBucket: classification.estimatedEffortBucket,
             decisionState: exactTask.decisionState ?? "restored",
-            decisionConfidence: finalEvaluation.confidence,
-            decisionReason: exactTask.decisionReason ?? finalEvaluation.why,
-            decisionReasonTags: finalEvaluation.reasonTags,
+            decisionConfidence: gatedEmailEvaluation.confidence,
+            decisionReason: exactTask.decisionReason ?? gatedEmailEvaluation.why,
+            decisionReasonTags: gatedEmailEvaluation.reasonTags,
+            priorityExplanation: classification.why,
+            selectionReason: `Included because the email likely needs action: ${classification.why}`,
+            priorityReason: `Model-estimated priority ${exactTask.priority.toLowerCase()} and effort ${classification.estimatedEffortBucket.toLowerCase()} based on the email and your preferences.`,
             personalizationVersion: personalization.memory.version ?? 1
           });
         }
@@ -533,10 +630,10 @@ async function applyMicrosoftResults(
         sourceLink: email.webLink ?? null,
         sourceRef: email.id,
         sourceThreadRef: email.conversationId ?? null,
-        proposedPriority: finalEvaluation.priority,
-        decisionConfidence: finalEvaluation.confidence,
-        decisionReason: finalEvaluation.why,
-        decisionReasonTags: finalEvaluation.reasonTags,
+        proposedPriority: gatedEmailEvaluation.priority,
+        decisionConfidence: gatedEmailEvaluation.confidence,
+        decisionReason: gatedEmailEvaluation.why,
+        decisionReasonTags: gatedEmailEvaluation.reasonTags,
         candidatePayloadJson: payloadJson,
         personalizationVersion: personalization.memory.version ?? 1
       });
@@ -547,12 +644,16 @@ async function applyMicrosoftResults(
     if (threadTask && !exactTask) {
       updateTask(threadTask.id, {
         title: classification.title,
-        priority: threadTask.manualOverrideFlags.includes("priority") ? undefined : finalEvaluation.priority,
+        priority: threadTask.manualOverrideFlags.includes("priority") ? undefined : gatedEmailEvaluation.priority,
+        estimatedEffortBucket: classification.estimatedEffortBucket,
         lastActivityAt: now,
-        decisionState: threadTask.decisionState === "restored" ? "restored" : finalEvaluation.relevance === "uncertain" ? "uncertain" : "accepted",
-        decisionConfidence: finalEvaluation.confidence,
-        decisionReason: finalEvaluation.why,
-        decisionReasonTags: finalEvaluation.reasonTags,
+        decisionState: threadTask.decisionState === "restored" ? "restored" : gatedEmailEvaluation.relevance === "uncertain" ? "uncertain" : "accepted",
+        decisionConfidence: gatedEmailEvaluation.confidence,
+        decisionReason: gatedEmailEvaluation.why,
+        decisionReasonTags: gatedEmailEvaluation.reasonTags,
+        priorityExplanation: classification.why,
+        selectionReason: `Included because the email likely needs action: ${classification.why}`,
+        priorityReason: `Model-estimated priority ${gatedEmailEvaluation.priority.toLowerCase()} and effort ${classification.estimatedEffortBucket.toLowerCase()} based on the email and your preferences.`,
         personalizationVersion: personalization.memory.version ?? 1,
         rejectedAt: null
       });
@@ -560,14 +661,18 @@ async function applyMicrosoftResults(
       upsertTask({
         title: classification.title,
         source: "Email",
-        priority: finalEvaluation.priority,
+        priority: gatedEmailEvaluation.priority,
         sourceLink: email.webLink ?? null,
         sourceRef: email.id,
         sourceThreadRef: email.conversationId ?? null,
-        decisionState: finalEvaluation.relevance === "uncertain" ? "uncertain" : "accepted",
-        decisionConfidence: finalEvaluation.confidence,
-        decisionReason: finalEvaluation.why,
-        decisionReasonTags: finalEvaluation.reasonTags,
+        estimatedEffortBucket: classification.estimatedEffortBucket,
+        decisionState: gatedEmailEvaluation.relevance === "uncertain" ? "uncertain" : "accepted",
+        decisionConfidence: gatedEmailEvaluation.confidence,
+        decisionReason: gatedEmailEvaluation.why,
+        decisionReasonTags: gatedEmailEvaluation.reasonTags,
+        priorityExplanation: classification.why,
+        selectionReason: `Included because the email likely needs action: ${classification.why}`,
+        priorityReason: `Model-estimated priority ${gatedEmailEvaluation.priority.toLowerCase()} and effort ${classification.estimatedEffortBucket.toLowerCase()} based on the email and your preferences.`,
         personalizationVersion: personalization.memory.version ?? 1
       });
     }
@@ -576,11 +681,11 @@ async function applyMicrosoftResults(
       sourceRef: email.id,
       sourceThreadRef: email.conversationId ?? null,
       action: "system_evaluated",
-      afterPriority: threadTask && !exactTask ? (threadTask.manualOverrideFlags.includes("priority") ? threadTask.priority : finalEvaluation.priority) : finalEvaluation.priority,
-      systemDecisionState: finalEvaluation.relevance === "uncertain" ? "uncertain" : "accepted",
-      decisionConfidence: finalEvaluation.confidence,
-      decisionReason: finalEvaluation.why,
-      decisionReasonTags: finalEvaluation.reasonTags,
+      afterPriority: threadTask && !exactTask ? (threadTask.manualOverrideFlags.includes("priority") ? threadTask.priority : gatedEmailEvaluation.priority) : gatedEmailEvaluation.priority,
+      systemDecisionState: gatedEmailEvaluation.relevance === "uncertain" ? "uncertain" : "accepted",
+      decisionConfidence: gatedEmailEvaluation.confidence,
+      decisionReason: gatedEmailEvaluation.why,
+      decisionReasonTags: gatedEmailEvaluation.reasonTags,
       feedbackPayloadJson: payloadJson,
       preferencePolarity: "neutral"
     });
@@ -613,7 +718,8 @@ async function applyMicrosoftResults(
             start && end ? Math.max(0, Math.round((end.getTime() - start.getTime()) / 60000)) : 0,
           meetingLink,
           meetingLinkType,
-          isCancelled
+          isCancelled,
+          attendanceStatus: "attending" as const
         };
       })
     );
@@ -737,6 +843,10 @@ async function syncMicrosoftMeetings(options?: {
         options.preferredTimeZone
       );
       await applyMicrosoftResults([], meetingsResult.events, meetingsResult.timeZone);
+      saveAutomationSettings({
+        workdayStartLocal: meetingsResult.workdayStartLocal,
+        workdayEndLocal: meetingsResult.workdayEndLocal
+      });
       setSyncState("microsoft", now);
       logEvent({
         eventType: "sync.microsoft.meetings",
@@ -766,6 +876,10 @@ async function syncMicrosoftMeetings(options?: {
       try {
         const meetingsResult = await fetchTodaysMeetings(startIso, endIso, options?.preferredTimeZone);
         await applyMicrosoftResults([], meetingsResult.events, meetingsResult.timeZone);
+        saveAutomationSettings({
+          workdayStartLocal: meetingsResult.workdayStartLocal,
+          workdayEndLocal: meetingsResult.workdayEndLocal
+        });
         setSyncState("microsoft", now);
         logEvent({
           eventType: "sync.microsoft.meetings",
@@ -980,6 +1094,9 @@ function inferEffortBucket(task: Task): TaskEffortBucket {
     if (minutes <= 60) return "1 hour";
     return "2+ hours";
   }
+  if (task.estimatedEffortBucket) {
+    return task.estimatedEffortBucket;
+  }
   const text = `${task.title} ${task.jiraStatus ?? ""}`.toLowerCase();
   if (/(migration|epic|refactor|design|investigation|spike|replace|build)/.test(text)) return "2+ hours";
   if (/(review|testing|qa|implement|feature|story)/.test(text)) return "1 hour";
@@ -1019,7 +1136,7 @@ function effectiveJiraPlanningMinutes(task: Task) {
     task.jiraSubtaskEstimateSeconds && task.jiraSubtaskEstimateSeconds > 0
       ? Math.max(15, Math.ceil(task.jiraSubtaskEstimateSeconds / 60))
       : 0;
-  const effective = Math.max(parentMinutes, subtaskMinutes);
+  const effective = subtaskMinutes > 0 ? subtaskMinutes : parentMinutes;
   return effective > 0 ? effective : null;
 }
 
@@ -1053,8 +1170,6 @@ function deriveJiraPlanningPriority(task: Task): TaskPriority {
 }
 
 const DEFAULT_WORKDAY_MINUTES = 510;
-const DEFAULT_WORKDAY_START_HOUR = 9;
-const DEFAULT_WORKDAY_START_MINUTE = 30;
 
 function clamp(value: number, min: number, max: number) {
   return Math.min(max, Math.max(min, value));
@@ -1094,6 +1209,17 @@ function addMinutes(value: Date, minutes: number) {
   return new Date(value.getTime() + minutes * 60_000);
 }
 
+function parseLocalTime(value: string | null | undefined, fallbackHours: number, fallbackMinutes: number) {
+  const match = value?.match(/^(\d{2}):(\d{2})$/);
+  if (!match) {
+    return { hours: fallbackHours, minutes: fallbackMinutes };
+  }
+  return {
+    hours: Number(match[1]),
+    minutes: Number(match[2])
+  };
+}
+
 function diffMinutes(start: Date, end: Date) {
   return Math.max(0, Math.round((end.getTime() - start.getTime()) / 60_000));
 }
@@ -1120,10 +1246,75 @@ function meetingEnd(meeting: ReturnType<typeof listMeetings>[number]) {
 function estimateRemainingTaskMinutes(task: Task) {
   const total = minutesForTask(task);
   if (task.status === "Completed") return 0;
+  if (task.source === "Jira" && (task.jiraSubtaskEstimateSeconds ?? 0) > 0) {
+    if (task.status === "In Progress") {
+      return Math.max(30, Math.round(total * 0.8));
+    }
+    return total;
+  }
   if (task.status === "In Progress") {
     return Math.max(15, Math.round(total * 0.6));
   }
   return total;
+}
+
+function mergeAdjacentTaskBlocks(blocks: DayPlanBlock[]) {
+  const sorted = [...blocks].sort((left, right) => new Date(left.startTime).getTime() - new Date(right.startTime).getTime());
+  const merged: DayPlanBlock[] = [];
+
+  for (const block of sorted) {
+    const previous = merged[merged.length - 1];
+    if (
+      previous &&
+      previous.kind === "task" &&
+      block.kind === "task" &&
+      previous.taskId !== null &&
+      previous.taskId === block.taskId &&
+      previous.source === block.source &&
+      previous.priority === block.priority &&
+      previous.link === block.link
+    ) {
+      const gapMinutes = diffMinutes(new Date(previous.endTime), new Date(block.startTime));
+      if (gapMinutes > 15) {
+        merged.push({ ...block });
+        continue;
+      }
+      previous.endTime = block.endTime;
+      previous.durationMinutes += block.durationMinutes + gapMinutes;
+      previous.note = block.note ?? previous.note;
+      previous.status =
+        previous.status === "in_progress" || block.status === "in_progress"
+          ? "in_progress"
+          : previous.status === "up_next" || block.status === "up_next"
+            ? "up_next"
+            : previous.status;
+      continue;
+    }
+    merged.push({ ...block });
+  }
+
+  return merged;
+}
+
+function isPrimaryPlanningTask(task: Task) {
+  const planningPriority = task.source === "Jira" ? deriveJiraPlanningPriority(task) : task.priority;
+  return (
+    task.status === "In Progress" ||
+    task.carryForwardCount > 0 ||
+    task.source === "Jira" ||
+    planningPriority === "High"
+  );
+}
+
+function isLightEmailPlanningTask(task: Task) {
+  const emailSignals = `${task.title} ${task.selectionReason ?? ""} ${task.priorityReason ?? ""}`.toLowerCase();
+  return (
+    task.source === "Email" &&
+    !isPrimaryPlanningTask(task) &&
+    estimateRemainingTaskMinutes(task) <= 60 &&
+    !/announcement|release|showcase|newsletter|optional|hackathon|webinar|training|scam|highlights|monthly deep dive/.test(emailSignals) &&
+    (/reply|follow up|approval|review|action|respond|check in|comment|mentioned/.test(emailSignals) || task.priority !== "Low")
+  );
 }
 
 function buildTaskPlanningTitle(task: Task, scheduledMinutes: number) {
@@ -1166,6 +1357,156 @@ function buildTaskPlanningNote(task: Task) {
   return task.priorityExplanation ?? null;
 }
 
+function shiftDayKey(base: Date, dayDelta: number) {
+  const shifted = new Date(base);
+  shifted.setDate(shifted.getDate() + dayDelta);
+  return localDayKey(shifted);
+}
+
+function isStarterPlanningEmailTask(task: Task) {
+  const text = `${task.title} ${task.selectionReason ?? ""} ${task.priorityReason ?? ""}`.toLowerCase();
+  return (
+    task.source === "Email" &&
+    estimateRemainingTaskMinutes(task) <= 30 &&
+    !/announcement|release|showcase|newsletter|optional|hackathon|webinar|training|scam|highlights|monthly deep dive/.test(text) &&
+    (/reply|follow up|approval|review|action|respond|check in|comment|mentioned|password|pull request/.test(text) ||
+      task.priority !== "Low")
+  );
+}
+
+function isClosingPlanningTask(task: Task) {
+  const remaining = estimateRemainingTaskMinutes(task);
+  if (task.source === "Email") {
+    return isLightEmailPlanningTask(task) && remaining <= 30;
+  }
+  return remaining <= 45 && (task.priority === "Low" || task.stage === "Later" || task.source === "Manual");
+}
+
+function planningRoleForTask(task: Task): PlanningRole {
+  const explicit = task.historySignals.find((entry) => /^Planning role:/i.test(entry));
+  if (explicit) {
+    const normalized = explicit.split(":")[1]?.trim().toLowerCase();
+    if (normalized === "starter" || normalized === "major" || normalized === "ender" || normalized === "review") {
+      return normalized;
+    }
+  }
+  if (task.stage === "Review" || task.decisionState === "uncertain") return "review";
+  if (isStarterPlanningEmailTask(task)) return "starter";
+  if (isClosingPlanningTask(task)) return "ender";
+  return "major";
+}
+
+async function applyPlanningCategories() {
+  const activeTasks = listTasks(undefined, { includeDeferred: true }).filter((task) => task.status !== "Completed");
+  if (!activeTasks.length) return;
+
+  const fallbackRoles = new Map<number, PlanningRole>();
+  for (const task of activeTasks) {
+    fallbackRoles.set(task.id, planningRoleForTask(task));
+  }
+
+  const aiResult = await callOpenAIJson<
+    { assignments: Array<{ taskId: number; role: PlanningRole; reason?: string }> }
+  >(
+    {
+      tasks: activeTasks.slice(0, 30).map((task) => ({
+        taskId: task.id,
+        title: task.title,
+        source: task.source,
+        priority: task.priority,
+        status: task.status,
+        stage: task.stage,
+        selectionReason: task.selectionReason,
+        priorityReason: task.priorityReason,
+        priorityExplanation: task.priorityExplanation,
+        remainingMinutes: estimateRemainingTaskMinutes(task),
+        jiraStatus: task.jiraStatus,
+        carryForwardCount: task.carryForwardCount
+      }))
+    },
+    {
+      type: "object",
+      additionalProperties: false,
+      required: ["assignments"],
+      properties: {
+        assignments: {
+          type: "array",
+          items: {
+            type: "object",
+            additionalProperties: false,
+            required: ["taskId", "role"],
+            properties: {
+              taskId: { type: "number" },
+              role: { type: "string", enum: ["starter", "major", "ender", "review"] },
+              reason: { type: "string" }
+            }
+          }
+        }
+      }
+    },
+    "day_plan_task_roles",
+    [
+      "Categorize work tasks for a day planner into starter, major, ender, or review.",
+      "starter: simple easy opener tasks, usually 15-30 minutes, often email/reply/review/admin.",
+      "major: the main focused work blocks, usually Jira, in-progress work, spillover, substantial work.",
+      "ender: simple closing tasks near the end of the day, like reviews, follow-ups, and light email/admin.",
+      "review: uncertain items that should not be confidently scheduled into the active day.",
+      "Prefer only 1-2 starter tasks and 1-2 ender tasks across the whole set.",
+      "Do not mark many tasks as starter or ender unless they are genuinely simple.",
+      "Use the actual title, source, status, and priority signals. Return JSON only."
+    ].join(" ")
+  );
+
+  const roleMap = new Map<number, PlanningRole>(fallbackRoles);
+  for (const assignment of aiResult?.assignments ?? []) {
+    if (!roleMap.has(assignment.taskId)) continue;
+    roleMap.set(assignment.taskId, assignment.role);
+  }
+
+  for (const task of activeTasks) {
+    const role = roleMap.get(task.id) ?? fallbackRoles.get(task.id) ?? "major";
+    const nextHistorySignals = [
+      ...task.historySignals.filter((entry) => !/^Planning role:/i.test(entry)),
+      `Planning role: ${role}`
+    ];
+    updateTask(task.id, {
+      historySignals: nextHistorySignals,
+      lastChangedBy: "system",
+      lastChangedAt: new Date().toISOString()
+    });
+  }
+}
+
+function planningBehaviorAdjustment(task: Task) {
+  const recentEvents = listTaskStateEvents({
+    startDayKey: shiftDayKey(new Date(), -21),
+    endDayKey: localDayKey(new Date()),
+    limit: 500
+  }).filter((event) => event.taskId === task.id);
+
+  const removedFromTimelineCount = recentEvents.filter((event) => event.eventType === "timeline_slot_removed").length;
+  const addedToTimelineCount = recentEvents.filter((event) => event.eventType === "timeline_slot_added").length;
+  const updatedInTimelineCount = recentEvents.filter((event) => event.eventType === "timeline_slot_updated").length;
+  const completedCount = recentEvents.filter((event) => {
+    if (event.eventType !== "task_updated" || !event.afterJson) return false;
+    try {
+      const parsed = JSON.parse(event.afterJson) as { status?: string };
+      return parsed.status === "Completed";
+    } catch {
+      return false;
+    }
+  }).length;
+
+  return {
+    scoreDelta:
+      Math.min(10, addedToTimelineCount * 2) +
+      Math.min(8, updatedInTimelineCount) +
+      Math.min(12, completedCount * 3) -
+      Math.min(18, removedFromTimelineCount * 6),
+    removedFromTimelineCount
+  };
+}
+
 function buildTaskStoryContext(task: Task) {
   if (task.source !== "Jira") return null;
   const storyKey = task.sourceRef ?? null;
@@ -1202,7 +1543,10 @@ function taskExecutionBucket(task: Task) {
   if (task.status === "In Progress" && task.priority === "High") {
     return 3;
   }
-  return 4;
+  if (task.carryForwardCount > 0) {
+    return 4;
+  }
+  return 5;
 }
 
 function deriveAdaptiveFocusFactor(todayKey: string, weekday: number) {
@@ -1230,30 +1574,68 @@ function deriveAdaptiveFocusFactor(todayKey: string, weekday: number) {
   return clamp(learned, 0.72, 1.08);
 }
 
+function plannedTaskIdsFromSnapshot(row: Record<string, unknown>) {
+  try {
+    const parsed = JSON.parse(String(row.planned_task_ids_json ?? "[]")) as unknown;
+    return Array.isArray(parsed) ? parsed.filter((value): value is number => typeof value === "number") : [];
+  } catch {
+    return [];
+  }
+}
+
+function deriveCarryForwardCount(task: Task, todayKey: string) {
+  if (task.status === "Completed") {
+    return 0;
+  }
+
+  const snapshotCarryForward = listRecentDailyPlanSnapshots(14)
+    .filter((row) => String(row.day_key) !== todayKey)
+    .filter((row) => plannedTaskIdsFromSnapshot(row).includes(task.id)).length;
+
+  if (snapshotCarryForward > 0) {
+    return snapshotCarryForward;
+  }
+
+  const ageDays = daysBetween(task.createdAt, new Date().toISOString());
+  return Math.max(0, ageDays - 1);
+}
+
 function buildDayPlan(tasks: Task[], meetings: ReturnType<typeof listMeetings>): DayPlan {
   const now = new Date();
   const dayKey = localDayKey(now);
   const weekday = now.getDay();
+  const automation = getAutomationSettings();
+  const workdayStartParts = parseLocalTime(automation.workdayStartLocal, 9, 30);
+  const workdayEndParts = parseLocalTime(automation.workdayEndLocal, 18, 0);
   const todayStart = startOfLocalDay(now);
   const todayEnd = endOfLocalDay(now);
   const workdayStart = new Date(
     now.getFullYear(),
     now.getMonth(),
     now.getDate(),
-    DEFAULT_WORKDAY_START_HOUR,
-    DEFAULT_WORKDAY_START_MINUTE,
+    workdayStartParts.hours,
+    workdayStartParts.minutes,
     0,
     0
   );
-  const workdayEnd = addMinutes(workdayStart, DEFAULT_WORKDAY_MINUTES);
+  const workdayEnd = new Date(
+    now.getFullYear(),
+    now.getMonth(),
+    now.getDate(),
+    workdayEndParts.hours,
+    workdayEndParts.minutes,
+    0,
+    0
+  );
+  const effectiveBaseWorkdayMinutes = Math.max(60, diffMinutes(workdayStart, workdayEnd));
 
   const todaysMeetings = meetings
-    .filter((meeting) => !meeting.isCancelled && meetingStart(meeting) < todayEnd && meetingEnd(meeting) > todayStart)
+    .filter((meeting) => isPlannableMeeting(meeting) && meetingStart(meeting) < todayEnd && meetingEnd(meeting) > todayStart)
     .sort((left, right) => meetingStart(left).getTime() - meetingStart(right).getTime());
   const remainingMeetings = todaysMeetings.filter((meeting) => meetingEnd(meeting).getTime() > now.getTime());
   const meetingMinutes = todaysMeetings.reduce((sum, meeting) => sum + meeting.durationMinutes, 0);
 
-  const baseTaskCapacityMinutes = Math.max(0, DEFAULT_WORKDAY_MINUTES - meetingMinutes);
+  const baseTaskCapacityMinutes = Math.max(0, effectiveBaseWorkdayMinutes - meetingMinutes);
   const focusFactor = deriveAdaptiveFocusFactor(dayKey, weekday);
   const adaptedTaskCapacityMinutes = Math.max(0, Math.round(baseTaskCapacityMinutes * focusFactor));
   const completedTodayTasks = tasks.filter((task) => task.status === "Completed" && isSameLocalDay(task.completedAt, now));
@@ -1265,6 +1647,7 @@ function buildDayPlan(tasks: Task[], meetings: ReturnType<typeof listMeetings>):
     .map((task) => {
       const remainingMinutes = estimateRemainingTaskMinutes(task);
       const executionBucket = taskExecutionBucket(task);
+      const behaviorAdjustment = planningBehaviorAdjustment(task);
       const rank =
         (task.priorityScore ?? 0) +
         (task.status === "In Progress" ? 22 : 0) +
@@ -1273,15 +1656,17 @@ function buildDayPlan(tasks: Task[], meetings: ReturnType<typeof listMeetings>):
           : (task.source === "Jira" ? deriveJiraPlanningPriority(task) : task.priority) === "Medium"
             ? 9
             : 3) +
-        Math.min(10, task.carryForwardCount * 2) +
+        Math.min(20, task.carryForwardCount * 5) +
         (task.source === "Email" && /follow up|reply|approval|action/i.test(task.title) ? 6 : 0) +
-        (task.source === "Jira" && isRecentlyUpdated(task.lastActivityAt) ? 8 : 0);
+        (task.source === "Jira" && isRecentlyUpdated(task.lastActivityAt) ? 8 : 0) +
+        behaviorAdjustment.scoreDelta;
       return {
         task,
         remainingMinutes,
         remainingEstimate: remainingMinutes,
         executionBucket,
-        rank
+        rank,
+        behaviorAdjustment
       };
     })
     .filter((entry) => entry.remainingMinutes > 0)
@@ -1302,6 +1687,7 @@ function buildDayPlan(tasks: Task[], meetings: ReturnType<typeof listMeetings>):
       planningStart.getTime()
     )
   );
+  const taskSchedulingEnd = schedulingEnd;
 
   const blocks: DayPlanBlock[] = [];
   const taskBlocks: DayPlanBlock[] = [];
@@ -1323,16 +1709,109 @@ function buildDayPlan(tasks: Task[], meetings: ReturnType<typeof listMeetings>):
     }
 
     const preferQuickWin = focusStreak >= 2 || slotMinutes <= 45;
-    const quickCandidates = rankedTasks.filter((entry) => entry.remainingEstimate > 0 && entry.remainingEstimate <= 45);
     const fallbackCandidates = rankedTasks.filter((entry) => entry.remainingEstimate > 0);
-    const inFlightJiraCandidate = fallbackCandidates.find(
-      (entry) => entry.task.source === "Jira" && entry.executionBucket <= 1
+    const quickCandidates = fallbackCandidates.filter((entry) => entry.remainingEstimate <= 45);
+    const primaryCandidates = fallbackCandidates.filter((entry) => planningRoleForTask(entry.task) === "major");
+    const starterCandidates = fallbackCandidates.filter((entry) => planningRoleForTask(entry.task) === "starter");
+    const closingCandidates = fallbackCandidates.filter((entry) => planningRoleForTask(entry.task) === "ender");
+    const nowTaskMinutes = taskBlocks.reduce((sum, block) => sum + block.durationMinutes, 0);
+    const totalSchedulingWindowMinutes = Math.max(15, diffMinutes(planningStart, taskSchedulingEnd));
+    const progressRatio = clamp(nowTaskMinutes / totalSchedulingWindowMinutes, 0, 1);
+    const remainingDayMinutes = Math.max(0, diffMinutes(slotStart, taskSchedulingEnd));
+    const lastTaskId = taskBlocks[taskBlocks.length - 1]?.taskId ?? null;
+    const lastTaskSource = taskBlocks.length
+      ? tasks.find((candidate) => candidate.id === taskBlocks[taskBlocks.length - 1]!.taskId)?.source ?? null
+      : null;
+    const taskById = (taskId: number | null) =>
+      taskId === null ? null : tasks.find((candidate) => candidate.id === taskId) ?? null;
+    const plannedMinutesForTask = (taskId: number) =>
+      taskBlocks.reduce((sum, block) => sum + (block.taskId === taskId ? block.durationMinutes : 0), 0);
+    const plannedBlockCountForTask = (taskId: number) =>
+      taskBlocks.reduce((sum, block) => sum + (block.taskId === taskId ? 1 : 0), 0);
+    const starterTaskIds = new Set(
+      taskBlocks
+        .map((block) => block.taskId)
+        .filter((taskId): taskId is number => taskId !== null)
+        .filter((taskId) => {
+          const task = taskById(taskId);
+          return task ? planningRoleForTask(task) === "starter" : false;
+        })
     );
+    const closingTaskIds = new Set(
+      taskBlocks
+        .map((block) => block.taskId)
+        .filter((taskId): taskId is number => taskId !== null)
+        .filter((taskId) => {
+          const task = taskById(taskId);
+          return task ? planningRoleForTask(task) === "ender" : false;
+        })
+    );
+    const alreadyPlannedTaskMinutes = taskBlocks.reduce((sum, block) => sum + block.durationMinutes, 0);
+    const plannedPrimaryMinutes = taskBlocks.reduce((sum, block) => {
+      const task = block.taskId !== null ? tasks.find((candidate) => candidate.id === block.taskId) : null;
+      return sum + (task && isPrimaryPlanningTask(task) ? block.durationMinutes : 0);
+    }, 0);
+    const shouldOpenWithStarter = starterCandidates.length > 0 && starterTaskIds.size < 2 && alreadyPlannedTaskMinutes < 45;
+    const shouldCloseWithLight =
+      closingCandidates.length > 0 &&
+      closingTaskIds.size < 2 &&
+      (remainingDayMinutes <= 90 || progressRatio >= 0.78);
+    const continuePreviousMajor =
+      lastTaskId !== null
+        ? fallbackCandidates.find(
+            (entry) =>
+              entry.task.id === lastTaskId &&
+              planningRoleForTask(entry.task) === "major" &&
+              entry.task.source !== "Email" &&
+              entry.remainingEstimate >= 30
+          ) ?? null
+        : null;
+
+    const chooseCandidate = (
+      pool: typeof fallbackCandidates,
+      options?: { avoidTaskId?: number | null; preferFresh?: boolean }
+    ) => {
+      if (!pool.length) return null;
+      let filtered = [...pool];
+      if (options?.avoidTaskId !== null && options?.avoidTaskId !== undefined && filtered.some((entry) => entry.task.id !== options.avoidTaskId)) {
+        filtered = filtered.filter((entry) => entry.task.id !== options.avoidTaskId);
+      }
+      filtered = filtered.filter((entry) => !(entry.task.source === "Email" && plannedBlockCountForTask(entry.task.id) > 0));
+      const notOverFragmented = filtered.filter((entry) => {
+        const plannedBlocks = plannedBlockCountForTask(entry.task.id);
+        if (plannedBlocks === 0) return true;
+        if (entry.task.source === "Email") return false;
+        if (plannedBlocks >= 2 && entry.task.source !== "Jira") return false;
+        return true;
+      });
+      if (notOverFragmented.length) {
+        filtered = notOverFragmented;
+      }
+      if (options?.preferFresh) {
+        const fresh = filtered.filter((entry) => plannedMinutesForTask(entry.task.id) === 0);
+        if (fresh.length) filtered = fresh;
+      }
+      filtered.sort((left, right) => {
+        const leftPlanned = plannedMinutesForTask(left.task.id);
+        const rightPlanned = plannedMinutesForTask(right.task.id);
+        if (leftPlanned !== rightPlanned) return leftPlanned - rightPlanned;
+        if (left.behaviorAdjustment.removedFromTimelineCount !== right.behaviorAdjustment.removedFromTimelineCount) {
+          return left.behaviorAdjustment.removedFromTimelineCount - right.behaviorAdjustment.removedFromTimelineCount;
+        }
+        if (right.rank !== left.rank) return right.rank - left.rank;
+        return left.remainingEstimate - right.remainingEstimate;
+      });
+      return filtered[0] ?? null;
+    };
+
     const chosen =
-      inFlightJiraCandidate ??
-      (preferQuickWin && fallbackCandidates[0]?.executionBucket > 1 ? quickCandidates[0] : null) ??
-      fallbackCandidates.find((entry) => entry.remainingEstimate <= slotMinutes + 15) ??
-      fallbackCandidates[0];
+      (shouldOpenWithStarter ? chooseCandidate(starterCandidates, { avoidTaskId: lastTaskId, preferFresh: true }) : null) ??
+      (shouldCloseWithLight ? chooseCandidate(closingCandidates, { avoidTaskId: lastTaskId, preferFresh: true }) : null) ??
+      continuePreviousMajor ??
+      chooseCandidate(primaryCandidates, { avoidTaskId: lastTaskId, preferFresh: true }) ??
+      (preferQuickWin ? chooseCandidate(quickCandidates, { avoidTaskId: lastTaskId, preferFresh: true }) : null) ??
+      chooseCandidate(fallbackCandidates, { avoidTaskId: lastTaskId, preferFresh: true }) ??
+      chooseCandidate(fallbackCandidates, { avoidTaskId: lastTaskId });
 
     if (!chosen) {
       return { block: null, consumedMinutes: 0, nextFocusStreak: focusStreak };
@@ -1340,27 +1819,82 @@ function buildDayPlan(tasks: Task[], meetings: ReturnType<typeof listMeetings>):
 
     const capacityLeft = Math.max(
       0,
-      remainingTaskCapacityMinutes -
-        taskBlocks.reduce((sum, block) => sum + block.durationMinutes, 0)
+      remainingTaskCapacityMinutes - taskBlocks.reduce((sum, block) => sum + block.durationMinutes, 0)
     );
     const canForceVisibilityBlock =
       taskBlocks.length === 0 &&
       slotMinutes >= 15 &&
-      (chosen.task.status === "In Progress" || chosen.executionBucket <= 1);
+      (chosen.task.status === "In Progress" || chosen.executionBucket <= 1) &&
+      slotStart.getTime() < workdayEnd.getTime();
     const effectiveCapacityLeft = capacityLeft >= 15 ? capacityLeft : canForceVisibilityBlock ? 15 : 0;
 
     if (effectiveCapacityLeft < 15) {
-      return { block: null, consumedMinutes: 0, nextFocusStreak: focusStreak };
+      const stretchCandidate =
+        fallbackCandidates.find((entry) => entry.executionBucket <= 2 && entry.remainingEstimate > 0) ??
+        fallbackCandidates.find((entry) => entry.remainingEstimate > 0);
+      if (!stretchCandidate) {
+        return { block: null, consumedMinutes: 0, nextFocusStreak: focusStreak };
+      }
+
+      const stretchDuration = Math.max(
+        15,
+        Math.min(
+          slotMinutes,
+          stretchCandidate.remainingEstimate,
+          stretchCandidate.executionBucket <= 1 ? 45 : 30
+        )
+      );
+      const stretchEnd = addMinutes(slotStart, stretchDuration);
+      const stretchBlock: DayPlanBlock = {
+        id: `task-stretch-${stretchCandidate.task.id}-${slotStart.getTime()}`,
+        kind: "task",
+        title: buildTaskPlanningTitle(stretchCandidate.task, stretchDuration),
+        startTime: slotStart.toISOString(),
+        endTime: stretchEnd.toISOString(),
+        timeZone: null,
+        durationMinutes: stretchDuration,
+        status: "planned",
+        taskId: stretchCandidate.task.id,
+        meetingId: null,
+        source: stretchCandidate.task.source,
+        priority:
+          stretchCandidate.task.source === "Jira"
+            ? deriveJiraPlanningPriority(stretchCandidate.task)
+            : stretchCandidate.task.priority,
+        link: stretchCandidate.task.sourceLink,
+        note: `${buildTaskPlanningNote(stretchCandidate.task) ?? "Optional stretch work."} Use this block if you finish earlier than expected or want to pull work forward.`
+      };
+      stretchCandidate.remainingEstimate -= stretchDuration;
+      plannedTaskIds.add(stretchCandidate.task.id);
+      return {
+        block: stretchBlock,
+        consumedMinutes: stretchDuration,
+        nextFocusStreak: 0
+      };
     }
 
     const planningPriority = chosen.task.source === "Jira" ? deriveJiraPlanningPriority(chosen.task) : chosen.task.priority;
+    const plannedAlreadyForChosen = plannedMinutesForTask(chosen.task.id);
     const idealChunk =
-      chosen.remainingEstimate <= 30
-        ? chosen.remainingEstimate
-        : chosen.executionBucket <= 1 || planningPriority === "High" || chosen.task.status === "In Progress"
-          ? Math.min(120, chosen.remainingEstimate)
-          : Math.min(60, chosen.remainingEstimate);
-    const durationMinutes = Math.max(15, Math.min(slotMinutes, effectiveCapacityLeft, idealChunk));
+      planningRoleForTask(chosen.task) === "starter" || planningRoleForTask(chosen.task) === "ender"
+        ? Math.min(30, chosen.remainingEstimate)
+        : chosen.task.source === "Email"
+          ? Math.min(30, chosen.remainingEstimate)
+          : plannedAlreadyForChosen > 0
+            ? Math.min(90, chosen.remainingEstimate)
+            : chosen.executionBucket <= 1 || planningPriority === "High" || chosen.task.status === "In Progress"
+              ? Math.min(120, chosen.remainingEstimate)
+              : Math.min(90, chosen.remainingEstimate);
+    const minimumChunk =
+      chosen.task.source === "Email"
+        ? 15
+        : lastTaskId === chosen.task.id
+          ? 45
+          : lastTaskSource === chosen.task.source
+          ? 30
+          : 60;
+    const maxChunk = Math.min(slotMinutes, effectiveCapacityLeft, idealChunk);
+    const durationMinutes = Math.max(Math.min(minimumChunk, maxChunk), maxChunk >= 15 ? 15 : maxChunk);
     const endTime = addMinutes(slotStart, durationMinutes);
     const status: DayPlanBlock["status"] =
       chosen.task.status === "In Progress" && slotStart.getTime() <= now.getTime() ? "in_progress" : "planned";
@@ -1455,8 +1989,8 @@ function buildDayPlan(tasks: Task[], meetings: ReturnType<typeof listMeetings>):
     focusStreak = 0;
   }
 
-  while (cursor.getTime() < schedulingEnd.getTime()) {
-    const slotMinutes = diffMinutes(cursor, schedulingEnd);
+  while (cursor.getTime() < taskSchedulingEnd.getTime()) {
+    const slotMinutes = diffMinutes(cursor, taskSchedulingEnd);
     const scheduled = scheduleTaskBlock(cursor, slotMinutes, focusStreak);
     if (!scheduled.block) break;
     taskBlocks.push(scheduled.block);
@@ -1465,6 +1999,7 @@ function buildDayPlan(tasks: Task[], meetings: ReturnType<typeof listMeetings>):
     focusStreak = scheduled.nextFocusStreak;
   }
 
+  const displayBlocks = mergeAdjacentTaskBlocks(blocks);
   const plannedTaskMinutes = taskBlocks.reduce((sum, block) => sum + block.durationMinutes, 0);
   const spilloverTasks = rankedTasks
     .filter((entry) => entry.remainingEstimate > 0)
@@ -1499,7 +2034,7 @@ function buildDayPlan(tasks: Task[], meetings: ReturnType<typeof listMeetings>):
   return {
     summary: {
       dayKey,
-      baseWorkdayMinutes: DEFAULT_WORKDAY_MINUTES,
+      baseWorkdayMinutes: effectiveBaseWorkdayMinutes,
       adaptedTaskCapacityMinutes,
       remainingTaskCapacityMinutes,
       meetingMinutes,
@@ -1512,7 +2047,7 @@ function buildDayPlan(tasks: Task[], meetings: ReturnType<typeof listMeetings>):
       completionRate,
       guidance
     },
-    blocks: blocks.sort((left, right) => new Date(left.startTime).getTime() - new Date(right.startTime).getTime()),
+    blocks: displayBlocks,
     spilloverTasks
   };
 }
@@ -1522,7 +2057,7 @@ function computeTaskSignals(task: Task, meetings: ReturnType<typeof listMeetings
   const reasons: string[] = [];
   const scoreBreakdown: Array<{ label: string; value: number; kind: "positive" | "negative" | "neutral" }> = [];
   const ageDays = daysBetween(task.createdAt, new Date().toISOString());
-  const carryForwardCount = task.status === "Completed" ? 0 : Math.max(0, ageDays - 1);
+  const carryForwardCount = deriveCarryForwardCount(task, localDayKey(new Date()));
   const effort = inferEffortBucket(task);
   const jiraPlanningPriority = task.source === "Jira" ? deriveJiraPlanningPriority(task) : task.priority;
 
@@ -1608,7 +2143,7 @@ function computeTaskSignals(task: Task, meetings: ReturnType<typeof listMeetings
     scoreBreakdown.push({ label: "Workflow state pressure", value: 8, kind: "positive" });
   }
   const nextMeeting = meetings.find(
-    (meeting) => !meeting.isCancelled && new Date(meeting.startTime).getTime() > Date.now()
+    (meeting) => isPlannableMeeting(meeting) && new Date(meeting.startTime).getTime() > Date.now()
   );
   if (nextMeeting && /prep|agenda|review/i.test(task.title)) {
     score += 10;
@@ -1619,7 +2154,7 @@ function computeTaskSignals(task: Task, meetings: ReturnType<typeof listMeetings
     task.source === "Jira"
       ? buildTaskStoryContext(task) ?? reasons[0] ?? "Assigned Jira issue is available as next work."
       : task.source === "Email"
-        ? reasons[0] ?? "Recent email needs attention"
+        ? task.decisionReason ?? task.priorityExplanation ?? reasons[0] ?? "Recent email needs attention"
         : reasons[0] ?? "Manual task still active";
 
   const selectionReason =
@@ -1628,7 +2163,9 @@ function computeTaskSignals(task: Task, meetings: ReturnType<typeof listMeetings
       : task.source === "Jira"
         ? "Included because it is assigned Jira work that fits your current capacity and execution order."
         : task.source === "Email"
-          ? "Included because it looks like actionable email work that still needs review or follow-through."
+          ? task.decisionReason
+            ? `Included because the email was judged actionable: ${task.decisionReason}`
+            : "Included because it looks like actionable email work that still needs review or follow-through."
           : "Included because you created it manually and it remains active.";
 
   const priorityReason =
@@ -1636,7 +2173,9 @@ function computeTaskSignals(task: Task, meetings: ReturnType<typeof listMeetings
       ? "High priority because active story work, urgency, or recent signals outweigh other tasks."
       : jiraPlanningPriority === "Medium"
         ? "Medium priority because it matters, but more active work is ahead of it."
-        : "Low priority because it remains relevant, but higher-urgency work is already in motion.";
+        : task.source === "Email"
+          ? "Priority reflects the email content, urgency, and your saved preferences."
+          : "Low priority because it remains relevant, but higher-urgency work is already in motion.";
 
   const historySignals = [
     ageDays >= 3 ? `Open for ${ageDays} days` : null,
@@ -1662,6 +2201,80 @@ function derivePriorityFromScore(score: number): TaskPriority {
   if (score >= 48) return "High";
   if (score >= 24) return "Medium";
   return "Low";
+}
+
+function priorityForStage(stage: TaskStage): TaskPriority {
+  switch (stage) {
+    case "Now":
+      return "High";
+    case "Next":
+      return "Medium";
+    default:
+      return "Low";
+  }
+}
+
+function recommendedStageForTask(task: Task, plannedTodayTaskIds: Set<number>): TaskStage {
+  if (task.status === "Completed") {
+    return task.stage ?? "Later";
+  }
+  if (task.decisionState === "uncertain") {
+    return "Review";
+  }
+  if (plannedTodayTaskIds.has(task.id)) {
+    return "Now";
+  }
+  if (task.source === "Jira" && (task.status === "In Progress" || hasActiveJiraSubtask(task) || task.carryForwardCount > 0)) {
+    return "Next";
+  }
+  if (task.priority === "High" || (task.priorityScore ?? 0) >= 42 || task.carryForwardCount > 0 || task.status === "In Progress") {
+    return "Next";
+  }
+  if (task.source === "Email" && /(review|comment|mentioned|approval|action required)/i.test(task.title)) {
+    return "Review";
+  }
+  return "Later";
+}
+
+function assignTaskStages(tasks: Task[], dayPlan: DayPlan) {
+  const plannedTodayTaskIds = new Set(
+    dayPlan.blocks.map((block) => block.taskId).filter((taskId): taskId is number => taskId !== null)
+  );
+  const grouped = new Map<TaskStage, Task[]>();
+  for (const task of tasks) {
+    if (task.status === "Completed") continue;
+    const stage = task.manualOverrideFlags.includes("stage")
+      ? task.stage
+      : recommendedStageForTask(task, plannedTodayTaskIds);
+    const existing = grouped.get(stage) ?? [];
+    existing.push(task);
+    grouped.set(stage, existing);
+  }
+
+  for (const stage of ["Now", "Next", "Later", "Review"] as TaskStage[]) {
+    const ordered = (grouped.get(stage) ?? []).sort((left, right) => {
+      if (left.manualOverrideFlags.includes("stageOrder") && right.manualOverrideFlags.includes("stageOrder")) {
+        return left.stageOrder - right.stageOrder;
+      }
+      if (right.priorityScore !== left.priorityScore) return (right.priorityScore ?? 0) - (left.priorityScore ?? 0);
+      if (left.status !== right.status) return left.status === "In Progress" ? -1 : right.status === "In Progress" ? 1 : 0;
+      return new Date(right.updatedAt).getTime() - new Date(left.updatedAt).getTime();
+    });
+
+    ordered.forEach((task, index) => {
+      const nextStage = task.manualOverrideFlags.includes("stage") ? task.stage : stage;
+      const nextStageOrder = task.manualOverrideFlags.includes("stageOrder") ? task.stageOrder : index;
+      const nextPriority = task.manualOverrideFlags.includes("priority") ? task.priority : priorityForStage(nextStage);
+      if (task.stage === nextStage && task.stageOrder === nextStageOrder && task.priority === nextPriority) return;
+      updateTask(task.id, {
+        stage: nextStage,
+        stageOrder: nextStageOrder,
+        priority: nextPriority,
+        lastChangedBy: "system",
+        lastChangedAt: new Date().toISOString()
+      });
+    });
+  }
 }
 
 function applyTaskIntelligence() {
@@ -1692,7 +2305,9 @@ function applyTaskIntelligence() {
   }
 }
 
-function syncReminders() {
+async function syncReminders(options?: {
+  microsoftGraphAccessToken?: string | null;
+}) {
   const settings = getAutomationSettings();
   if (!settings.remindersEnabled) {
     resolveStaleReminders([]);
@@ -1709,16 +2324,16 @@ function syncReminders() {
     let kind: ReminderKind | null = null;
     let reason = "";
 
-    if (task.deferredUntil && new Date(task.deferredUntil).getTime() <= Date.now()) {
+  if (task.deferredUntil && new Date(task.deferredUntil).getTime() <= Date.now()) {
       kind = "deferred_due";
       reason = "Deferred task is active again.";
     } else if (task.source === "Email" && task.taskAgeDays >= 1 && task.status === "Not Started") {
       kind = "email_follow_up";
       reason = "Important email has not been answered yet.";
-    } else if (task.source === "Jira" && task.taskAgeDays >= 2 && task.status !== "In Progress") {
-      kind = "jira_stale";
-      reason = "Assigned Jira work shows no recent progress.";
-    }
+  } else if (task.source === "Jira" && task.taskAgeDays >= 2 && task.status !== "In Progress") {
+    kind = "jira_stale";
+    reason = "Assigned Jira work shows no recent progress.";
+  }
 
     if (!kind) continue;
 
@@ -1743,7 +2358,7 @@ function syncReminders() {
   }
 
   for (const meeting of meetings) {
-    if (meeting.isCancelled) continue;
+    if (!isPlannableMeeting(meeting)) continue;
     const start = new Date(meeting.startTime).getTime();
     const hoursUntil = (start - Date.now()) / 3_600_000;
     if (hoursUntil > 0 && hoursUntil <= 2) {
@@ -1761,6 +2376,36 @@ function syncReminders() {
         throttleUntil: new Date(start).toISOString()
       });
     }
+  }
+
+  const followUpSinceIso = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+  try {
+    const [sentEmails, inboxEmails] = options?.microsoftGraphAccessToken
+      ? await Promise.all([
+          fetchRecentSentEmailsWithAccessToken(followUpSinceIso, options.microsoftGraphAccessToken),
+          fetchRecentEmailsWithAccessToken(followUpSinceIso, options.microsoftGraphAccessToken)
+        ])
+      : await Promise.all([fetchRecentSentEmails(followUpSinceIso), fetchRecentEmails(followUpSinceIso)]);
+
+    for (const sentEmail of sentEmails) {
+      if (!needsSentEmailFollowUp(sentEmail, inboxEmails)) continue;
+      const reminderKey = `sent_follow_up:${sentEmail.id}`;
+      activeKeys.push(reminderKey);
+      upsertReminder({
+        reminderKey,
+        taskId: null,
+        kind: "email_follow_up",
+        title: sentEmail.subject?.trim() ? `Follow up: ${sentEmail.subject.trim()}` : "Follow up on sent email",
+        reason: "You sent this email and there has not been a reply yet. Check if a follow-up is needed.",
+        status: "active",
+        sourceLink: sentEmail.webLink ?? null,
+        sourceLabel: "Sent email",
+        scheduledFor: sentEmail.sentDateTime ?? null,
+        throttleUntil: new Date(Date.now() + cadenceMs).toISOString()
+      });
+    }
+  } catch {
+    // Reminder generation should stay resilient even if follow-up mail inspection fails.
   }
 
   resolveStaleReminders(activeKeys);
@@ -1805,7 +2450,7 @@ function buildWorkloadSummary(tasks: Task[]): WorkloadSummary {
         start.getFullYear() === now.getFullYear() &&
         start.getMonth() === now.getMonth() &&
         start.getDate() === now.getDate() &&
-        !meeting.isCancelled
+        isPlannableMeeting(meeting)
       );
     })
     .reduce((sum, meeting) => sum + meeting.durationMinutes, 0);
@@ -1827,9 +2472,12 @@ function buildWorkloadSummary(tasks: Task[]): WorkloadSummary {
 }
 
 function buildPayload(warnings: string[] = []): TodayPayload {
+  cleanupLegacyDailyWrapUpTasks();
   const tasks = listTasks();
-  const meetings = listMeetings();
+  const meetings = listMeetings().filter((meeting) => isPlannableMeeting(meeting));
   const dayPlan = buildDayPlan(tasks, meetings);
+  assignTaskStages(tasks, dayPlan);
+  const stageAwareTasks = listTasks().filter((task) => task.status !== "Completed");
   upsertDailyPlanSnapshot({
     dayKey: dayPlan.summary.dayKey,
     weekday: new Date().getDay(),
@@ -1852,9 +2500,9 @@ function buildPayload(warnings: string[] = []): TodayPayload {
   });
   return {
     meetings,
-    tasks: groupTasksByPriority(tasks),
+    tasks: groupTasksByPriority(stageAwareTasks),
     reminders: listReminderItems(["active", "dismissed"]),
-    workload: buildWorkloadSummary(tasks),
+    workload: buildWorkloadSummary(stageAwareTasks),
     dayPlan,
     deferredTaskCount: listDeferredTasks().length,
     rejectedTaskCount: getRejectedTaskCount(),
@@ -1886,9 +2534,14 @@ export function getTodaySnapshot() {
   return buildPayload([]);
 }
 
-async function postSyncMaintenance(triggerType: "manual" | "scheduled", warnings: string[]) {
+async function postSyncMaintenance(
+  triggerType: "manual" | "scheduled",
+  warnings: string[],
+  options?: { microsoftGraphAccessToken?: string | null }
+) {
   applyTaskIntelligence();
-  syncReminders();
+  await applyPlanningCategories();
+  await syncReminders(options);
   await refreshPreferenceMemory();
   const now = new Date().toISOString();
   setSyncState("plan", now);
@@ -1924,7 +2577,7 @@ export async function generatePlan(
   const microsoftMeetingWarnings = await syncMicrosoftMeetings({ ...options, runId });
   const microsoftTaskWarnings = await syncMicrosoftTasks({ ...options, runId });
   const warnings = [...microsoftTaskWarnings, ...microsoftMeetingWarnings, ...jiraWarnings];
-  await postSyncMaintenance(triggerType, warnings);
+  await postSyncMaintenance(triggerType, warnings, { microsoftGraphAccessToken: options?.microsoftGraphAccessToken ?? null });
   const payload = buildPayload(warnings);
   persistPlannerRun(runId, triggerType, options?.preferredTimeZone ?? null, payload);
   logEvent({
@@ -1950,7 +2603,7 @@ export async function syncMeetingsOnly(options?: {
 }) {
   const runId = options?.runId ?? createCorrelationId();
   const warnings = await syncMicrosoftMeetings({ ...options, runId });
-  syncReminders();
+  await syncReminders({ microsoftGraphAccessToken: options?.microsoftGraphAccessToken ?? null });
   const payload = buildPayload(warnings);
   persistPlannerRun(runId, "sync", options?.preferredTimeZone ?? null, payload);
   return payload;
@@ -1964,10 +2617,11 @@ export async function syncTasksOnly(options?: {
 }) {
   const runId = options?.runId ?? createCorrelationId();
   const jiraWarnings = await syncJiraTasks(runId);
-  const microsoftWarnings = await syncMicrosoftTasks({ ...options, runId });
+  const microsoftMeetingWarnings = await syncMicrosoftMeetings({ ...options, runId });
+  const microsoftTaskWarnings = await syncMicrosoftTasks({ ...options, runId });
   applyTaskIntelligence();
-  syncReminders();
-  const payload = buildPayload([...microsoftWarnings, ...jiraWarnings]);
+  await syncReminders({ microsoftGraphAccessToken: options?.microsoftGraphAccessToken ?? null });
+  const payload = buildPayload([...microsoftTaskWarnings, ...microsoftMeetingWarnings, ...jiraWarnings]);
   persistPlannerRun(runId, "sync", options?.preferredTimeZone ?? null, payload);
   return payload;
 }

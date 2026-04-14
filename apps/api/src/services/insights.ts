@@ -24,6 +24,7 @@ import type {
   InsightsOverview,
   InsightsTodayPayload,
   InsightsTodayTask,
+  InsightsUpdatesPayload,
   PlannerRunDetail,
   Task,
   TaskInsightsPayload
@@ -47,45 +48,65 @@ function toDaySummary(row: Record<string, unknown>): DayHistorySummary {
   const summary = parseJsonValue<Record<string, unknown>>(row.summary_json, {});
   const dayKey = String(row.day_key);
   const plannedTaskIds = parseJsonValue<number[]>(row.planned_task_ids_json, []);
+  const plannedTaskIdSet = new Set(plannedTaskIds);
   const plannedTasks = parseJsonValue<DayPlanBlock[]>(row.blocks_json, []).filter((block) => block.kind === "task");
   const changeEvents = listTaskStateEvents({ dayKey });
-  const rejectedCount = changeEvents.filter((event) => event.eventType === "reject").length;
-  const restoredCount = changeEvents.filter((event) => event.eventType === "restore").length;
-  const deferredCount = changeEvents.filter((event) => event.eventType === "deferred").length;
-  const demotedCount = changeEvents.filter(
+  const relevantEvents = changeEvents.filter((event) => event.taskId !== null && plannedTaskIdSet.has(event.taskId));
+  const rejectedCount = relevantEvents.filter((event) => event.eventType === "reject").length;
+  const restoredCount = relevantEvents.filter((event) => event.eventType === "restore").length;
+  const deferredCount = relevantEvents.filter((event) => event.eventType === "deferred").length;
+  const removedTaskCount = relevantEvents.filter((event) => ["remove_manual", "reject"].includes(event.eventType)).length;
+  const stageChangedCount = relevantEvents.filter((event) => event.eventType === "task_updated").length;
+  const demotedCount = relevantEvents.filter(
     (event) => event.eventType === "priority_changed" && (event.afterJson ?? "").includes('"Low"')
   ).length;
   const disagreements = new Set(
-    changeEvents
+    relevantEvents
       .filter((event) => ["reject", "deferred"].includes(event.eventType) || (event.eventType === "priority_changed" && (event.afterJson ?? "").includes('"Low"')))
       .map((event) => event.taskId)
       .filter((taskId): taskId is number => taskId !== null)
   ).size + demotedCount;
 
   const plannedCount = plannedTaskIds.length || plannedTasks.length;
-  const completedCount = listTasks(undefined, { includeDeferred: true }).filter((task) => task.completedAt?.slice(0, 10) === dayKey)
-    .length;
+  const completedCount = listTasks(undefined, { includeDeferred: true }).filter(
+    (task) => plannedTaskIdSet.has(task.id) && task.completedAt?.slice(0, 10) === dayKey
+  ).length;
+  const emailTaskCount = plannedTasks.filter((task) => task.source === "Email").length;
+  const jiraTaskCount = plannedTasks.filter((task) => task.source === "Jira").length;
+  const manualTaskCount = plannedTasks.filter((task) => task.source === "Manual").length;
   const scheduledMeetingCount = parseJsonValue<DayPlanBlock[]>(row.blocks_json, []).filter((block) => block.kind === "meeting").length;
   const agreementPercent =
     plannedCount > 0 ? Math.max(0, Math.min(100, Math.round(((plannedCount - disagreements) / plannedCount) * 100))) : null;
+  const acceptancePercent = agreementPercent;
   const completionPercent =
     plannedCount > 0 ? Math.max(0, Math.min(100, Math.round((completedCount / plannedCount) * 100))) : null;
+  const spilloverPercent =
+    plannedCount > 0
+      ? Math.max(0, Math.min(100, Math.round((Number(row.spillover_task_count ?? summary.spilloverTaskCount ?? 0) / plannedCount) * 100)))
+      : null;
 
   return {
     dayKey,
     guidance: String(summary.guidance ?? ""),
     plannedTaskCount: plannedCount,
     completedTaskCount: completedCount,
+    removedTaskCount,
     deferredTaskCount: deferredCount,
     rejectedTaskCount: rejectedCount,
     restoredTaskCount: restoredCount,
+    stageChangedCount,
     scheduledMeetingCount,
     scheduledMeetingMinutes: Number(row.meeting_minutes ?? summary.meetingMinutes ?? 0),
     plannedTaskMinutes: Number(row.planned_task_minutes ?? summary.plannedTaskMinutes ?? 0),
     completedTaskMinutes: Number(row.completed_task_minutes ?? summary.completedTaskMinutes ?? 0),
     spilloverTaskCount: Number(row.spillover_task_count ?? summary.spilloverTaskCount ?? 0),
+    spilloverPercent,
     agreementPercent,
-    completionPercent
+    acceptancePercent,
+    completionPercent,
+    emailTaskCount,
+    jiraTaskCount,
+    manualTaskCount
   };
 }
 
@@ -168,12 +189,29 @@ export function getInsightsHistoryPayload(limit = 30) {
   };
 }
 
+export function getInsightsUpdatesPayload(startDayKey?: string | null, endDayKey?: string | null, limit = 300): InsightsUpdatesPayload {
+  const events = listTaskStateEvents({
+    startDayKey: startDayKey ?? undefined,
+    endDayKey: endDayKey ?? undefined,
+    limit
+  });
+  return {
+    startDayKey: startDayKey ?? null,
+    endDayKey: endDayKey ?? null,
+    totalEvents: events.length,
+    events
+  };
+}
+
 export function getInsightsHistoryDayPayload(dayKey: string): DayHistoryDetail | null {
   const row = getDailyPlanSnapshot(dayKey);
   if (!row) return null;
 
   const summary = toDaySummary(row);
   const blocks = parseJsonValue<DayPlanBlock[]>(row.blocks_json, []);
+  const plannedTaskIdSet = new Set(
+    parseJsonValue<number[]>(row.planned_task_ids_json, []).filter((taskId): taskId is number => typeof taskId === "number")
+  );
   const plannedTasks = blocks
     .filter((block) => block.kind === "task")
     .map((block) => ({
@@ -186,11 +224,11 @@ export function getInsightsHistoryDayPayload(dayKey: string): DayHistoryDetail |
     }));
 
   const allTasks = listTasks(undefined, { includeDeferred: true });
-  const completedTasks = allTasks.filter((task) => task.completedAt?.slice(0, 10) === dayKey);
-  const deferredTasks = allTasks.filter((task) => task.deferredUntil?.slice(0, 10) === dayKey);
+  const completedTasks = allTasks.filter((task) => plannedTaskIdSet.has(task.id) && task.completedAt?.slice(0, 10) === dayKey);
+  const deferredTasks = allTasks.filter((task) => plannedTaskIdSet.has(task.id) && task.deferredUntil?.slice(0, 10) === dayKey);
   const rejectedTasks = listRejectedTasks().filter((task) => task.rejectedAt.slice(0, 10) === dayKey);
   const ignoredTasks = listIgnoredRejectedTasks().filter((task) => task.updatedAt.slice(0, 10) === dayKey);
-  const changeEvents = listTaskStateEvents({ dayKey });
+  const changeEvents = listTaskStateEvents({ dayKey }).filter((event) => event.taskId !== null && plannedTaskIdSet.has(event.taskId));
 
   return {
     summary,

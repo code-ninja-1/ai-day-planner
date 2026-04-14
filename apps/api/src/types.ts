@@ -1,6 +1,7 @@
 export type TaskSource = "Email" | "Jira" | "Manual";
 export type TaskPriority = "High" | "Medium" | "Low";
 export type TaskStatus = "Not Started" | "In Progress" | "Completed";
+export type TaskStage = "Now" | "Next" | "Later" | "Review";
 export type TaskEffortBucket = "15 min" | "30 min" | "1 hour" | "2+ hours";
 export type ReminderStatus = "active" | "dismissed" | "resolved";
 export type ReminderKind = "email_follow_up" | "jira_stale" | "deferred_due" | "meeting_prep";
@@ -15,6 +16,7 @@ export type FeedbackAction =
   | "system_evaluated"
   | "reject"
   | "restore"
+  | "stage_changed"
   | "priority_changed"
   | "status_changed"
   | "deferred"
@@ -58,6 +60,8 @@ export interface Task {
   id: number;
   title: string;
   source: TaskSource;
+  stage: TaskStage;
+  stageOrder: number;
   priority: TaskPriority;
   status: TaskStatus;
   sourceLink: string | null;
@@ -108,7 +112,26 @@ export interface Meeting {
   meetingLink: string | null;
   meetingLinkType: "join" | "calendar" | null;
   isCancelled: boolean;
+  attendanceStatus: "attending" | "unattending";
   createdAt: string;
+}
+
+export interface MeetingDetail {
+  id: number;
+  title: string;
+  startTime: string;
+  endTime: string;
+  timeZone: string | null;
+  durationMinutes: number;
+  meetingLink: string | null;
+  meetingLinkType: "join" | "calendar" | null;
+  isCancelled: boolean;
+  attendanceStatus: "attending" | "unattending";
+  organizer: string | null;
+  attendees: string[];
+  location: string | null;
+  description: string | null;
+  bodyPreview: string | null;
 }
 
 export interface IntegrationConnection {
@@ -144,6 +167,8 @@ export interface AutomationSettings {
   scheduleEnabled: boolean;
   scheduleTimeLocal: string;
   scheduleTimezone: string;
+  workdayStartLocal: string;
+  workdayEndLocal: string;
   remindersEnabled: boolean;
   reminderCadenceHours: number;
   desktopNotificationsEnabled: boolean;
@@ -257,6 +282,15 @@ export interface DayPlan {
   spilloverTasks: Task[];
 }
 
+export interface TaskBoardPayload {
+  now: Task[];
+  next: Task[];
+  later: Task[];
+  review: Task[];
+  rejected: RejectedTask[];
+  ignoredRejected: RejectedTask[];
+}
+
 export interface TodayPayload {
   meetings: Meeting[];
   tasks: Record<TaskPriority, Task[]>;
@@ -272,6 +306,46 @@ export interface TodayPayload {
     lastGeneratedAt: string | null;
   };
   warnings: string[];
+}
+
+export interface HomeBanner {
+  title: string;
+  totalTaskCount: number;
+  emailTaskCount: number;
+  jiraTaskCount: number;
+  meetingCount: number;
+  followUpCount: number;
+  inProgressTaskCount: number;
+  highPriorityTaskCount: number;
+  summary: string;
+  upcomingMeetingLabel: string | null;
+}
+
+export interface HomeScheduleEntry {
+  entryId: string;
+  dayKey: string;
+  taskId: number;
+  startMinutes: number;
+  durationMinutes: number;
+  source: "planner" | "user";
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface HomeSchedule {
+  dayKey: string;
+  entries: HomeScheduleEntry[];
+  hiddenMeetingIds: number[];
+  hasEmptyWorkingSlots: boolean;
+}
+
+export interface HomePayload {
+  banner: HomeBanner;
+  tasks: Task[];
+  meetings: Meeting[];
+  deferredTasks: Task[];
+  reminders: Reminder[];
+  schedule: HomeSchedule;
 }
 
 export interface AuditEvent {
@@ -354,16 +428,23 @@ export interface DayHistorySummary {
   guidance: string;
   plannedTaskCount: number;
   completedTaskCount: number;
+  removedTaskCount: number;
   deferredTaskCount: number;
   rejectedTaskCount: number;
   restoredTaskCount: number;
+  stageChangedCount: number;
   scheduledMeetingCount: number;
   scheduledMeetingMinutes: number;
   plannedTaskMinutes: number;
   completedTaskMinutes: number;
   spilloverTaskCount: number;
+  spilloverPercent: number | null;
   agreementPercent: number | null;
+  acceptancePercent: number | null;
   completionPercent: number | null;
+  emailTaskCount: number;
+  jiraTaskCount: number;
+  manualTaskCount: number;
 }
 
 export interface DayHistoryDetail {
@@ -381,6 +462,13 @@ export interface DayHistoryDetail {
   rejectedTasks: RejectedTask[];
   ignoredTasks: RejectedTask[];
   changeEvents: TaskStateEvent[];
+}
+
+export interface InsightsUpdatesPayload {
+  startDayKey: string | null;
+  endDayKey: string | null;
+  totalEvents: number;
+  events: TaskStateEvent[];
 }
 
 export interface TaskInsightsPayload {
